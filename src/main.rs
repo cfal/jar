@@ -3,11 +3,9 @@ use rand::Rng;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
@@ -51,17 +49,14 @@ async fn start_proc(prefix: String, opts: JobConfig, initial: bool) {
         sleep(delay).await;
     }
 
-    if let Err(e) = start_proc_internal(prefix.clone(), &opts).await {
+    if let Err(e) = start_proc_internal(&prefix, &opts).await {
         eprintln!("{} > * > Process error: {}", prefix, e);
     }
 
     start_proc(prefix, opts, false).await;
 }
 
-async fn start_proc_internal(
-    prefix: String,
-    opts: &JobConfig,
-) -> std::io::Result<()> {
+async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<()> {
     let mut envs = env::vars().collect::<HashMap<String, String>>();
     if let Some(additional_env) = &opts.env {
         envs.extend(additional_env.clone());
@@ -84,19 +79,19 @@ async fn start_proc_internal(
         child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
         })?,
-        prefix.clone(),
+        prefix.to_string(),
         "stdout",
     );
     let stderr_handle = spawn_output_handler(
         child.stderr.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stderr")
         })?,
-        prefix.clone(),
+        prefix.to_string(),
         "stderr",
     );
     let status = child.wait().await?;
-    stdout_handle.await?;
-    stderr_handle.await?;
+    stdout_handle.await??;
+    stderr_handle.await??;
 
     eprintln!(
         "{} > * > Exited with code {}",
@@ -163,13 +158,22 @@ fn main() -> std::io::Result<()> {
             updated_args.push(String::from("--inner"));
             updated_args.extend(args[1..].iter().map(ToString::to_string));
 
-            println!("[Supervisor] Starting inner process..");
-            std::process::Command::new(&args[0])
+            eprintln!("[Supervisor] Starting inner process..");
+            match std::process::Command::new(&args[0])
                 .args(updated_args)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status();
-            println!("[Supervisor] Inner process exited, waiting 15 seconds before restarting..");
+                .status()
+            {
+                Ok(exit_status) => match exit_status.code() {
+                    Some(code) => eprintln!("[Supervisor] Exited with status code: {code}"),
+                    None => eprintln!("[Supervisor] Process terminated by signal"),
+                },
+                Err(e) => {
+                    eprintln!("[Supervisor] Failed to read exit status: {}", e);
+                }
+            }
+            eprintln!("[Supervisor] Inner process exited, waiting 15 seconds before restarting..");
             std::thread::sleep(Duration::from_millis(15_000));
         }
     }
