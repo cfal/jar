@@ -311,8 +311,9 @@ fn main() -> std::io::Result<()> {
             _ = sigquit.recv() => "QUIT",
         };
 
+        // Print an extra newline incase we have a ^C prefix.
         eprintln!(
-            "Received {} signal, killing active processes..",
+            "\nReceived {} signal, killing active processes..",
             signal_name
         );
 
