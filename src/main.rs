@@ -40,17 +40,32 @@ struct Config {
 }
 
 #[async_recursion]
-async fn start_proc(name: String, opts: Arc<JobConfig>, delay: Duration) {
-    sleep(delay).await;
+async fn start_proc(prefix: String, opts: JobConfig, initial: bool) {
+    let delay = Duration::from_millis(if initial {
+        opts.delay
+    } else {
+        eprintln!("{} > * > Restarting in {}ms", prefix, opts.restart_delay);
+        opts.restart_delay
+    });
+    if !delay.is_zero() {
+        sleep(delay).await;
+    }
 
-    let restart_delay = Duration::from_millis(opts.restart_delay);
+    if let Err(e) = start_proc_internal(prefix.clone(), &opts).await {
+        eprintln!("{} > * > Process error: {}", prefix, e);
+    }
 
+    start_proc(prefix, opts, false).await;
+}
+
+async fn start_proc_internal(
+    prefix: String,
+    opts: &JobConfig,
+) -> std::io::Result<()> {
     let mut envs = env::vars().collect::<HashMap<String, String>>();
     if let Some(additional_env) = &opts.env {
         envs.extend(additional_env.clone());
     }
-
-    let prefix = color_func(&opts.color, &name);
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
@@ -60,44 +75,38 @@ async fn start_proc(name: String, opts: Arc<JobConfig>, delay: Duration) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!(
-                "{} > * > Failed to start, retrying in {:?}: {}",
-                prefix, restart_delay, e
-            );
-            start_proc(name, opts, restart_delay).await;
-            return;
-        }
-    };
+    let mut child = cmd.spawn()?;
 
     eprintln!("{} > * > Started (pid {})", prefix, child.id().unwrap());
 
     // TODO: fix all unwraps
     let stdout_handle = spawn_output_handler(
-        child.stdout.take().unwrap(),
+        child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
+        })?,
         prefix.clone(),
         "stdout",
     );
     let stderr_handle = spawn_output_handler(
-        child.stderr.take().unwrap(),
+        child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Could not get stderr")
+        })?,
         prefix.clone(),
         "stderr",
     );
-    let status = child.wait().await.unwrap();
-    stdout_handle.await.unwrap();
-    stderr_handle.await.unwrap();
+    let status = child.wait().await?;
+    stdout_handle.await?;
+    stderr_handle.await?;
 
     eprintln!(
         "{} > * > Exited with code {}",
         prefix,
-        status.code().unwrap_or(-1)
+        status
+            .code()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No status code"))?,
     );
 
-    eprintln!("{} > * > Restarting in {:?}", prefix, restart_delay);
-
-    start_proc(name, opts, restart_delay).await;
+    Ok(())
 }
 
 fn spawn_output_handler<R: 'static + AsyncRead + std::marker::Send + Unpin>(
@@ -155,7 +164,11 @@ fn main() -> std::io::Result<()> {
             updated_args.extend(args[1..].iter().map(ToString::to_string));
 
             println!("[Supervisor] Starting inner process..");
-            std::process::Command::new(&args[0]).args(updated_args).stdout(Stdio::inherit()).stderr(Stdio::inherit()).status();
+            std::process::Command::new(&args[0])
+                .args(updated_args)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
             println!("[Supervisor] Inner process exited, waiting 15 seconds before restarting..");
             std::thread::sleep(Duration::from_millis(15_000));
         }
@@ -192,7 +205,10 @@ fn main() -> std::io::Result<()> {
                     .into_string()
                     .expect("Could not parse current directory"),
                 Err(e) => {
-                    eprintln!("Could not read current directory, defaulting to $HOME: {}", e);
+                    eprintln!(
+                        "Could not read current directory, defaulting to $HOME: {}",
+                        e
+                    );
                     home_path.clone()
                 }
             };
@@ -229,8 +245,8 @@ fn main() -> std::io::Result<()> {
             }
 
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
-            let delay = Duration::from_millis(job_config.delay);
-            let handle = tokio::spawn(start_proc(name, Arc::new(job_config), delay));
+            let prefix = color_func(&job_config.color, &name);
+            let handle = tokio::spawn(start_proc(prefix, job_config, true));
             handles.push(handle);
         }
 
