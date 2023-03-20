@@ -127,7 +127,7 @@ fn spawn_output_handler<R: 'static + AsyncRead + std::marker::Send + Unpin>(
     })
 }
 
-fn color_func(color: &str, tag: &str) -> String {
+fn create_prefix(color: &str, tag: &str) -> String {
     let colors = [
         ("red", "\x1b[31m"),
         ("green", "\x1b[32m"),
@@ -266,7 +266,7 @@ fn main() -> std::io::Result<()> {
             }
 
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
-            let prefix = color_func(&job_config.color, &name);
+            let prefix = create_prefix(&job_config.color, &name);
             let handle = tokio::spawn(start_proc(prefix, job_config, true));
             handles.push(handle);
         }
