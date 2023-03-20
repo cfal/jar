@@ -1,10 +1,11 @@
-use async_recursion::async_recursion;
-use rand::Rng;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::process::Stdio;
 use std::time::Duration;
+
+use async_recursion::async_recursion;
+use rand::Rng;
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Builder;
@@ -80,7 +81,6 @@ async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<
         })?
     );
 
-    // TODO: fix all unwraps
     let stdout_handle = spawn_output_handler(
         child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
@@ -110,7 +110,7 @@ async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<
     Ok(())
 }
 
-fn spawn_output_handler<R: 'static + AsyncRead + std::marker::Send + Unpin>(
+fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin>(
     reader: R,
     prefix: String,
     msg_type: &'static str,
