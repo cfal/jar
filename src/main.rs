@@ -72,7 +72,13 @@ async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<
 
     let mut child = cmd.spawn()?;
 
-    eprintln!("{} > * > Started (pid {})", prefix, child.id().unwrap());
+    eprintln!(
+        "{} > * > Started (pid {})",
+        prefix,
+        child.id().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Could not get child pid")
+        })?
+    );
 
     // TODO: fix all unwraps
     let stdout_handle = spawn_output_handler(
@@ -181,7 +187,7 @@ fn main() -> std::io::Result<()> {
     let config_path = &args[2];
     let config_parent_path = std::path::Path::new(config_path)
         .parent()
-        .unwrap()
+        .expect("Could not read the parent path of the config file")
         .to_string_lossy()
         .into_owned();
 
