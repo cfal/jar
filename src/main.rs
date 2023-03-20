@@ -281,8 +281,9 @@ fn main() -> std::io::Result<()> {
         .build()
         .expect("Could not build tokio runtime");
 
-    let active_pids = runtime.block_on(async move {
+    let (active_pids, active_root_pids) = runtime.block_on(async move {
         let active_pids = Arc::new(Mutex::new(HashSet::new()));
+        let active_root_pids = Arc::new(Mutex::new(HashSet::new()));
         for (name, job_config) in config.jobs {
             if job_config.disabled {
                 eprintln!("! Skipping disabled job: {}", name);
@@ -296,7 +297,13 @@ fn main() -> std::io::Result<()> {
 
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
             let prefix = create_prefix(&job_config.color, &name);
-            tokio::spawn(start_proc(prefix, job_config, active_pids.clone()));
+
+            let pids = if job_config.command.starts_with("sudo ") {
+                active_root_pids.clone()
+            } else {
+                active_pids.clone()
+            };
+            tokio::spawn(start_proc(prefix, job_config, pids));
         }
 
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
@@ -318,10 +325,14 @@ fn main() -> std::io::Result<()> {
         );
 
         let mut pids = active_pids.lock().unwrap();
-        let cloned_pids = pids.clone();
-        pids.clear();
+        let mut root_pids = active_root_pids.lock().unwrap();
 
-        cloned_pids
+        let cloned_pids = pids.clone();
+        let cloned_root_pids = root_pids.clone();
+        pids.clear();
+        root_pids.clear();
+
+        (cloned_pids, cloned_root_pids)
     });
 
     runtime.shutdown_background();
@@ -334,6 +345,18 @@ fn main() -> std::io::Result<()> {
                 // will also kill our current process, and the wrapper process.
                 // Assume that children processes also handle killing their own
                 // children correctly.
+                pid.to_string(),
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+    }
+
+    for pid in active_root_pids.into_iter() {
+        let _ = std::process::Command::new("sudo")
+            .args([
+                String::from("kill"),
+                String::from("-TERM"),
                 pid.to_string(),
             ])
             .stdout(Stdio::inherit())
