@@ -323,7 +323,7 @@ fn main() -> std::io::Result<()> {
         cloned_pids
     });
 
-    drop(runtime);
+    runtime.shutdown_background();
 
     for pid in active_pids.into_iter() {
         let _ = std::process::Command::new("kill")
