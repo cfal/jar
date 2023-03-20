@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::Rng;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::runtime::Builder;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -37,7 +39,7 @@ struct Config {
     jobs: HashMap<String, JobConfig>,
 }
 
-async fn start_proc(prefix: String, opts: JobConfig) {
+async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<HashSet<u32>>>) {
     let mut initial = true;
     loop {
         let delay = Duration::from_millis(if initial {
@@ -52,13 +54,22 @@ async fn start_proc(prefix: String, opts: JobConfig) {
             sleep(delay).await;
         }
 
-        if let Err(e) = start_proc_internal(&prefix, &opts).await {
-            eprintln!("{} > * > Process error: {}", prefix, e);
+        match start_proc_internal(&prefix, &opts, &active_pids).await {
+            Ok(true) => break,
+            Ok(false) => (),
+            Err(e) => {
+                eprintln!("{} > * > Process error: {}", prefix, e);
+            }
         }
     }
+    eprintln!("{} > * > Shutting down..", prefix);
 }
 
-async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<()> {
+async fn start_proc_internal(
+    prefix: &str,
+    opts: &JobConfig,
+    active_pids: &Arc<Mutex<HashSet<u32>>>,
+) -> std::io::Result<bool> {
     let mut envs = env::vars().collect::<HashMap<String, String>>();
     if let Some(additional_env) = &opts.env {
         envs.extend(additional_env.clone());
@@ -72,16 +83,29 @@ async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()?;
+    let child = cmd.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Could not get child pid"))?;
 
-    eprintln!(
-        "{} > * > Started (pid {})",
-        prefix,
-        child.id().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Could not get child pid")
-        })?
-    );
+    active_pids.lock().unwrap().insert(pid);
 
+    eprintln!("{} > * > Started (pid {})", prefix, pid);
+
+    let handle_child_result = handle_child(prefix, child).await;
+
+    // This should never be true because we're single threaded, but if we were to
+    // switch to a multi-threaded executor, a cleared set means that we are shutting down,
+    // and we can use it as a signal not to restart.
+    if !active_pids.lock().unwrap().remove(&pid) {
+        Ok(true)
+    } else {
+        handle_child_result?;
+        Ok(false)
+    }
+}
+
+async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
     let stdout_handle = spawn_output_handler(
         child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
@@ -257,8 +281,8 @@ fn main() -> std::io::Result<()> {
         .build()
         .expect("Could not build tokio runtime");
 
-    runtime.block_on(async move {
-        let mut handles = Vec::new();
+    let (signal_name, active_pids) = runtime.block_on(async move {
+        let active_pids = Arc::new(Mutex::new(HashSet::new()));
         for (name, job_config) in config.jobs {
             if job_config.disabled {
                 eprintln!("! Skipping disabled job: {}", name);
@@ -272,14 +296,46 @@ fn main() -> std::io::Result<()> {
 
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
             let prefix = create_prefix(&job_config.color, &name);
-            let handle = tokio::spawn(start_proc(prefix, job_config));
-            handles.push(handle);
+            tokio::spawn(start_proc(prefix, job_config, active_pids.clone()));
         }
 
-        for handle in handles {
-            handle.await.unwrap();
-        }
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigquit = signal(SignalKind::quit()).unwrap();
+
+        let signal_name = tokio::select! {
+            _ = sigterm.recv() => "TERM",
+            _ = sighup.recv() => "HUP",
+            _ = sigint.recv() => "INT",
+            _ = sigquit.recv() => "QUIT",
+        };
+
+        let mut pids = active_pids.lock().unwrap();
+        let cloned_pids = pids.clone();
+        pids.clear();
+
+        (signal_name, cloned_pids)
     });
+
+    drop(runtime);
+
+    eprintln!(
+        "Received {} signal, killing active processes..",
+        signal_name
+    );
+
+    for pid in active_pids.into_iter() {
+        let _ = std::process::Command::new("kill")
+            .args([
+                format!("-{}", signal_name),
+                // negative to signal we should kill the process group.
+                format!("-{}", pid),
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+    }
 
     Ok(())
 }
