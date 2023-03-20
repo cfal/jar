@@ -12,3 +12,8 @@ serde_json = "*"
 serde_yaml = "*"
 rand = "*"
 async-recursion = "*"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+
