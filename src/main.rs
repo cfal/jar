@@ -194,7 +194,18 @@ fn main() -> std::io::Result<()> {
     let home_path = env::var("HOME").expect("Could not read $HOME");
 
     let config_data = std::fs::read_to_string(config_path)?;
-    let mut config: Config = serde_json::from_str(&config_data)?;
+
+    let mut config: Config = match serde_yaml::from_str(&config_data) {
+        Ok(c) => c,
+        Err(_) => {
+            let config_data = config_data
+                .split("\n")
+                .filter(|s| !s.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str(&config_data)?
+        }
+    };
 
     let print_colors = [
         "red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray",
