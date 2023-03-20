@@ -3,7 +3,6 @@ use std::env;
 use std::process::Stdio;
 use std::time::Duration;
 
-use async_recursion::async_recursion;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -38,23 +37,25 @@ struct Config {
     jobs: HashMap<String, JobConfig>,
 }
 
-#[async_recursion]
-async fn start_proc(prefix: String, opts: JobConfig, initial: bool) {
-    let delay = Duration::from_millis(if initial {
-        opts.delay
-    } else {
-        eprintln!("{} > * > Restarting in {}ms", prefix, opts.restart_delay);
-        opts.restart_delay
-    });
-    if !delay.is_zero() {
-        sleep(delay).await;
-    }
+async fn start_proc(prefix: String, opts: JobConfig) {
+    let mut initial = true;
+    loop {
+        let delay = Duration::from_millis(if initial {
+            initial = false;
+            opts.delay
+        } else {
+            opts.restart_delay
+        });
 
-    if let Err(e) = start_proc_internal(&prefix, &opts).await {
-        eprintln!("{} > * > Process error: {}", prefix, e);
-    }
+        if !delay.is_zero() {
+            eprintln!("{} > * > Starting in {}s", prefix, delay.as_secs());
+            sleep(delay).await;
+        }
 
-    start_proc(prefix, opts, false).await;
+        if let Err(e) = start_proc_internal(&prefix, &opts).await {
+            eprintln!("{} > * > Process error: {}", prefix, e);
+        }
+    }
 }
 
 async fn start_proc_internal(prefix: &str, opts: &JobConfig) -> std::io::Result<()> {
@@ -267,7 +268,7 @@ fn main() -> std::io::Result<()> {
 
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
             let prefix = create_prefix(&job_config.color, &name);
-            let handle = tokio::spawn(start_proc(prefix, job_config, true));
+            let handle = tokio::spawn(start_proc(prefix, job_config));
             handles.push(handle);
         }
 
