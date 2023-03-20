@@ -155,17 +155,21 @@ fn create_prefix(color: &str, tag: &str) -> String {
 fn main() -> std::io::Result<()> {
     let args = env::args().collect::<Vec<_>>();
     if args.len() < 2 {
-        eprintln!("Usage: {} config.json", args[0]);
+        eprintln!("Usage: {} [--wrap] config.json", args[0]);
         std::process::exit(1);
     }
 
-    if args[1] != "--inner" {
+    if args[1] == "--wrap" {
+        if args.len() < 3 {
+            eprintln!("No config file provided.");
+            std::process::exit(1);
+        }
         loop {
-            let mut updated_args = Vec::with_capacity(args.len() + 1);
-            updated_args.push(String::from("--inner"));
-            updated_args.extend(args[1..].iter().map(ToString::to_string));
-
-            eprintln!("[Supervisor] Starting inner process..");
+            let updated_args = args[2..]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            eprintln!("[Wrapper] Starting inner process..");
             match std::process::Command::new(&args[0])
                 .args(updated_args)
                 .stdout(Stdio::inherit())
@@ -173,19 +177,19 @@ fn main() -> std::io::Result<()> {
                 .status()
             {
                 Ok(exit_status) => match exit_status.code() {
-                    Some(code) => eprintln!("[Supervisor] Exited with status code: {code}"),
-                    None => eprintln!("[Supervisor] Process terminated by signal"),
+                    Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
+                    None => eprintln!("[Wrapper] Process terminated by signal"),
                 },
                 Err(e) => {
-                    eprintln!("[Supervisor] Failed to read exit status: {}", e);
+                    eprintln!("[Wrapper] Failed to read exit status: {}", e);
                 }
             }
-            eprintln!("[Supervisor] Inner process exited, waiting 15 seconds before restarting..");
+            eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
             std::thread::sleep(Duration::from_millis(15_000));
         }
     }
 
-    let config_path = &args[2];
+    let config_path = &args[1];
     let config_parent_path = std::path::Path::new(config_path)
         .parent()
         .expect("Could not read the parent path of the config file")
