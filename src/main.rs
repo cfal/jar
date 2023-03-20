@@ -281,7 +281,7 @@ fn main() -> std::io::Result<()> {
         .build()
         .expect("Could not build tokio runtime");
 
-    let (signal_name, active_pids) = runtime.block_on(async move {
+    let active_pids = runtime.block_on(async move {
         let active_pids = Arc::new(Mutex::new(HashSet::new()));
         for (name, job_config) in config.jobs {
             if job_config.disabled {
@@ -311,26 +311,29 @@ fn main() -> std::io::Result<()> {
             _ = sigquit.recv() => "QUIT",
         };
 
+        eprintln!(
+            "Received {} signal, killing active processes..",
+            signal_name
+        );
+
         let mut pids = active_pids.lock().unwrap();
         let cloned_pids = pids.clone();
         pids.clear();
 
-        (signal_name, cloned_pids)
+        cloned_pids
     });
 
     drop(runtime);
 
-    eprintln!(
-        "Received {} signal, killing active processes..",
-        signal_name
-    );
-
     for pid in active_pids.into_iter() {
         let _ = std::process::Command::new("kill")
             .args([
-                format!("-{}", signal_name),
-                // negative to signal we should kill the process group.
-                format!("-{}", pid),
+                String::from("-TERM"),
+                // We can't kill the whole process group, because that
+                // will also kill our current process, and the wrapper process.
+                // Assume that children processes also handle killing their own
+                // children correctly.
+                pid.to_string(),
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
