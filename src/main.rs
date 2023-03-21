@@ -348,30 +348,28 @@ fn main() -> std::io::Result<()> {
     runtime.shutdown_background();
 
     for (sudo_user, pid_set) in active_pid_map.into_iter() {
+        let mut cmd = if sudo_user.is_empty() {
+            let mut kill_cmd = std::process::Command::new("kill");
+            kill_cmd.arg("-TERM");
+            kill_cmd
+        } else {
+            let mut sudo_cmd = std::process::Command::new("sudo");
+            sudo_cmd.args(["-u", &sudo_user, "kill", "-TERM"]);
+            sudo_cmd
+        };
+
         for pid in pid_set.into_iter() {
-            let _ = if sudo_user.is_empty() {
-                std::process::Command::new("kill")
-                    .arg("-TERM")
-                    // We can't kill the whole process group, because that
-                    // will also kill our current process, and the wrapper process.
-                    // Assume that children processes also handle killing their own
-                    // children correctly.
-                    .arg(pid.to_string())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-            } else {
-                std::process::Command::new("sudo")
-                    .arg("-u")
-                    .arg(&sudo_user)
-                    .arg("kill")
-                    .arg("-TERM")
-                    .arg(pid.to_string())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-            };
+            cmd.arg(pid.to_string());
         }
+
+        // We can't kill the whole process group by specifying -<pid>, because that
+        // will also kill our current process, and the wrapper process.
+        // Assume that children processes also handle killing their own
+        // children correctly.
+        let _ = cmd
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
     }
 
     Ok(())
