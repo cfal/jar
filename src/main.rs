@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::process::Stdio;
@@ -26,7 +27,9 @@ struct JobConfig {
     delay: u64,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-    #[serde(default = "default_restart_delay")]
+    #[serde(default, alias = "sudoUser")]
+    sudo_user: Option<String>,
+    #[serde(default = "default_restart_delay", alias = "restartDelay")]
     restart_delay: u64,
 }
 
@@ -77,7 +80,10 @@ async fn start_proc_internal(
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg(format!("exec {}", opts.command))
+        .arg(match opts.sudo_user {
+            Some(ref username) => format!("exec sudo -u {} {}", username, opts.command),
+            None => format!("exec {}", opts.command),
+        })
         .current_dir(opts.cwd.clone())
         .envs(&envs)
         .stdout(Stdio::piped())
@@ -281,9 +287,13 @@ fn main() -> std::io::Result<()> {
         .build()
         .expect("Could not build tokio runtime");
 
-    let (active_pids, active_root_pids) = runtime.block_on(async move {
-        let active_pids = Arc::new(Mutex::new(HashSet::new()));
-        let active_root_pids = Arc::new(Mutex::new(HashSet::new()));
+    let active_pid_map = runtime.block_on(async move {
+        // another option is to pass a different variable to keep track
+        // of the pid for each task - for example, HashMap<String, Arc<AtomicU32>>,
+        // where the key would be the name of the job and everyone gets a different
+        // Arc<AtomicU32>. Could possibly reduce contention if there are very frequent
+        // restarts.
+        let mut pid_map: HashMap<String, Arc<Mutex<HashSet<u32>>>> = HashMap::new();
         for (name, job_config) in config.jobs {
             if job_config.disabled {
                 eprintln!("! Skipping disabled job: {}", name);
@@ -298,12 +308,12 @@ fn main() -> std::io::Result<()> {
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
             let prefix = create_prefix(&job_config.color, &name);
 
-            let pids = if job_config.command.starts_with("sudo ") {
-                active_root_pids.clone()
-            } else {
-                active_pids.clone()
+            let sudo_user = job_config.sudo_user.clone().unwrap_or_else(String::default);
+            let pid_set = match pid_map.entry(sudo_user.clone()) {
+                Entry::Occupied(o) => o.get().clone(),
+                Entry::Vacant(v) => v.insert(Arc::new(Mutex::new(HashSet::new()))).clone(),
             };
-            tokio::spawn(start_proc(prefix, job_config, pids));
+            tokio::spawn(start_proc(prefix, job_config, pid_set));
         }
 
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
@@ -324,44 +334,44 @@ fn main() -> std::io::Result<()> {
             signal_name
         );
 
-        let mut pids = active_pids.lock().unwrap();
-        let mut root_pids = active_root_pids.lock().unwrap();
+        let mut cloned_pid_map = HashMap::new();
+        for (sudo_user, pid_set_mutex) in pid_map.into_iter() {
+            let mut pid_set = pid_set_mutex.lock().unwrap();
+            let cloned_pid_set = pid_set.clone();
+            pid_set.clear();
+            cloned_pid_map.insert(sudo_user, cloned_pid_set);
+        }
 
-        let cloned_pids = pids.clone();
-        let cloned_root_pids = root_pids.clone();
-        pids.clear();
-        root_pids.clear();
-
-        (cloned_pids, cloned_root_pids)
+        cloned_pid_map
     });
 
     runtime.shutdown_background();
 
-    for pid in active_pids.into_iter() {
-        let _ = std::process::Command::new("kill")
-            .args([
-                String::from("-TERM"),
-                // We can't kill the whole process group, because that
-                // will also kill our current process, and the wrapper process.
-                // Assume that children processes also handle killing their own
-                // children correctly.
-                pid.to_string(),
-            ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-    }
-
-    for pid in active_root_pids.into_iter() {
-        let _ = std::process::Command::new("sudo")
-            .args([
-                String::from("kill"),
-                String::from("-TERM"),
-                pid.to_string(),
-            ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
+    for (sudo_user, pid_set) in active_pid_map.into_iter() {
+        for pid in pid_set.into_iter() {
+            let _ = if sudo_user.is_empty() {
+                std::process::Command::new("kill")
+                    .arg("-TERM")
+                    // We can't kill the whole process group, because that
+                    // will also kill our current process, and the wrapper process.
+                    // Assume that children processes also handle killing their own
+                    // children correctly.
+                    .arg(pid.to_string())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+            } else {
+                std::process::Command::new("sudo")
+                    .arg("-u")
+                    .arg(&sudo_user)
+                    .arg("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+            };
+        }
     }
 
     Ok(())
