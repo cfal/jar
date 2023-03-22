@@ -234,7 +234,7 @@ fn main() -> std::io::Result<()> {
         Ok(c) => c,
         Err(_) => {
             let config_data = config_data
-                .split("\n")
+                .split('\n')
                 .filter(|s| !s.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -308,8 +308,8 @@ fn main() -> std::io::Result<()> {
             eprintln!("Initializing job \"{}\": {:?}", name, job_config);
             let prefix = create_prefix(&job_config.color, &name);
 
-            let sudo_user = job_config.sudo_user.clone().unwrap_or_else(String::default);
-            let pid_set = match pid_map.entry(sudo_user.clone()) {
+            let sudo_user = job_config.sudo_user.clone().unwrap_or_default();
+            let pid_set = match pid_map.entry(sudo_user) {
                 Entry::Occupied(o) => o.get().clone(),
                 Entry::Vacant(v) => v.insert(Arc::new(Mutex::new(HashSet::new()))).clone(),
             };
