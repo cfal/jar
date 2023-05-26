@@ -184,7 +184,7 @@ fn create_prefix(color: &str, tag: &str) -> String {
 
 fn main() -> std::io::Result<()> {
     let args = env::args().collect::<Vec<_>>();
-    if args.len() < 2 {
+    if args.len() < 2 || args.iter().find(|arg| arg.as_str() == "--help").is_some() {
         eprintln!("Usage: {} [--wrap] config.json", args[0]);
         std::process::exit(1);
     }
