@@ -32,10 +32,36 @@ struct JobConfig {
     sudo_user: Option<String>,
     #[serde(default = "default_restart_delay", alias = "restartDelay")]
     restart_delay: u64,
+    #[serde(default)]
+    datetime: DateTimeConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DateTimeConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_datetime_format")]
+    format: String,
+    #[serde(default)]
+    local: bool,
+}
+
+impl Default for DateTimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: String::new(),
+            local: false,
+        }
+    }
 }
 
 fn default_restart_delay() -> u64 {
     15_000
+}
+
+fn default_datetime_format() -> String {
+    String::from("%Y-%m-%d %H:%M:%S %Z")
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +125,7 @@ async fn start_proc_internal(
 
     eprintln!("{} (s) > Started (pid {})", prefix, pid);
 
-    let handle_child_result = handle_child(prefix, child).await;
+    let handle_child_result = handle_child(prefix, &opts.datetime, child).await;
 
     // This should never be true because we're single threaded, but if we were to
     // switch to a multi-threaded executor, a cleared set means that we are shutting down,
@@ -112,13 +138,18 @@ async fn start_proc_internal(
     }
 }
 
-async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
+async fn handle_child(
+    prefix: &str,
+    datetime: &DateTimeConfig,
+    mut child: Child,
+) -> std::io::Result<()> {
     let stdout_prefix = format!("{} (1)", prefix);
     let stdout_handle = spawn_output_handler(
         child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
         })?,
         stdout_prefix,
+        datetime.clone(),
         std::io::stdout(),
     );
     let stderr_prefix = format!("{} (2)", prefix);
@@ -127,6 +158,7 @@ async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stderr")
         })?,
         stderr_prefix,
+        datetime.clone(),
         std::io::stderr(),
     );
     let status = child.wait().await?;
@@ -146,15 +178,38 @@ async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
 
 fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin, T: Write + Send + 'static>(
     reader: R,
-    prefix: String,
+    output_prefix: String,
+    datetime: DateTimeConfig,
     mut writer: T,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
+        let datetime_items = match datetime.enabled {
+            true => Some(
+                chrono::format::StrftimeItems::new(&datetime.format)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ),
+            false => None,
+        };
+        let datetime_local = datetime.local;
+
         let reader = BufReader::new(reader);
         let mut lines = reader.lines();
-
         while let Some(line) = lines.next_line().await? {
-            writeln!(writer, "{} > {}", prefix, line).expect("Could not write log line");
+            match datetime_items {
+                Some(ref items) => writeln!(
+                    writer,
+                    "{} > {} > {}",
+                    output_prefix,
+                    match datetime_local {
+                        true => chrono::offset::Local::now().format_with_items(items.iter()),
+                        false => chrono::offset::Utc::now().format_with_items(items.iter()),
+                    },
+                    line
+                ),
+                None => writeln!(writer, "{} > {}", output_prefix, line),
+            }
+            .expect("Could not write log line")
         }
 
         Ok(())
