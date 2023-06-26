@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::io::Write;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,7 +54,7 @@ async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<Hash
         });
 
         if !delay.is_zero() {
-            eprintln!("{} > * > Starting in {}s", prefix, delay.as_secs());
+            eprintln!("{} (s) > Starting in {}s", prefix, delay.as_secs());
             sleep(delay).await;
         }
 
@@ -61,11 +62,11 @@ async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<Hash
             Ok(true) => break,
             Ok(false) => (),
             Err(e) => {
-                eprintln!("{} > * > Process error: {}", prefix, e);
+                eprintln!("{} (s) > Process error: {}", prefix, e);
             }
         }
     }
-    eprintln!("{} > * > Shutting down..", prefix);
+    eprintln!("{} (s) > Shutting down..", prefix);
 }
 
 async fn start_proc_internal(
@@ -96,7 +97,7 @@ async fn start_proc_internal(
 
     active_pids.lock().unwrap().insert(pid);
 
-    eprintln!("{} > * > Started (pid {})", prefix, pid);
+    eprintln!("{} (s) > Started (pid {})", prefix, pid);
 
     let handle_child_result = handle_child(prefix, child).await;
 
@@ -112,26 +113,28 @@ async fn start_proc_internal(
 }
 
 async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
+    let stdout_prefix = format!("{} (1)", prefix);
     let stdout_handle = spawn_output_handler(
         child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
         })?,
-        prefix.to_string(),
-        "stdout",
+        stdout_prefix,
+        std::io::stdout(),
     );
+    let stderr_prefix = format!("{} (2)", prefix);
     let stderr_handle = spawn_output_handler(
         child.stderr.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "Could not get stderr")
         })?,
-        prefix.to_string(),
-        "stderr",
+        stderr_prefix,
+        std::io::stderr(),
     );
     let status = child.wait().await?;
     stdout_handle.await??;
     stderr_handle.await??;
 
     eprintln!(
-        "{} > * > Exited with code {}",
+        "{} (s) > Exited with code {}",
         prefix,
         status
             .code()
@@ -141,17 +144,17 @@ async fn handle_child(prefix: &str, mut child: Child) -> std::io::Result<()> {
     Ok(())
 }
 
-fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin>(
+fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin, T: Write + Send + 'static>(
     reader: R,
     prefix: String,
-    msg_type: &'static str,
+    mut writer: T,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
         let reader = BufReader::new(reader);
         let mut lines = reader.lines();
 
         while let Some(line) = lines.next_line().await? {
-            eprintln!("{} > {} > {}", prefix, msg_type, line);
+            writeln!(writer, "{} > {}", prefix, line).expect("Could not write log line");
         }
 
         Ok(())
