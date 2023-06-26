@@ -45,7 +45,6 @@ struct DateTimeConfig {
     #[serde(default)]
     local: bool,
 }
-
 impl Default for DateTimeConfig {
     fn default() -> Self {
         Self {
@@ -69,7 +68,51 @@ struct Config {
     jobs: HashMap<String, JobConfig>,
 }
 
+#[derive(Clone)]
+struct PrefixWriter<'a> {
+    prefix: String,
+    datetime_items: Vec<chrono::format::Item<'a>>,
+    datetime_local: bool,
+}
+
+impl<'a> PrefixWriter<'a> {
+    pub fn from(prefix: String, config: &'a DateTimeConfig) -> Self {
+        let datetime_items = match config.enabled {
+            true => chrono::format::StrftimeItems::new(&config.format)
+                .into_iter()
+                .collect(),
+            false => vec![],
+        };
+        Self {
+            prefix,
+            datetime_items,
+            datetime_local: config.local,
+        }
+    }
+}
+
+impl<'a> std::fmt::Display for PrefixWriter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.datetime_items.is_empty() {
+            write!(f, "{}", self.prefix)
+        } else {
+            write!(
+                f,
+                "{} > {}",
+                self.prefix,
+                match self.datetime_local {
+                    true =>
+                        chrono::offset::Local::now().format_with_items(self.datetime_items.iter()),
+                    false =>
+                        chrono::offset::Utc::now().format_with_items(self.datetime_items.iter()),
+                }
+            )
+        }
+    }
+}
+
 async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<HashSet<u32>>>) {
+    let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
     let mut initial = true;
     loop {
         let delay = Duration::from_millis(if initial {
@@ -80,22 +123,23 @@ async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<Hash
         });
 
         if !delay.is_zero() {
-            eprintln!("{} (s) > Starting in {}s", prefix, delay.as_secs());
+            eprintln!("{} > Starting in {}s", status_prefix, delay.as_secs());
             sleep(delay).await;
         }
 
-        match start_proc_internal(&prefix, &opts, &active_pids).await {
+        match start_proc_internal(&status_prefix, &prefix, &opts, &active_pids).await {
             Ok(true) => break,
             Ok(false) => (),
             Err(e) => {
-                eprintln!("{} (s) > Process error: {}", prefix, e);
+                eprintln!("{} > Process error: {}", status_prefix, e);
             }
         }
     }
-    eprintln!("{} (s) > Shutting down..", prefix);
+    eprintln!("{} > Shutting down..", status_prefix);
 }
 
 async fn start_proc_internal(
+    status_prefix: &PrefixWriter<'_>,
     prefix: &str,
     opts: &JobConfig,
     active_pids: &Arc<Mutex<HashSet<u32>>>,
@@ -123,9 +167,9 @@ async fn start_proc_internal(
 
     active_pids.lock().unwrap().insert(pid);
 
-    eprintln!("{} (s) > Started (pid {})", prefix, pid);
+    eprintln!("{} > Started (pid {})", status_prefix, pid);
 
-    let handle_child_result = handle_child(prefix, &opts.datetime, child).await;
+    let handle_child_result = handle_child(status_prefix, prefix, &opts.datetime, child).await;
 
     // This should never be true because we're single threaded, but if we were to
     // switch to a multi-threaded executor, a cleared set means that we are shutting down,
@@ -139,6 +183,7 @@ async fn start_proc_internal(
 }
 
 async fn handle_child(
+    status_prefix: &PrefixWriter<'_>,
     prefix: &str,
     datetime: &DateTimeConfig,
     mut child: Child,
@@ -166,8 +211,8 @@ async fn handle_child(
     stderr_handle.await??;
 
     eprintln!(
-        "{} (s) > Exited with code {}",
-        prefix,
+        "{} > Exited with code {}",
+        status_prefix,
         status
             .code()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No status code"))?,
@@ -183,33 +228,11 @@ fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin, T: Write + Send +
     mut writer: T,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        let datetime_items = match datetime.enabled {
-            true => Some(
-                chrono::format::StrftimeItems::new(&datetime.format)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-            ),
-            false => None,
-        };
-        let datetime_local = datetime.local;
-
+        let output_prefix = PrefixWriter::from(output_prefix, &datetime);
         let reader = BufReader::new(reader);
         let mut lines = reader.lines();
         while let Some(line) = lines.next_line().await? {
-            match datetime_items {
-                Some(ref items) => writeln!(
-                    writer,
-                    "{} > {} > {}",
-                    output_prefix,
-                    match datetime_local {
-                        true => chrono::offset::Local::now().format_with_items(items.iter()),
-                        false => chrono::offset::Utc::now().format_with_items(items.iter()),
-                    },
-                    line
-                ),
-                None => writeln!(writer, "{} > {}", output_prefix, line),
-            }
-            .expect("Could not write log line")
+            writeln!(writer, "{} > {}", output_prefix, line).expect("Could not write log line");
         }
 
         Ok(())
