@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::Write;
 use std::process::{ExitCode, Stdio};
@@ -35,6 +35,16 @@ struct JobConfig {
     restart_delay: u64,
     #[serde(default)]
     datetime: DateTimeConfig,
+    /// Run job in its own process group (setsid). Allows killing all child processes together.
+    #[serde(default, alias = "processGroup")]
+    process_group: bool,
+    /// Seconds to wait after SIGTERM before sending SIGKILL (default: 5)
+    #[serde(default = "default_shutdown_timeout", alias = "shutdownTimeout")]
+    shutdown_timeout: u64,
+}
+
+fn default_shutdown_timeout() -> u64 {
+    5
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -58,6 +68,15 @@ fn default_datetime_format() -> String {
 #[derive(Debug, Deserialize)]
 struct Config {
     jobs: BTreeMap<String, JobConfig>,
+}
+
+/// Information tracked for each running process
+#[derive(Clone, Copy)]
+struct PidInfo {
+    /// Whether this process is a process group leader (setsid)
+    is_process_group: bool,
+    /// Seconds to wait after SIGTERM before SIGKILL
+    shutdown_timeout: u64,
 }
 
 #[derive(Clone)]
@@ -104,7 +123,7 @@ impl<'a> std::fmt::Display for PrefixWriter<'a> {
 async fn start_proc(
     prefix: String,
     opts: JobConfig,
-    active_pids: Arc<Mutex<HashSet<u32>>>,
+    active_pids: Arc<Mutex<HashMap<u32, PidInfo>>>,
     shutdown: Arc<AtomicBool>,
     base_env: Arc<HashMap<String, String>>,
 ) -> bool {
@@ -154,7 +173,7 @@ async fn start_proc_internal(
     status_prefix: &PrefixWriter<'_>,
     prefix: &str,
     opts: &JobConfig,
-    active_pids: &Arc<Mutex<HashSet<u32>>>,
+    active_pids: &Arc<Mutex<HashMap<u32, PidInfo>>>,
     shutdown: &Arc<AtomicBool>,
     base_env: &Arc<HashMap<String, String>>,
 ) -> std::io::Result<bool> {
@@ -179,6 +198,17 @@ async fn start_proc_internal(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Optionally create a new session/process group so we can kill all children together
+    #[cfg(unix)]
+    if opts.process_group {
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
     let child = cmd.spawn()?;
     let pid = child
         .id()
@@ -193,14 +223,18 @@ async fn start_proc_internal(
         return Ok(true);
     }
 
-    active_pids.lock().unwrap().insert(pid);
+    // Track PID with its shutdown configuration
+    active_pids.lock().unwrap().insert(pid, PidInfo {
+        is_process_group: opts.process_group,
+        shutdown_timeout: opts.shutdown_timeout,
+    });
 
     eprintln!("{} > Started (pid {})", status_prefix, pid);
 
     let handle_child_result = handle_child(status_prefix, prefix, &opts.datetime, child).await;
 
-    // If PID was already removed from set, we're shutting down - don't restart
-    if !active_pids.lock().unwrap().remove(&pid) {
+    // If PID was already removed from map, we're shutting down - don't restart
+    if active_pids.lock().unwrap().remove(&pid).is_none() {
         Ok(true)
     } else {
         handle_child_result?;
@@ -427,8 +461,8 @@ fn main() -> ExitCode {
         .build()
         .expect("Could not build tokio runtime");
 
-    let (active_pid_map, any_job_failed) = runtime.block_on(async move {
-        let mut pid_map: HashMap<String, Arc<Mutex<HashSet<u32>>>> = HashMap::new();
+    let active_pid_map = runtime.block_on(async move {
+        let mut pid_map: HashMap<String, Arc<Mutex<HashMap<u32, PidInfo>>>> = HashMap::new();
         let mut job_handles: Vec<JoinHandle<bool>> = Vec::new();
 
         for (name, job_config) in config.jobs {
@@ -448,7 +482,7 @@ fn main() -> ExitCode {
             let sudo_user = job_config.sudo_user.clone().unwrap_or_default();
             let pid_set = match pid_map.entry(sudo_user) {
                 Entry::Occupied(o) => o.get().clone(),
-                Entry::Vacant(v) => v.insert(Arc::new(Mutex::new(HashSet::new()))).clone(),
+                Entry::Vacant(v) => v.insert(Arc::new(Mutex::new(HashMap::new()))).clone(),
             };
 
             let handle = tokio::spawn(start_proc(
@@ -499,7 +533,7 @@ fn main() -> ExitCode {
                             sudo_cmd
                         };
 
-                        for pid in pid_set.iter() {
+                        for pid in pid_set.keys() {
                             cmd.arg(pid.to_string());
                         }
 
@@ -534,53 +568,139 @@ fn main() -> ExitCode {
             cloned_pid_map.insert(sudo_user, cloned_pid_set);
         }
 
-        // Collect results from all job handles to check for failures
-        let mut any_failed = false;
-        for handle in job_handles {
-            if let Ok(had_failure) = handle.await
-                && had_failure
-            {
-                any_failed = true;
+        // Don't wait for job handles here - they're blocked on child processes
+        // which won't exit until we send them signals. Drop them and let
+        // shutdown_background handle cleanup.
+        drop(job_handles);
+
+        cloned_pid_map
+    });
+
+    // Shutdown runtime - this will abort the blocked tasks
+    runtime.shutdown_background();
+
+    // Collect all PIDs for graceful shutdown
+    let all_pids: Vec<(String, u32, PidInfo)> = active_pid_map
+        .into_iter()
+        .flat_map(|(sudo_user, pid_map): (String, HashMap<u32, PidInfo>)| {
+            pid_map
+                .into_iter()
+                .map(move |(pid, info)| (sudo_user.clone(), pid, info))
+        })
+        .collect();
+
+    if all_pids.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+
+    // Send SIGTERM to all processes (using -pid for process groups)
+    send_signal_to_pids(&all_pids, "TERM");
+
+    // Graceful shutdown: wait for each process according to its timeout
+    let max_timeout = all_pids
+        .iter()
+        .map(|(_, _, info)| info.shutdown_timeout)
+        .max()
+        .unwrap_or(5);
+
+    let start = std::time::Instant::now();
+    let check_interval = Duration::from_millis(100);
+
+    // Track which PIDs have exceeded their timeout
+    let mut killed_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    loop {
+        let elapsed_secs = start.elapsed().as_secs();
+
+        // Check each process
+        for (sudo_user, pid, info) in &all_pids {
+            if killed_pids.contains(pid) {
+                continue;
+            }
+
+            let alive = is_process_alive(*pid);
+            if !alive {
+                // Process exited on its own
+                continue;
+            }
+
+            // If this process has exceeded its timeout, kill it
+            if elapsed_secs >= info.shutdown_timeout {
+                eprintln!(
+                    "Process {} exceeded {}s shutdown timeout, sending SIGKILL..",
+                    pid, info.shutdown_timeout
+                );
+                send_signal_to_pids(&[(sudo_user.clone(), *pid, *info)], "KILL");
+                killed_pids.insert(*pid);
             }
         }
 
-        (cloned_pid_map, any_failed)
-    });
+        // Check if all processes are done
+        let any_alive = all_pids
+            .iter()
+            .any(|(_, pid, _)| !killed_pids.contains(pid) && is_process_alive(*pid));
 
-    runtime.shutdown_background();
-
-    for (sudo_user, pid_set) in active_pid_map.into_iter() {
-        if pid_set.is_empty() {
-            continue;
+        if !any_alive {
+            eprintln!("All processes exited gracefully");
+            break;
         }
 
+        // Exit if we've exceeded the maximum timeout
+        if start.elapsed() >= Duration::from_secs(max_timeout) {
+            break;
+        }
+
+        std::thread::sleep(check_interval);
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Check if a process is still alive
+fn is_process_alive(pid: u32) -> bool {
+    // kill -0 checks if process exists without sending a signal
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Send a signal to a list of PIDs, using process groups where applicable
+fn send_signal_to_pids(pids: &[(String, u32, PidInfo)], signal: &str) {
+    // Group by sudo user for efficient batching
+    let mut by_sudo_user: HashMap<&str, Vec<(u32, bool)>> = HashMap::new();
+    for (sudo_user, pid, info) in pids {
+        by_sudo_user
+            .entry(sudo_user.as_str())
+            .or_default()
+            .push((*pid, info.is_process_group));
+    }
+
+    for (sudo_user, pid_list) in by_sudo_user {
         let mut cmd = if sudo_user.is_empty() {
             let mut kill_cmd = std::process::Command::new("kill");
-            kill_cmd.arg("-TERM");
+            kill_cmd.args([&format!("-{}", signal), "--"]);
             kill_cmd
         } else {
             let mut sudo_cmd = std::process::Command::new("sudo");
-            sudo_cmd.args(["-u", &sudo_user, "kill", "-TERM"]);
+            sudo_cmd.args(["-u", sudo_user, "kill", &format!("-{}", signal), "--"]);
             sudo_cmd
         };
 
-        for pid in pid_set.into_iter() {
-            cmd.arg(pid.to_string());
+        for (pid, is_group) in pid_list {
+            if is_group {
+                // Negative PID kills the process group
+                cmd.arg(format!("-{}", pid));
+            } else {
+                cmd.arg(pid.to_string());
+            }
         }
 
-        // We can't kill the whole process group by specifying -<pid>, because that
-        // will also kill our current process, and the wrapper process.
-        // Assume that children processes also handle killing their own
-        // children correctly.
         let _ = cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
-    }
-
-    if any_job_failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
     }
 }
