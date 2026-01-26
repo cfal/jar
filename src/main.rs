@@ -1,8 +1,9 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io::Write;
-use std::process::Stdio;
+use std::process::{ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ struct JobConfig {
     datetime: DateTimeConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 struct DateTimeConfig {
     #[serde(default)]
     enabled: bool,
@@ -44,15 +45,6 @@ struct DateTimeConfig {
     format: String,
     #[serde(default)]
     local: bool,
-}
-impl Default for DateTimeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            format: String::new(),
-            local: false,
-        }
-    }
 }
 
 fn default_restart_delay() -> u64 {
@@ -65,7 +57,7 @@ fn default_datetime_format() -> String {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    jobs: HashMap<String, JobConfig>,
+    jobs: BTreeMap<String, JobConfig>,
 }
 
 #[derive(Clone)]
@@ -78,9 +70,7 @@ struct PrefixWriter<'a> {
 impl<'a> PrefixWriter<'a> {
     pub fn from(prefix: String, config: &'a DateTimeConfig) -> Self {
         let datetime_items = match config.enabled {
-            true => chrono::format::StrftimeItems::new(&config.format)
-                .into_iter()
-                .collect(),
+            true => chrono::format::StrftimeItems::new(&config.format).collect(),
             false => vec![],
         };
         Self {
@@ -111,10 +101,23 @@ impl<'a> std::fmt::Display for PrefixWriter<'a> {
     }
 }
 
-async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<HashSet<u32>>>) {
+async fn start_proc(
+    prefix: String,
+    opts: JobConfig,
+    active_pids: Arc<Mutex<HashSet<u32>>>,
+    shutdown: Arc<AtomicBool>,
+    base_env: Arc<HashMap<String, String>>,
+) -> bool {
     let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
     let mut initial = true;
+    let mut had_failure = false;
+
     loop {
+        // Check shutdown before starting a new process
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         let delay = Duration::from_millis(if initial {
             initial = false;
             opts.delay
@@ -125,17 +128,26 @@ async fn start_proc(prefix: String, opts: JobConfig, active_pids: Arc<Mutex<Hash
         if !delay.is_zero() {
             eprintln!("{} > Starting in {}s", status_prefix, delay.as_secs());
             sleep(delay).await;
+
+            // Check shutdown again after sleeping
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
         }
 
-        match start_proc_internal(&status_prefix, &prefix, &opts, &active_pids).await {
+        match start_proc_internal(&status_prefix, &prefix, &opts, &active_pids, &shutdown, &base_env).await {
             Ok(true) => break,
-            Ok(false) => (),
+            Ok(false) => {
+                had_failure = true;
+            }
             Err(e) => {
                 eprintln!("{} > Process error: {}", status_prefix, e);
+                had_failure = true;
             }
         }
     }
     eprintln!("{} > Shutting down..", status_prefix);
+    had_failure
 }
 
 async fn start_proc_internal(
@@ -143,8 +155,15 @@ async fn start_proc_internal(
     prefix: &str,
     opts: &JobConfig,
     active_pids: &Arc<Mutex<HashSet<u32>>>,
+    shutdown: &Arc<AtomicBool>,
+    base_env: &Arc<HashMap<String, String>>,
 ) -> std::io::Result<bool> {
-    let mut envs = env::vars().collect::<HashMap<String, String>>();
+    // Check shutdown before spawning
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
+
+    let mut envs = base_env.as_ref().clone();
     if let Some(additional_env) = &opts.env {
         envs.extend(additional_env.clone());
     }
@@ -163,7 +182,16 @@ async fn start_proc_internal(
     let child = cmd.spawn()?;
     let pid = child
         .id()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Could not get child pid"))?;
+        .ok_or_else(|| std::io::Error::other("Could not get child pid"))?;
+
+    // Check shutdown again before registering PID
+    if shutdown.load(Ordering::Relaxed) {
+        // Process was spawned but we're shutting down - kill it immediately
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        return Ok(true);
+    }
 
     active_pids.lock().unwrap().insert(pid);
 
@@ -171,9 +199,7 @@ async fn start_proc_internal(
 
     let handle_child_result = handle_child(status_prefix, prefix, &opts.datetime, child).await;
 
-    // This should never be true because we're single threaded, but if we were to
-    // switch to a multi-threaded executor, a cleared set means that we are shutting down,
-    // and we can use it as a signal not to restart.
+    // If PID was already removed from set, we're shutting down - don't restart
     if !active_pids.lock().unwrap().remove(&pid) {
         Ok(true)
     } else {
@@ -191,7 +217,7 @@ async fn handle_child(
     let stdout_prefix = format!("{} (1)", prefix);
     let stdout_handle = spawn_output_handler(
         child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Could not get stdout")
+            std::io::Error::other("Could not get stdout")
         })?,
         stdout_prefix,
         datetime.clone(),
@@ -200,23 +226,37 @@ async fn handle_child(
     let stderr_prefix = format!("{} (2)", prefix);
     let stderr_handle = spawn_output_handler(
         child.stderr.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Could not get stderr")
+            std::io::Error::other("Could not get stderr")
         })?,
         stderr_prefix,
         datetime.clone(),
         std::io::stderr(),
     );
     let status = child.wait().await?;
-    stdout_handle.await??;
-    stderr_handle.await??;
+    // Ignore errors from output handlers - they may fail if stdout/stderr is closed
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
 
-    eprintln!(
-        "{} > Exited with code {}",
-        status_prefix,
-        status
-            .code()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No status code"))?,
-    );
+    // Handle both normal exit codes and signal termination
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = status.code() {
+            eprintln!("{} > Exited with code {}", status_prefix, code);
+        } else if let Some(signal) = status.signal() {
+            eprintln!("{} > Killed by signal {}", status_prefix, signal);
+        } else {
+            eprintln!("{} > Exited with unknown status", status_prefix);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        match status.code() {
+            Some(code) => eprintln!("{} > Exited with code {}", status_prefix, code),
+            None => eprintln!("{} > Exited with unknown status", status_prefix),
+        }
+    }
 
     Ok(())
 }
@@ -232,7 +272,10 @@ fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin, T: Write + Send +
         let reader = BufReader::new(reader);
         let mut lines = reader.lines();
         while let Some(line) = lines.next_line().await? {
-            writeln!(writer, "{} > {}", output_prefix, line).expect("Could not write log line");
+            // Gracefully handle write failures (e.g., stdout closed)
+            if writeln!(writer, "{} > {}", output_prefix, line).is_err() {
+                break;
+            }
         }
 
         Ok(())
@@ -263,26 +306,24 @@ fn create_prefix(color: &str, tag: &str) -> String {
     format!("{}{}{}", code, tag, reset)
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> ExitCode {
     let args = env::args().collect::<Vec<_>>();
-    if args.len() < 2 || args.iter().find(|arg| arg.as_str() == "--help").is_some() {
+    if args.len() < 2 || args.iter().any(|arg| arg.as_str() == "--help") {
         eprintln!("Usage: {} [--wrap] config.json", args[0]);
-        std::process::exit(1);
+        return ExitCode::from(1);
     }
 
     if args[1] == "--wrap" {
         if args.len() < 3 {
             eprintln!("No config file provided.");
-            std::process::exit(1);
+            return ExitCode::from(1);
         }
+        // Perf: collect args once outside the loop
+        let wrapper_args: Vec<_> = args[2..].to_vec();
         loop {
-            let updated_args = args[2..]
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
             eprintln!("[Wrapper] Starting inner process..");
             match std::process::Command::new(&args[0])
-                .args(updated_args)
+                .args(&wrapper_args)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()
@@ -307,9 +348,15 @@ fn main() -> std::io::Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    let home_path = env::var("HOME").expect("Could not read $HOME");
+    let home_path = env::var("HOME").unwrap_or_default();
 
-    let config_data = std::fs::read_to_string(config_path)?;
+    let config_data = match std::fs::read_to_string(config_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Could not read config file: {}", e);
+            return ExitCode::from(1);
+        }
+    };
 
     let mut config: Config = match serde_yaml::from_str(&config_data) {
         Ok(c) => c,
@@ -319,7 +366,13 @@ fn main() -> std::io::Result<()> {
                 .filter(|s| !s.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            serde_json::from_str(&config_data)?
+            match serde_json::from_str(&config_data) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Could not parse config file: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
         }
     };
 
@@ -327,8 +380,8 @@ fn main() -> std::io::Result<()> {
         "red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray",
     ];
 
-    let mut rng = rand::thread_rng();
-    let mut next_random_color_index = rng.gen_range(0..print_colors.len());
+    let mut rng = rand::rng();
+    let mut next_random_color_index = rng.random_range(0..print_colors.len());
 
     for job_config in config.jobs.values_mut() {
         if job_config.color.is_empty() {
@@ -361,6 +414,12 @@ fn main() -> std::io::Result<()> {
             .replace("#home#", &home_path);
     }
 
+    // Cache environment variables once at startup (perf improvement)
+    let base_env: Arc<HashMap<String, String>> = Arc::new(env::vars().collect());
+
+    // Shutdown flag to prevent race conditions when spawning new processes
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     let mut builder = Builder::new_current_thread();
     let runtime = builder
         .enable_io()
@@ -368,13 +427,10 @@ fn main() -> std::io::Result<()> {
         .build()
         .expect("Could not build tokio runtime");
 
-    let active_pid_map = runtime.block_on(async move {
-        // another option is to pass a different variable to keep track
-        // of the pid for each task - for example, HashMap<String, Arc<AtomicU32>>,
-        // where the key would be the name of the job and everyone gets a different
-        // Arc<AtomicU32>. Could possibly reduce contention if there are very frequent
-        // restarts.
+    let (active_pid_map, any_job_failed) = runtime.block_on(async move {
         let mut pid_map: HashMap<String, Arc<Mutex<HashSet<u32>>>> = HashMap::new();
+        let mut job_handles: Vec<JoinHandle<bool>> = Vec::new();
+
         for (name, job_config) in config.jobs {
             if job_config.disabled {
                 eprintln!("! Skipping disabled job: {}", name);
@@ -394,26 +450,81 @@ fn main() -> std::io::Result<()> {
                 Entry::Occupied(o) => o.get().clone(),
                 Entry::Vacant(v) => v.insert(Arc::new(Mutex::new(HashSet::new()))).clone(),
             };
-            tokio::spawn(start_proc(prefix, job_config, pid_set));
+
+            let handle = tokio::spawn(start_proc(
+                prefix,
+                job_config,
+                pid_set,
+                shutdown.clone(),
+                base_env.clone(),
+            ));
+            job_handles.push(handle);
         }
 
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
         let mut sighup = signal(SignalKind::hangup()).unwrap();
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
         let mut sigquit = signal(SignalKind::quit()).unwrap();
+        let mut sigusr1 = signal(SignalKind::user_defined1()).unwrap();
+        let mut sigusr2 = signal(SignalKind::user_defined2()).unwrap();
 
-        let signal_name = tokio::select! {
-            _ = sigterm.recv() => "TERM",
-            _ = sighup.recv() => "HUP",
-            _ = sigint.recv() => "INT",
-            _ = sigquit.recv() => "QUIT",
+        // Signal handling loop: forward USR1/USR2, exit on termination signals
+        let signal_name = loop {
+            let signal = tokio::select! {
+                _ = sigterm.recv() => Some(("TERM", None)),
+                _ = sighup.recv() => Some(("HUP", None)),
+                _ = sigint.recv() => Some(("INT", None)),
+                _ = sigquit.recv() => Some(("QUIT", None)),
+                _ = sigusr1.recv() => Some(("USR1", Some("USR1"))),
+                _ = sigusr2.recv() => Some(("USR2", Some("USR2"))),
+            };
+
+            match signal {
+                Some((name, Some(forward_signal))) => {
+                    // Forward USR1/USR2 to all active processes
+                    eprintln!("Received {} signal, forwarding to all jobs..", name);
+                    for (sudo_user, pid_set_mutex) in pid_map.iter() {
+                        let pid_set = pid_set_mutex.lock().unwrap();
+                        if pid_set.is_empty() {
+                            continue;
+                        }
+
+                        let mut cmd = if sudo_user.is_empty() {
+                            let mut kill_cmd = std::process::Command::new("kill");
+                            kill_cmd.arg(format!("-{}", forward_signal));
+                            kill_cmd
+                        } else {
+                            let mut sudo_cmd = std::process::Command::new("sudo");
+                            sudo_cmd.args(["-u", sudo_user, "kill", &format!("-{}", forward_signal)]);
+                            sudo_cmd
+                        };
+
+                        for pid in pid_set.iter() {
+                            cmd.arg(pid.to_string());
+                        }
+
+                        let _ = cmd
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                }
+                Some((name, None)) => {
+                    // Termination signal - break out of loop
+                    break name;
+                }
+                None => continue,
+            }
         };
 
-        // Print an extra newline incase we have a ^C prefix.
+        // Print an extra newline in case we have a ^C prefix.
         eprintln!(
             "\nReceived {} signal, killing active processes..",
             signal_name
         );
+
+        // Set shutdown flag BEFORE clearing PIDs to prevent race condition
+        shutdown.store(true, Ordering::Relaxed);
 
         let mut cloned_pid_map = HashMap::new();
         for (sudo_user, pid_set_mutex) in pid_map.into_iter() {
@@ -423,12 +534,26 @@ fn main() -> std::io::Result<()> {
             cloned_pid_map.insert(sudo_user, cloned_pid_set);
         }
 
-        cloned_pid_map
+        // Collect results from all job handles to check for failures
+        let mut any_failed = false;
+        for handle in job_handles {
+            if let Ok(had_failure) = handle.await
+                && had_failure
+            {
+                any_failed = true;
+            }
+        }
+
+        (cloned_pid_map, any_failed)
     });
 
     runtime.shutdown_background();
 
     for (sudo_user, pid_set) in active_pid_map.into_iter() {
+        if pid_set.is_empty() {
+            continue;
+        }
+
         let mut cmd = if sudo_user.is_empty() {
             let mut kill_cmd = std::process::Command::new("kill");
             kill_cmd.arg("-TERM");
@@ -453,5 +578,9 @@ fn main() -> std::io::Result<()> {
             .status();
     }
 
-    Ok(())
+    if any_job_failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
