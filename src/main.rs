@@ -4,7 +4,7 @@ use std::env;
 use std::io::Write;
 use std::process::{ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use rand::Rng;
@@ -59,6 +59,13 @@ struct DateTimeConfig {
 
 fn default_restart_delay() -> u64 {
     15_000
+}
+
+/// Lock a mutex, recovering from poison if necessary.
+/// For a process supervisor, it's better to continue with potentially stale data
+/// than to crash entirely during shutdown.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn default_datetime_format() -> String {
@@ -133,7 +140,7 @@ async fn start_proc(
 
     loop {
         // Check shutdown before starting a new process
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Acquire) {
             break;
         }
 
@@ -149,7 +156,7 @@ async fn start_proc(
             sleep(delay).await;
 
             // Check shutdown again after sleeping
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 break;
             }
         }
@@ -178,13 +185,22 @@ async fn start_proc_internal(
     base_env: &Arc<HashMap<String, String>>,
 ) -> std::io::Result<bool> {
     // Check shutdown before spawning
-    if shutdown.load(Ordering::Relaxed) {
+    if shutdown.load(Ordering::Acquire) {
         return Ok(true);
     }
 
     let mut envs = base_env.as_ref().clone();
     if let Some(additional_env) = &opts.env {
         envs.extend(additional_env.clone());
+    }
+
+    // Validate working directory exists before spawning
+    let cwd_path = std::path::Path::new(&opts.cwd);
+    if !cwd_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Working directory does not exist: {}", opts.cwd),
+        ));
     }
 
     let mut cmd = Command::new("sh");
@@ -203,7 +219,9 @@ async fn start_proc_internal(
     if opts.process_group {
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -215,16 +233,36 @@ async fn start_proc_internal(
         .ok_or_else(|| std::io::Error::other("Could not get child pid"))?;
 
     // Check shutdown again before registering PID
-    if shutdown.load(Ordering::Relaxed) {
-        // Process was spawned but we're shutting down - kill it immediately
+    if shutdown.load(Ordering::Acquire) {
+        // Process was spawned but we're shutting down - do inline graceful shutdown
+        // to avoid orphaning this process (it's not tracked in the main shutdown handler)
+        let signal_target = if opts.process_group {
+            format!("-{}", pid)
+        } else {
+            pid.to_string()
+        };
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args(["-TERM", "--", &signal_target])
             .status();
+
+        // Wait for process to exit or timeout, then SIGKILL if needed
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(opts.shutdown_timeout);
+        while start.elapsed() < timeout && is_process_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if is_process_alive(pid) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &signal_target])
+                .status();
+        }
+        // Wait on the child to reap it and avoid zombie
+        drop(child);
         return Ok(true);
     }
 
     // Track PID with its shutdown configuration
-    active_pids.lock().unwrap().insert(pid, PidInfo {
+    lock_or_recover(&active_pids).insert(pid, PidInfo {
         is_process_group: opts.process_group,
         shutdown_timeout: opts.shutdown_timeout,
     });
@@ -234,7 +272,7 @@ async fn start_proc_internal(
     let handle_child_result = handle_child(status_prefix, prefix, &opts.datetime, child).await;
 
     // If PID was already removed from map, we're shutting down - don't restart
-    if active_pids.lock().unwrap().remove(&pid).is_none() {
+    if lock_or_recover(&active_pids).remove(&pid).is_none() {
         Ok(true)
     } else {
         handle_child_result?;
@@ -495,12 +533,12 @@ fn main() -> ExitCode {
             job_handles.push(handle);
         }
 
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigquit = signal(SignalKind::quit()).unwrap();
-        let mut sigusr1 = signal(SignalKind::user_defined1()).unwrap();
-        let mut sigusr2 = signal(SignalKind::user_defined2()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+        let mut sigquit = signal(SignalKind::quit()).expect("Failed to register SIGQUIT handler");
+        let mut sigusr1 = signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1 handler");
+        let mut sigusr2 = signal(SignalKind::user_defined2()).expect("Failed to register SIGUSR2 handler");
 
         // Signal handling loop: forward USR1/USR2, exit on termination signals
         let signal_name = loop {
@@ -518,7 +556,7 @@ fn main() -> ExitCode {
                     // Forward USR1/USR2 to all active processes
                     eprintln!("Received {} signal, forwarding to all jobs..", name);
                     for (sudo_user, pid_set_mutex) in pid_map.iter() {
-                        let pid_set = pid_set_mutex.lock().unwrap();
+                        let pid_set = lock_or_recover(pid_set_mutex);
                         if pid_set.is_empty() {
                             continue;
                         }
@@ -558,11 +596,11 @@ fn main() -> ExitCode {
         );
 
         // Set shutdown flag BEFORE clearing PIDs to prevent race condition
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Release);
 
         let mut cloned_pid_map = HashMap::new();
         for (sudo_user, pid_set_mutex) in pid_map.into_iter() {
-            let mut pid_set = pid_set_mutex.lock().unwrap();
+            let mut pid_set = lock_or_recover(&pid_set_mutex);
             let cloned_pid_set = pid_set.clone();
             pid_set.clear();
             cloned_pid_map.insert(sudo_user, cloned_pid_set);
