@@ -104,9 +104,10 @@ struct PrefixWriter<'a> {
 
 impl<'a> PrefixWriter<'a> {
     pub fn from(prefix: String, config: &'a DateTimeConfig) -> Self {
-        let datetime_items = match config.enabled {
-            true => chrono::format::StrftimeItems::new(&config.format).collect(),
-            false => vec![],
+        let datetime_items = if config.enabled {
+            chrono::format::StrftimeItems::new(&config.format).collect()
+        } else {
+            vec![]
         };
         Self {
             prefix,
@@ -119,20 +120,15 @@ impl<'a> PrefixWriter<'a> {
 impl<'a> std::fmt::Display for PrefixWriter<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.datetime_items.is_empty() {
-            write!(f, "{}", self.prefix)
-        } else {
-            write!(
-                f,
-                "{} > {}",
-                self.prefix,
-                match self.datetime_local {
-                    true =>
-                        chrono::offset::Local::now().format_with_items(self.datetime_items.iter()),
-                    false =>
-                        chrono::offset::Utc::now().format_with_items(self.datetime_items.iter()),
-                }
-            )
+            return write!(f, "{}", self.prefix);
         }
+
+        let timestamp = if self.datetime_local {
+            chrono::offset::Local::now().format_with_items(self.datetime_items.iter())
+        } else {
+            chrono::offset::Utc::now().format_with_items(self.datetime_items.iter())
+        };
+        write!(f, "{} > {}", self.prefix, timestamp)
     }
 }
 
@@ -304,24 +300,11 @@ async fn handle_child(
     datetime: &DateTimeConfig,
     mut child: Child,
 ) -> std::io::Result<()> {
-    let stdout_prefix = format!("{} (1)", prefix);
-    let stdout_handle = spawn_output_handler(
-        child.stdout.take().ok_or_else(|| {
-            std::io::Error::other("Could not get stdout")
-        })?,
-        stdout_prefix,
-        datetime.clone(),
-        std::io::stdout(),
-    );
-    let stderr_prefix = format!("{} (2)", prefix);
-    let stderr_handle = spawn_output_handler(
-        child.stderr.take().ok_or_else(|| {
-            std::io::Error::other("Could not get stderr")
-        })?,
-        stderr_prefix,
-        datetime.clone(),
-        std::io::stderr(),
-    );
+    let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("Could not get stdout"))?;
+    let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("Could not get stderr"))?;
+
+    let stdout_handle = spawn_output_handler(stdout, format!("{} (1)", prefix), datetime.clone(), std::io::stdout());
+    let stderr_handle = spawn_output_handler(stderr, format!("{} (2)", prefix), datetime.clone(), std::io::stderr());
     let status = child.wait().await?;
     // Ignore errors from output handlers - they may fail if stdout/stderr is closed
     let _ = stdout_handle.await;
@@ -331,21 +314,23 @@ async fn handle_child(
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(code) = status.code() {
-            eprintln!("{} > Exited with code {}", status_prefix, code);
+        let exit_msg = if let Some(code) = status.code() {
+            format!("Exited with code {}", code)
         } else if let Some(signal) = status.signal() {
-            eprintln!("{} > Killed by signal {}", status_prefix, signal);
+            format!("Killed by signal {}", signal)
         } else {
-            eprintln!("{} > Exited with unknown status", status_prefix);
-        }
+            "Exited with unknown status".to_string()
+        };
+        eprintln!("{} > {}", status_prefix, exit_msg);
     }
 
     #[cfg(not(unix))]
     {
-        match status.code() {
-            Some(code) => eprintln!("{} > Exited with code {}", status_prefix, code),
-            None => eprintln!("{} > Exited with unknown status", status_prefix),
-        }
+        let exit_msg = match status.code() {
+            Some(code) => format!("Exited with code {}", code),
+            None => "Exited with unknown status".to_string(),
+        };
+        eprintln!("{} > {}", status_prefix, exit_msg);
     }
 
     Ok(())
@@ -461,16 +446,9 @@ fn main() -> ExitCode {
     // If the path has no parent (e.g., just "config.yaml"), use current directory
     let config_parent_path = std::path::Path::new(config_path)
         .parent()
-        .and_then(|p| {
-            let s = p.to_string_lossy();
-            // parent() returns Some("") for paths without directory component
-            if s.is_empty() { None } else { Some(s.into_owned()) }
-        })
-        .or_else(|| {
-            env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
         .unwrap_or_else(|| ".".to_string());
 
     let home_path = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -483,18 +461,20 @@ fn main() -> ExitCode {
         }
     };
 
+    // Helper to strip // comments from JSON
+    let strip_json_comments = |data: &str| -> String {
+        data.lines()
+            .filter(|s| !s.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     // Determine format by file extension, with fallback parsing
     let is_json_ext = config_path.ends_with(".json");
     let is_yaml_ext = config_path.ends_with(".yaml") || config_path.ends_with(".yml");
 
     let mut config: Config = if is_json_ext {
-        // JSON file: strip comments and parse as JSON only
-        let config_data_stripped = config_data
-            .split('\n')
-            .filter(|s| !s.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        match serde_json::from_str(&config_data_stripped) {
+        match serde_json::from_str(&strip_json_comments(&config_data)) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Could not parse JSON config file: {}", e);
@@ -502,7 +482,6 @@ fn main() -> ExitCode {
             }
         }
     } else if is_yaml_ext {
-        // YAML file: parse as YAML only
         match serde_yaml::from_str(&config_data) {
             Ok(c) => c,
             Err(e) => {
@@ -511,25 +490,18 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        // Unknown extension: try YAML first, then JSON, show both errors if both fail
+        // Unknown extension: try YAML first, then JSON
         match serde_yaml::from_str(&config_data) {
             Ok(c) => c,
-            Err(yaml_err) => {
-                let config_data_stripped = config_data
-                    .split('\n')
-                    .filter(|s| !s.trim_start().starts_with("//"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                match serde_json::from_str(&config_data_stripped) {
-                    Ok(c) => c,
-                    Err(json_err) => {
-                        eprintln!("Could not parse config file.");
-                        eprintln!("  As YAML: {}", yaml_err);
-                        eprintln!("  As JSON: {}", json_err);
-                        return ExitCode::from(1);
-                    }
+            Err(yaml_err) => match serde_json::from_str(&strip_json_comments(&config_data)) {
+                Ok(c) => c,
+                Err(json_err) => {
+                    eprintln!("Could not parse config file.");
+                    eprintln!("  As YAML: {}", yaml_err);
+                    eprintln!("  As JSON: {}", json_err);
+                    return ExitCode::from(1);
                 }
-            }
+            },
         }
     };
 
@@ -574,18 +546,20 @@ fn main() -> ExitCode {
     // Shutdown flag to prevent race conditions when spawning new processes
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    let mut builder = if num_threads == 1 {
-        Builder::new_current_thread()
-    } else {
-        let mut mt = Builder::new_multi_thread();
-        mt.worker_threads(num_threads);
-        mt
-    };
-    let runtime = match builder.enable_io().enable_time().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("Could not build tokio runtime: {}", e);
-            return ExitCode::from(1);
+    let runtime = {
+        let mut builder = if num_threads == 1 {
+            Builder::new_current_thread()
+        } else {
+            let mut mt = Builder::new_multi_thread();
+            mt.worker_threads(num_threads);
+            mt
+        };
+        match builder.enable_io().enable_time().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Could not build tokio runtime: {}", e);
+                return ExitCode::from(1);
+            }
         }
     };
 
@@ -853,20 +827,16 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
 fn is_process_alive(pid: u32) -> bool {
     // Safely convert PID to pid_t - PIDs above i32::MAX are invalid
     let Ok(pid_signed) = i32::try_from(pid) else {
-        return false; // Invalid PID cannot be alive
+        return false;
     };
 
     // kill(pid, 0) checks if process exists without sending a signal
-    // Returns 0 if process exists and we have permission to signal it
-    // Returns -1 with ESRCH if process doesn't exist
-    // Returns -1 with EPERM if process exists but we can't signal it (still alive)
-    let result = unsafe { libc::kill(pid_signed as libc::pid_t, 0) };
+    let result = unsafe { libc::kill(pid_signed, 0) };
     if result == 0 {
         return true;
     }
-    // If we got EPERM, process exists but we can't signal it - still alive
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    errno == libc::EPERM
+    // EPERM means process exists but we can't signal it - still alive
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Convert a signal name to its numeric value
@@ -883,23 +853,17 @@ fn signal_name_to_number(signal: &str) -> Option<libc::c_int> {
     }
 }
 
-/// Send a signal to a single PID using libc::kill
-/// For process groups, pass is_process_group=true to send to the process group
+/// Send a signal to a single PID using libc::kill.
+/// For process groups, pass is_process_group=true to send to the process group.
 fn send_signal_libc(pid: u32, signal: libc::c_int, is_process_group: bool) -> bool {
-    // Validate PID is within valid range (same check as is_process_alive)
     let Ok(pid_signed) = i32::try_from(pid) else {
-        return false; // Invalid PID
+        return false;
     };
 
-    let target_pid = if is_process_group {
-        // Negative PID sends signal to the process group
-        -(pid_signed as libc::pid_t)
-    } else {
-        pid_signed as libc::pid_t
-    };
+    // Negative PID sends signal to the process group
+    let target_pid = if is_process_group { -pid_signed } else { pid_signed };
 
-    let result = unsafe { libc::kill(target_pid, signal) };
-    result == 0
+    unsafe { libc::kill(target_pid, signal) == 0 }
 }
 
 /// Run wrapper mode: spawns job-runner as a child and restarts it if it exits.
@@ -915,32 +879,16 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
     let inner_pid_clone = inner_pid.clone();
     let shutdown_clone = shutdown_requested.clone();
     std::thread::spawn(move || {
-        // Set up signal handlers using a minimal tokio runtime
-        let rt = match Builder::new_current_thread().enable_io().build() {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("[Wrapper] Failed to create signal handler runtime: {}", e);
-                return;
-            }
+        let Ok(rt) = Builder::new_current_thread().enable_io().build() else {
+            eprintln!("[Wrapper] Failed to create signal handler runtime");
+            return;
         };
 
         rt.block_on(async {
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut sigquit = match signal(SignalKind::quit()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+            let Ok(mut sigterm) = signal(SignalKind::terminate()) else { return };
+            let Ok(mut sigint) = signal(SignalKind::interrupt()) else { return };
+            let Ok(mut sighup) = signal(SignalKind::hangup()) else { return };
+            let Ok(mut sigquit) = signal(SignalKind::quit()) else { return };
 
             loop {
                 let sig = tokio::select! {
@@ -953,10 +901,9 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
                 eprintln!("\n[Wrapper] Received termination signal, forwarding to inner process..");
                 shutdown_clone.store(true, Ordering::Release);
 
-                // Forward signal to inner process if it exists
                 let pid = inner_pid_clone.load(Ordering::Acquire);
                 if pid != 0 {
-                    unsafe { libc::kill(pid as libc::pid_t, sig) };
+                    unsafe { libc::kill(pid as i32, sig) };
                 }
             }
         });
