@@ -72,6 +72,15 @@ fn default_datetime_format() -> String {
     String::from("%Y-%m-%d %H:%M:%S %Z")
 }
 
+/// Validate that a sudo username contains only safe characters.
+/// Prevents shell injection via malicious usernames like "root; rm -rf /".
+fn is_valid_username(user: &str) -> bool {
+    !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     jobs: BTreeMap<String, JobConfig>,
@@ -201,6 +210,19 @@ async fn start_proc_internal(
             std::io::ErrorKind::NotFound,
             format!("Working directory does not exist: {}", opts.cwd),
         ));
+    }
+
+    // Validate sudo_user to prevent shell injection
+    if let Some(ref username) = opts.sudo_user {
+        if !is_valid_username(username) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid sudo_user '{}': must contain only alphanumeric characters, hyphens, or underscores",
+                    username
+                ),
+            ));
+        }
     }
 
     // Auto-enable process_group for sudo processes to prevent orphaned children
