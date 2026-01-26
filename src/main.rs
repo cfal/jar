@@ -227,7 +227,7 @@ async fn start_proc_internal(
         }
     }
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child
         .id()
         .ok_or_else(|| std::io::Error::other("Could not get child pid"))?;
@@ -248,7 +248,8 @@ async fn start_proc_internal(
             send_signal_libc(pid, libc::SIGKILL, opts.process_group);
         }
         // Wait on the child to reap it and avoid zombie
-        drop(child);
+        // We must actually wait, not just drop - dropping doesn't reap!
+        let _ = child.wait().await;
         return Ok(true);
     }
 
@@ -381,27 +382,7 @@ fn main() -> ExitCode {
             eprintln!("No config file provided.");
             return ExitCode::from(1);
         }
-        // Perf: collect args once outside the loop
-        let wrapper_args: Vec<_> = args[2..].to_vec();
-        loop {
-            eprintln!("[Wrapper] Starting inner process..");
-            match std::process::Command::new(&args[0])
-                .args(&wrapper_args)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-            {
-                Ok(exit_status) => match exit_status.code() {
-                    Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
-                    None => eprintln!("[Wrapper] Process terminated by signal"),
-                },
-                Err(e) => {
-                    eprintln!("[Wrapper] Failed to read exit status: {}", e);
-                }
-            }
-            eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
-            std::thread::sleep(Duration::from_millis(15_000));
-        }
+        return run_wrapper_mode(&args[0], &args[2..]);
     }
 
     let config_path = &args[1];
@@ -658,7 +639,17 @@ fn main() -> ExitCode {
     // Send SIGTERM to all processes (using -pid for process groups)
     send_signal_to_pids(&all_pids, "TERM");
 
-    // Graceful shutdown: wait for each process according to its timeout
+    // Event-driven graceful shutdown using waitpid
+    graceful_shutdown_with_waitpid(&all_pids);
+
+    ExitCode::SUCCESS
+}
+
+/// Perform graceful shutdown using waitpid for event-driven child reaping.
+/// This is more efficient than polling and properly reaps zombie processes.
+fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
+    use std::collections::HashSet;
+
     let max_timeout = all_pids
         .iter()
         .map(|(_, _, info)| info.shutdown_timeout)
@@ -666,28 +657,64 @@ fn main() -> ExitCode {
         .unwrap_or(5);
 
     let start = std::time::Instant::now();
-    let check_interval = Duration::from_millis(100);
 
-    // Track which PIDs have exceeded their timeout
-    let mut killed_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Track process states
+    let mut reaped_pids: HashSet<u32> = HashSet::new();
+    let mut killed_pids: HashSet<u32> = HashSet::new();
+
+    // Build a set of our direct child PIDs (non-sudo)
+    let direct_child_pids: HashSet<u32> = all_pids
+        .iter()
+        .filter(|(sudo_user, _, _)| sudo_user.is_empty())
+        .map(|(_, pid, _)| *pid)
+        .collect();
 
     loop {
         let elapsed_secs = start.elapsed().as_secs();
 
-        // Check each process
-        for (sudo_user, pid, info) in &all_pids {
-            if killed_pids.contains(pid) {
+        // Event-driven: reap any children that have exited using waitpid
+        // This is non-blocking (WNOHANG) and reaps zombies properly
+        loop {
+            let mut status: libc::c_int = 0;
+            let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+
+            if result <= 0 {
+                // No more children to reap (result == 0) or error (result == -1)
+                break;
+            }
+
+            let exited_pid = result as u32;
+            if direct_child_pids.contains(&exited_pid) {
+                reaped_pids.insert(exited_pid);
+            }
+        }
+
+        // Check each process and send SIGKILL if timeout exceeded
+        for (sudo_user, pid, info) in all_pids {
+            // Skip if already handled
+            if reaped_pids.contains(pid) || killed_pids.contains(pid) {
                 continue;
             }
 
-            let alive = is_process_alive(*pid);
+            // For direct children, we already know via waitpid if they're dead
+            // For sudo children, check with kill(pid, 0)
+            let is_direct = sudo_user.is_empty();
+            let alive = if is_direct && reaped_pids.contains(pid) {
+                false
+            } else if !is_direct {
+                is_process_alive(*pid)
+            } else {
+                // Direct child not yet reaped - still alive
+                true
+            };
+
             if !alive {
-                // Process exited on its own
+                reaped_pids.insert(*pid); // Mark as done
                 continue;
             }
 
             // If this process has exceeded its timeout, kill it
-            if elapsed_secs >= info.shutdown_timeout {
+            if elapsed_secs >= info.shutdown_timeout && !killed_pids.contains(pid) {
                 eprintln!(
                     "Process {} exceeded {}s shutdown timeout, sending SIGKILL..",
                     pid, info.shutdown_timeout
@@ -698,24 +725,40 @@ fn main() -> ExitCode {
         }
 
         // Check if all processes are done
-        let any_alive = all_pids
-            .iter()
-            .any(|(_, pid, _)| !killed_pids.contains(pid) && is_process_alive(*pid));
+        let any_alive = all_pids.iter().any(|(sudo_user, pid, _)| {
+            if reaped_pids.contains(pid) {
+                return false;
+            }
+            // For sudo processes, we must poll
+            if !sudo_user.is_empty() {
+                return is_process_alive(*pid);
+            }
+            // For direct children not yet reaped, assume alive
+            true
+        });
 
         if !any_alive {
             eprintln!("All processes exited gracefully");
             break;
         }
 
-        // Exit if we've exceeded the maximum timeout
-        if start.elapsed() >= Duration::from_secs(max_timeout) {
+        // Exit if we've exceeded the maximum timeout (with buffer for SIGKILL)
+        if start.elapsed() >= Duration::from_secs(max_timeout + 1) {
+            // Final reap attempt
+            loop {
+                let mut status: libc::c_int = 0;
+                let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if result <= 0 {
+                    break;
+                }
+            }
             break;
         }
 
-        std::thread::sleep(check_interval);
+        // Short sleep only for sudo process polling (direct children are event-driven)
+        // This is much shorter than before since waitpid handles most cases
+        std::thread::sleep(Duration::from_millis(20));
     }
-
-    ExitCode::SUCCESS
 }
 
 /// Check if a process is still alive using libc::kill with signal 0
@@ -755,15 +798,131 @@ fn signal_name_to_number(signal: &str) -> Option<libc::c_int> {
 /// Send a signal to a single PID using libc::kill
 /// For process groups, pass is_process_group=true to send to the process group
 fn send_signal_libc(pid: u32, signal: libc::c_int, is_process_group: bool) -> bool {
+    // Validate PID is within valid range (same check as is_process_alive)
+    let Ok(pid_signed) = i32::try_from(pid) else {
+        return false; // Invalid PID
+    };
+
     let target_pid = if is_process_group {
         // Negative PID sends signal to the process group
-        -(pid as libc::pid_t)
+        -(pid_signed as libc::pid_t)
     } else {
-        pid as libc::pid_t
+        pid_signed as libc::pid_t
     };
 
     let result = unsafe { libc::kill(target_pid, signal) };
     result == 0
+}
+
+/// Run wrapper mode: spawns job-runner as a child and restarts it if it exits.
+/// Handles signals properly by forwarding them to the inner process.
+fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
+    use std::sync::atomic::AtomicU32;
+
+    // Track the inner process PID for signal forwarding
+    let inner_pid: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+
+    // Spawn a thread to handle signals
+    let inner_pid_clone = inner_pid.clone();
+    let shutdown_clone = shutdown_requested.clone();
+    std::thread::spawn(move || {
+        // Set up signal handlers using a minimal tokio runtime
+        let rt = match Builder::new_current_thread().enable_io().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[Wrapper] Failed to create signal handler runtime: {}", e);
+                return;
+            }
+        };
+
+        rt.block_on(async {
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut sigquit = match signal(SignalKind::quit()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            loop {
+                let sig = tokio::select! {
+                    _ = sigterm.recv() => libc::SIGTERM,
+                    _ = sigint.recv() => libc::SIGINT,
+                    _ = sighup.recv() => libc::SIGHUP,
+                    _ = sigquit.recv() => libc::SIGQUIT,
+                };
+
+                eprintln!("\n[Wrapper] Received termination signal, forwarding to inner process..");
+                shutdown_clone.store(true, Ordering::Release);
+
+                // Forward signal to inner process if it exists
+                let pid = inner_pid_clone.load(Ordering::Acquire);
+                if pid != 0 {
+                    unsafe { libc::kill(pid as libc::pid_t, sig) };
+                }
+            }
+        });
+    });
+
+    loop {
+        // Check if shutdown was requested before starting
+        if shutdown_requested.load(Ordering::Acquire) {
+            eprintln!("[Wrapper] Shutdown requested, exiting..");
+            return ExitCode::SUCCESS;
+        }
+
+        eprintln!("[Wrapper] Starting inner process..");
+        let mut child = match std::process::Command::new(self_path)
+            .args(inner_args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Wrapper] Failed to spawn inner process: {}", e);
+                std::thread::sleep(Duration::from_secs(15));
+                continue;
+            }
+        };
+
+        // Store PID for signal forwarding
+        inner_pid.store(child.id(), Ordering::Release);
+
+        // Wait for inner process to exit
+        match child.wait() {
+            Ok(exit_status) => {
+                inner_pid.store(0, Ordering::Release);
+                match exit_status.code() {
+                    Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
+                    None => eprintln!("[Wrapper] Process terminated by signal"),
+                }
+            }
+            Err(e) => {
+                inner_pid.store(0, Ordering::Release);
+                eprintln!("[Wrapper] Failed to read exit status: {}", e);
+            }
+        }
+
+        // If shutdown was requested, exit instead of restarting
+        if shutdown_requested.load(Ordering::Acquire) {
+            eprintln!("[Wrapper] Shutdown complete, exiting..");
+            return ExitCode::SUCCESS;
+        }
+
+        eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
+        std::thread::sleep(Duration::from_secs(15));
+    }
 }
 
 /// Send a signal to a list of PIDs, using process groups where applicable
