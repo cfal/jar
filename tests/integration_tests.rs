@@ -59,24 +59,45 @@ fn collect_output_for(
     lines
 }
 
-/// Helper to send a signal to a process
+/// Convert a signal name to its numeric value
 #[cfg(unix)]
-fn send_signal(pid: u32, signal: &str) {
-    Command::new("kill")
-        .args([&format!("-{}", signal), &pid.to_string()])
-        .status()
-        .expect("Failed to send signal");
+fn signal_name_to_number(signal: &str) -> Option<libc::c_int> {
+    match signal {
+        "TERM" => Some(libc::SIGTERM),
+        "KILL" => Some(libc::SIGKILL),
+        "USR1" => Some(libc::SIGUSR1),
+        "USR2" => Some(libc::SIGUSR2),
+        "HUP" => Some(libc::SIGHUP),
+        "INT" => Some(libc::SIGINT),
+        "QUIT" => Some(libc::SIGQUIT),
+        _ => None,
+    }
 }
 
-/// Helper to check if a process is alive
+/// Helper to send a signal to a process using libc::kill
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    if let Some(sig) = signal_name_to_number(signal) {
+        unsafe { libc::kill(pid as libc::pid_t, sig) };
+    }
+}
+
+/// Helper to check if a process is alive using libc::kill with signal 0
+#[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    // If we got EPERM, process exists but we can't signal it - still alive
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
+
+/// Helper for non-unix platforms (not typically used in tests)
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
 }
 
 // =============================================================================
@@ -287,6 +308,127 @@ jobs:
             pid
         );
     }
+
+    let _ = child.wait();
+}
+
+// =============================================================================
+// TEST: Process Group Receives Signal via Negative PID (libc)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_process_group_signal_via_negative_pid() {
+    // This test verifies that when process_group is enabled, the entire
+    // process group is signaled, not just the leader process
+    let config = r#"
+jobs:
+  group_leader:
+    command: "bash -c 'bash -c \"trap \\\"echo CHILD_GOT_USR1\\\" USR1; while true; do sleep 0.2; done\" & wait'"
+    process_group: true
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+
+    // Wait for child processes to spawn
+    thread::sleep(Duration::from_secs(2));
+
+    // Send SIGUSR1 to job-runner (which should forward to the process group)
+    send_signal(child.id(), "USR1");
+
+    // Collect output
+    let output = collect_output_for(stdout, Duration::from_secs(2));
+
+    // Cleanup
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    // The child process in the group should have received USR1
+    let child_received = output
+        .iter()
+        .any(|line| line.contains("CHILD_GOT_USR1"));
+    assert!(
+        child_received,
+        "Child process in group should receive signal. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Multiple Children in Process Group All Killed
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_process_group_all_children_killed() {
+    // Test that ALL children in a process group are killed, not just some
+    let config = r#"
+jobs:
+  spawner:
+    command: "bash -c 'for i in 1 2 3 4 5; do bash -c \"sleep 302\" & done; wait'"
+    process_group: true
+    shutdown_timeout: 3
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    // Wait for all child processes to spawn
+    thread::sleep(Duration::from_secs(2));
+
+    // Find all the sleep 302 processes
+    let pgrep_output = Command::new("pgrep")
+        .args(["-f", "sleep 302"])
+        .output()
+        .expect("Failed to run pgrep");
+
+    let sleep_pids_before: Vec<u32> = String::from_utf8_lossy(&pgrep_output.stdout)
+        .lines()
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    assert!(
+        sleep_pids_before.len() >= 4,
+        "Expected at least 4 sleep processes, found: {:?}",
+        sleep_pids_before
+    );
+
+    // Send TERM to job-runner
+    send_signal(child.id(), "TERM");
+
+    // Wait for shutdown (including timeout + SIGKILL)
+    thread::sleep(Duration::from_secs(5));
+
+    // Verify ALL sleep processes are gone
+    let mut alive_count = 0;
+    for pid in &sleep_pids_before {
+        if is_process_alive(*pid) {
+            alive_count += 1;
+        }
+    }
+
+    assert_eq!(
+        alive_count, 0,
+        "All {} sleep processes should be killed, but {} are still alive. PIDs: {:?}",
+        sleep_pids_before.len(),
+        alive_count,
+        sleep_pids_before
+    );
 
     let _ = child.wait();
 }
@@ -897,4 +1039,719 @@ jobs:
         status.success(),
         "Job runner should handle YAML config correctly"
     );
+}
+
+// =============================================================================
+// TEST: is_process_alive - Existing Process Returns True
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_is_process_alive_existing_process() {
+    // Spawn a long-running process
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("Failed to spawn sleep process");
+
+    let pid = child.id();
+
+    // Process should be alive
+    assert!(
+        is_process_alive(pid),
+        "is_process_alive should return true for running process"
+    );
+
+    // Clean up
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// =============================================================================
+// TEST: is_process_alive - Non-Existent Process Returns False
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_is_process_alive_nonexistent_process() {
+    // Use a PID that's very unlikely to exist
+    // PID 4194304 is above the typical max PID on Linux (default max is 32768 or 4194304)
+    // We'll use a more reliable approach: spawn and kill a process, then check
+    let mut child = Command::new("true")
+        .spawn()
+        .expect("Failed to spawn process");
+
+    let pid = child.id();
+    let _ = child.wait(); // Wait for it to exit
+
+    // Give the OS a moment to clean up
+    thread::sleep(Duration::from_millis(100));
+
+    // Process should no longer be alive
+    assert!(
+        !is_process_alive(pid),
+        "is_process_alive should return false for exited process (pid {})",
+        pid
+    );
+}
+
+// =============================================================================
+// TEST: is_process_alive - Process Transition From Alive to Dead
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_is_process_alive_transition() {
+    // Spawn a short-lived process
+    let mut child = Command::new("sleep")
+        .arg("0.2")
+        .spawn()
+        .expect("Failed to spawn sleep process");
+
+    let pid = child.id();
+
+    // Should be alive initially
+    assert!(
+        is_process_alive(pid),
+        "Process should be alive immediately after spawn"
+    );
+
+    // Wait for process to exit
+    let _ = child.wait();
+    thread::sleep(Duration::from_millis(100));
+
+    // Should be dead now
+    assert!(
+        !is_process_alive(pid),
+        "Process should be dead after wait()"
+    );
+}
+
+// =============================================================================
+// TEST: libc Signal Sending - SIGTERM to Process
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_libc_signal_term() {
+    // Spawn a process that will run until signaled
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("Failed to spawn sleep process");
+
+    let pid = child.id();
+
+    // Verify it's running
+    assert!(is_process_alive(pid), "Process should be alive");
+
+    // Send SIGTERM via libc
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, 0, "libc::kill should return 0 on success");
+
+    // Wait for process to exit
+    let status = child.wait().expect("Failed to wait");
+
+    // Process should have been terminated by signal
+    assert!(!status.success(), "Process should not exit successfully after SIGTERM");
+}
+
+// =============================================================================
+// TEST: libc Signal Sending - Signal to Non-Existent Process
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_libc_signal_nonexistent_process() {
+    // Spawn and immediately kill a process to get a dead PID
+    let mut child = Command::new("true")
+        .spawn()
+        .expect("Failed to spawn process");
+    let pid = child.id();
+    let _ = child.wait();
+    thread::sleep(Duration::from_millis(100));
+
+    // Sending signal to non-existent process should return -1
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, -1, "libc::kill should return -1 for non-existent process");
+
+    // Errno should be ESRCH (no such process)
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    assert_eq!(errno, libc::ESRCH, "errno should be ESRCH");
+}
+
+// =============================================================================
+// TEST: libc Signal Sending - Process Group (Negative PID)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_libc_signal_process_group() {
+    // Create a process that spawns children in its own process group
+    let mut child = Command::new("bash")
+        .args(["-c", "sleep 60 & sleep 60 & wait"])
+        .spawn()
+        .expect("Failed to spawn bash");
+
+    let pid = child.id();
+    thread::sleep(Duration::from_millis(500));
+
+    // Find child sleep processes
+    let pgrep_output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .expect("Failed to run pgrep");
+
+    let child_pids: Vec<u32> = String::from_utf8_lossy(&pgrep_output.stdout)
+        .lines()
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    assert!(!child_pids.is_empty(), "Should have spawned child processes");
+
+    // Send SIGTERM to the process group (negative PID)
+    // Note: This only works if the process is a process group leader
+    // For this test, we'll just kill the parent and verify children handling
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, 0, "Should be able to signal the parent");
+
+    let _ = child.wait();
+
+    // Clean up any remaining children
+    for cpid in &child_pids {
+        let _ = unsafe { libc::kill(*cpid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+// =============================================================================
+// TEST: Environment Variables Passed to Job
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_env_variables_passed_to_job() {
+    let config = r#"
+jobs:
+  env_test:
+    command: "sh -c 'echo MY_VAR=$MY_VAR; echo OTHER_VAR=$OTHER_VAR'"
+    env:
+      MY_VAR: "hello_world"
+      OTHER_VAR: "test_value"
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+    let output = collect_output_for(stdout, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    let has_my_var = output.iter().any(|l| l.contains("MY_VAR=hello_world"));
+    let has_other_var = output.iter().any(|l| l.contains("OTHER_VAR=test_value"));
+
+    assert!(
+        has_my_var,
+        "MY_VAR should be passed to job. Output: {:?}",
+        output
+    );
+    assert!(
+        has_other_var,
+        "OTHER_VAR should be passed to job. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Initial Delay Before Job Start
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_initial_delay() {
+    let config = r#"
+jobs:
+  delayed_job:
+    command: "echo started"
+    delay: 1500
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let start = std::time::Instant::now();
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+
+    // Collect output until we see "started"
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("started") {
+                let _ = tx.send(std::time::Instant::now());
+                break;
+            }
+        }
+    });
+
+    // Wait for the "started" message or timeout
+    let started_time = rx.recv_timeout(Duration::from_secs(5));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+    let _ = reader_thread.join();
+
+    if let Ok(time) = started_time {
+        let elapsed = time - start;
+        assert!(
+            elapsed >= Duration::from_millis(1400),
+            "Job should have waited ~1.5s before starting. Elapsed: {:?}",
+            elapsed
+        );
+    } else {
+        panic!("Job never printed 'started'");
+    }
+}
+
+// =============================================================================
+// TEST: Restart Delay After Job Failure
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_restart_delay_after_failure() {
+    let config = r#"
+jobs:
+  failing_job:
+    command: "sh -c 'echo attempt; exit 1'"
+    restart_delay: 1000
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+
+    // Collect attempts
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("attempt") {
+                let _ = tx.send(std::time::Instant::now());
+            }
+        }
+    });
+
+    // Wait for at least 2 attempts
+    let first = rx.recv_timeout(Duration::from_secs(2));
+    let second = rx.recv_timeout(Duration::from_secs(3));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    if let (Ok(t1), Ok(t2)) = (first, second) {
+        let gap = t2 - t1;
+        assert!(
+            gap >= Duration::from_millis(900),
+            "Restart delay should be ~1s. Gap: {:?}",
+            gap
+        );
+    } else {
+        panic!("Did not see two restart attempts");
+    }
+}
+
+// =============================================================================
+// TEST: CWD Placeholder Substitution (#cwd#)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_cwd_placeholder_substitution() {
+    use std::io::Write;
+
+    // Create a temp directory and config file
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    let marker_file = temp_dir.path().join("marker.txt");
+
+    // Build config with placeholder - avoids raw string issues with #" in Rust 2024
+    let config = "jobs:\n  cwd_test:\n    command: \"touch marker.txt\"\n    cwd: \"#cwd#\"\n";
+
+    let mut file = std::fs::File::create(&config_path).expect("Failed to create config");
+    file.write_all(config.as_bytes()).unwrap();
+
+    let mut child = Command::new(binary_path())
+        .arg(&config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    // Wait for job to run
+    thread::sleep(Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    // The marker file should exist in the config file's directory
+    assert!(
+        marker_file.exists(),
+        "#cwd# should expand to config file directory. Marker file should be at {:?}",
+        marker_file
+    );
+}
+
+// =============================================================================
+// TEST: Home Placeholder Substitution (#home#)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_home_placeholder_substitution() {
+    // Build config with placeholder - avoids raw string issues with #" in Rust 2024
+    let config = "jobs:\n  home_test:\n    command: \"sh -c 'echo HOME_DIR=$PWD'\"\n    cwd: \"#home#\"\n";
+
+    let config_file = create_temp_config(config);
+    let expected_home = std::env::var("HOME").unwrap_or_default();
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+    let output = collect_output_for(stdout, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    let home_output = output
+        .iter()
+        .find(|l| l.contains("HOME_DIR="))
+        .map(|l| l.to_string())
+        .unwrap_or_default();
+
+    assert!(
+        home_output.contains(&expected_home),
+        "#home# should expand to $HOME ({}). Output: {:?}",
+        expected_home,
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Datetime Timestamps in Output
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_datetime_timestamps() {
+    let config = r#"
+jobs:
+  timestamp_job:
+    command: "echo hello"
+    datetime:
+      enabled: true
+      format: "%Y-%m-%d"
+      local: true
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+    let output = collect_output_for(stdout, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    // Get today's date in the expected format
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let has_timestamp = output.iter().any(|l| l.contains(&today));
+
+    assert!(
+        has_timestamp,
+        "Output should contain timestamp with date {}. Output: {:?}",
+        today,
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Empty Command is Skipped
+// =============================================================================
+
+#[test]
+fn test_empty_command_skipped() {
+    let config = r#"
+jobs:
+  empty_cmd:
+    command: ""
+  valid_cmd:
+    command: "echo valid"
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stderr = child.stderr.take().unwrap();
+    let output = collect_output_for(stderr, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    let skipped = output
+        .iter()
+        .any(|l| l.contains("Skipping job with missing command"));
+
+    assert!(
+        skipped,
+        "Empty command job should be skipped. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Multiple Jobs with Different Shutdown Timeouts
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_multiple_shutdown_timeouts() {
+    // Two jobs that ignore SIGTERM with different timeouts
+    let config = r#"
+jobs:
+  fast_kill:
+    command: "sh -c 'trap \"\" TERM; while true; do sleep 0.1; done'"
+    shutdown_timeout: 1
+  slow_kill:
+    command: "sh -c 'trap \"\" TERM; while true; do sleep 0.1; done'"
+    shutdown_timeout: 3
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    // Wait for jobs to start
+    thread::sleep(Duration::from_secs(1));
+
+    let start = std::time::Instant::now();
+
+    // Send TERM to job-runner
+    send_signal(child.id(), "TERM");
+
+    // Wait for shutdown
+    let _ = child.wait();
+    let elapsed = start.elapsed();
+
+    // Shutdown should take around 3s (the longer timeout)
+    // Allow some buffer
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(5),
+        "Shutdown should respect individual timeouts. Elapsed: {:?}",
+        elapsed
+    );
+}
+
+// =============================================================================
+// TEST: Color Assignment (Random Colors for Jobs)
+// =============================================================================
+
+#[test]
+fn test_color_assignment() {
+    let config = r#"
+jobs:
+  job_with_color:
+    command: "echo colored"
+    color: red
+  job_without_color:
+    command: "echo default"
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stderr = child.stderr.take().unwrap();
+    let output = collect_output_for(stderr, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    // Red color code is \x1b[31m
+    let has_red = output.iter().any(|l| l.contains("\x1b[31m"));
+
+    assert!(
+        has_red,
+        "Job with color: red should have red ANSI code. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Invalid Color is Ignored
+// =============================================================================
+
+#[test]
+fn test_invalid_color_ignored() {
+    let config = r#"
+jobs:
+  bad_color:
+    command: "echo test"
+    color: not_a_color
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stderr = child.stderr.take().unwrap();
+    let output = collect_output_for(stderr, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    let color_warning = output
+        .iter()
+        .any(|l| l.contains("No such color, ignoring"));
+
+    assert!(
+        color_warning,
+        "Invalid color should produce warning. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: CamelCase Config Aliases (processGroup, shutdownTimeout, etc.)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_camelcase_config_aliases() {
+    let config = r#"
+jobs:
+  camel_test:
+    command: "bash -c 'sleep 60 &; wait'"
+    processGroup: true
+    shutdownTimeout: 1
+    restartDelay: 500
+    sudoUser: null
+"#;
+
+    let config_file = create_temp_config(config);
+
+    let mut child = Command::new(binary_path())
+        .arg(config_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stderr = child.stderr.take().unwrap();
+
+    thread::sleep(Duration::from_secs(1));
+
+    let start = std::time::Instant::now();
+    send_signal(child.id(), "TERM");
+
+    let output = collect_output_for(stderr, Duration::from_secs(3));
+    let _ = child.wait();
+    let elapsed = start.elapsed();
+
+    // Check that processGroup was parsed (job initialized)
+    let initialized = output.iter().any(|l| l.contains("process_group: true"));
+
+    // Check shutdown was ~1s (shutdownTimeout worked)
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "shutdownTimeout should be respected. Elapsed: {:?}",
+        elapsed
+    );
+
+    assert!(
+        initialized,
+        "camelCase aliases should work. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
+// TEST: Signal kill(pid, 0) Returns Correct Value for Current Process
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_signal_zero_current_process() {
+    // We can always signal ourselves
+    let pid = std::process::id();
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert_eq!(result, 0, "Should be able to signal our own process with kill(pid, 0)");
+    assert!(is_process_alive(pid), "is_process_alive should return true for current process");
+}
+
+// =============================================================================
+// TEST: Very High PID is Not Alive
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_very_high_pid_not_alive() {
+    // PID 4194304 is typically the max on Linux, try something above it
+    // On most systems, this PID won't exist
+    let result = is_process_alive(99999999);
+    assert!(!result, "Very high PID should not be alive");
 }

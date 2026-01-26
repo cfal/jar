@@ -236,14 +236,7 @@ async fn start_proc_internal(
     if shutdown.load(Ordering::Acquire) {
         // Process was spawned but we're shutting down - do inline graceful shutdown
         // to avoid orphaning this process (it's not tracked in the main shutdown handler)
-        let signal_target = if opts.process_group {
-            format!("-{}", pid)
-        } else {
-            pid.to_string()
-        };
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", "--", &signal_target])
-            .status();
+        send_signal_libc(pid, libc::SIGTERM, opts.process_group);
 
         // Wait for process to exit or timeout, then SIGKILL if needed
         let start = std::time::Instant::now();
@@ -252,9 +245,7 @@ async fn start_proc_internal(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if is_process_alive(pid) {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &signal_target])
-                .status();
+            send_signal_libc(pid, libc::SIGKILL, opts.process_group);
         }
         // Wait on the child to reap it and avoid zombie
         drop(child);
@@ -561,24 +552,25 @@ fn main() -> ExitCode {
                             continue;
                         }
 
-                        let mut cmd = if sudo_user.is_empty() {
-                            let mut kill_cmd = std::process::Command::new("kill");
-                            kill_cmd.arg(format!("-{}", forward_signal));
-                            kill_cmd
+                        if sudo_user.is_empty() {
+                            // Use libc::kill directly for non-sudo cases
+                            if let Some(sig) = signal_name_to_number(forward_signal) {
+                                for (pid, info) in pid_set.iter() {
+                                    send_signal_libc(*pid, sig, info.is_process_group);
+                                }
+                            }
                         } else {
+                            // Must use sudo subprocess for different users
                             let mut sudo_cmd = std::process::Command::new("sudo");
                             sudo_cmd.args(["-u", sudo_user, "kill", &format!("-{}", forward_signal)]);
-                            sudo_cmd
-                        };
-
-                        for pid in pid_set.keys() {
-                            cmd.arg(pid.to_string());
+                            for pid in pid_set.keys() {
+                                sudo_cmd.arg(pid.to_string());
+                            }
+                            let _ = sudo_cmd
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
                         }
-
-                        let _ = cmd
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
                     }
                 }
                 Some((name, None)) => {
@@ -694,19 +686,54 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Check if a process is still alive
+/// Check if a process is still alive using libc::kill with signal 0
 fn is_process_alive(pid: u32) -> bool {
-    // kill -0 checks if process exists without sending a signal
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    // kill(pid, 0) checks if process exists without sending a signal
+    // Returns 0 if process exists and we have permission to signal it
+    // Returns -1 with ESRCH if process doesn't exist
+    // Returns -1 with EPERM if process exists but we can't signal it (still alive)
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    // If we got EPERM, process exists but we can't signal it - still alive
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
+
+/// Convert a signal name to its numeric value
+fn signal_name_to_number(signal: &str) -> Option<libc::c_int> {
+    match signal {
+        "TERM" => Some(libc::SIGTERM),
+        "KILL" => Some(libc::SIGKILL),
+        "USR1" => Some(libc::SIGUSR1),
+        "USR2" => Some(libc::SIGUSR2),
+        "HUP" => Some(libc::SIGHUP),
+        "INT" => Some(libc::SIGINT),
+        "QUIT" => Some(libc::SIGQUIT),
+        _ => None,
+    }
+}
+
+/// Send a signal to a single PID using libc::kill
+/// For process groups, pass is_process_group=true to send to the process group
+fn send_signal_libc(pid: u32, signal: libc::c_int, is_process_group: bool) -> bool {
+    let target_pid = if is_process_group {
+        // Negative PID sends signal to the process group
+        -(pid as libc::pid_t)
+    } else {
+        pid as libc::pid_t
+    };
+
+    let result = unsafe { libc::kill(target_pid, signal) };
+    result == 0
 }
 
 /// Send a signal to a list of PIDs, using process groups where applicable
+/// Uses libc::kill directly for non-sudo cases, falls back to subprocess for sudo
 fn send_signal_to_pids(pids: &[(String, u32, PidInfo)], signal: &str) {
+    let signal_num = signal_name_to_number(signal);
+
     // Group by sudo user for efficient batching
     let mut by_sudo_user: HashMap<&str, Vec<(u32, bool)>> = HashMap::new();
     for (sudo_user, pid, info) in pids {
@@ -717,28 +744,37 @@ fn send_signal_to_pids(pids: &[(String, u32, PidInfo)], signal: &str) {
     }
 
     for (sudo_user, pid_list) in by_sudo_user {
-        let mut cmd = if sudo_user.is_empty() {
-            let mut kill_cmd = std::process::Command::new("kill");
-            kill_cmd.args([&format!("-{}", signal), "--"]);
-            kill_cmd
+        if sudo_user.is_empty() {
+            // Use libc::kill directly for non-sudo cases
+            if let Some(sig) = signal_num {
+                for (pid, is_group) in pid_list {
+                    send_signal_libc(pid, sig, is_group);
+                }
+            } else {
+                // Unknown signal, fall back to subprocess
+                let mut cmd = std::process::Command::new("kill");
+                cmd.args([&format!("-{}", signal), "--"]);
+                for (pid, is_group) in pid_list {
+                    if is_group {
+                        cmd.arg(format!("-{}", pid));
+                    } else {
+                        cmd.arg(pid.to_string());
+                    }
+                }
+                let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
         } else {
+            // Must use sudo subprocess for different users
             let mut sudo_cmd = std::process::Command::new("sudo");
             sudo_cmd.args(["-u", sudo_user, "kill", &format!("-{}", signal), "--"]);
-            sudo_cmd
-        };
-
-        for (pid, is_group) in pid_list {
-            if is_group {
-                // Negative PID kills the process group
-                cmd.arg(format!("-{}", pid));
-            } else {
-                cmd.arg(pid.to_string());
+            for (pid, is_group) in pid_list {
+                if is_group {
+                    sudo_cmd.arg(format!("-{}", pid));
+                } else {
+                    sudo_cmd.arg(pid.to_string());
+                }
             }
+            let _ = sudo_cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
-
-        let _ = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 }
