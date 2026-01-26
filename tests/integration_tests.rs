@@ -916,7 +916,7 @@ fn test_invalid_config_file() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Could not parse config file"),
+        stderr.contains("Could not parse"),
         "Should report parse error. Stderr: {}",
         stderr
     );

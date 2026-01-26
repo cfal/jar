@@ -203,6 +203,10 @@ async fn start_proc_internal(
         ));
     }
 
+    // Auto-enable process_group for sudo processes to prevent orphaned children
+    // When sudo exits, its child command would otherwise keep running as an orphan
+    let use_process_group = opts.process_group || opts.sudo_user.is_some();
+
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(match opts.sudo_user {
@@ -216,7 +220,7 @@ async fn start_proc_internal(
 
     // Optionally create a new session/process group so we can kill all children together
     #[cfg(unix)]
-    if opts.process_group {
+    if use_process_group {
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -236,7 +240,7 @@ async fn start_proc_internal(
     if shutdown.load(Ordering::Acquire) {
         // Process was spawned but we're shutting down - do inline graceful shutdown
         // to avoid orphaning this process (it's not tracked in the main shutdown handler)
-        send_signal_libc(pid, libc::SIGTERM, opts.process_group);
+        send_signal_libc(pid, libc::SIGTERM, use_process_group);
 
         // Wait for process to exit or timeout, then SIGKILL if needed
         let start = std::time::Instant::now();
@@ -245,7 +249,7 @@ async fn start_proc_internal(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if is_process_alive(pid) {
-            send_signal_libc(pid, libc::SIGKILL, opts.process_group);
+            send_signal_libc(pid, libc::SIGKILL, use_process_group);
         }
         // Wait on the child to reap it and avoid zombie
         // We must actually wait, not just drop - dropping doesn't reap!
@@ -255,7 +259,7 @@ async fn start_proc_internal(
 
     // Track PID with its shutdown configuration
     lock_or_recover(active_pids).insert(pid, PidInfo {
-        is_process_group: opts.process_group,
+        is_process_group: use_process_group,
         shutdown_timeout: opts.shutdown_timeout,
     });
 
@@ -373,19 +377,63 @@ fn create_prefix(color: &str, tag: &str) -> String {
 fn main() -> ExitCode {
     let args = env::args().collect::<Vec<_>>();
     if args.len() < 2 || args.iter().any(|arg| arg.as_str() == "--help") {
-        eprintln!("Usage: {} [--wrap] config.json", args[0]);
+        eprintln!("Usage: {} [--wrap] [-t NUM_THREADS] config.yaml", args[0]);
+        eprintln!("  --wrap          Run in wrapper mode (auto-restart on exit)");
+        eprintln!("  -t NUM_THREADS  Number of runtime threads (default: 1)");
         return ExitCode::from(1);
     }
 
-    if args[1] == "--wrap" {
-        if args.len() < 3 {
-            eprintln!("No config file provided.");
-            return ExitCode::from(1);
+    // Parse arguments
+    let mut num_threads: usize = 1;
+    let mut config_path: Option<&str> = None;
+    let mut wrap_mode = false;
+    let mut i = 1;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--wrap" => {
+                wrap_mode = true;
+                i += 1;
+            }
+            "-t" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: -t requires a number argument");
+                    return ExitCode::from(1);
+                }
+                match args[i + 1].parse::<usize>() {
+                    Ok(n) if n >= 1 => num_threads = n,
+                    _ => {
+                        eprintln!("Error: -t requires a positive integer");
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 2;
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {}", arg);
+                return ExitCode::from(1);
+            }
+            _ => {
+                config_path = Some(&args[i]);
+                i += 1;
+            }
         }
-        return run_wrapper_mode(&args[0], &args[2..]);
     }
 
-    let config_path = &args[1];
+    let Some(config_path) = config_path else {
+        eprintln!("No config file provided.");
+        return ExitCode::from(1);
+    };
+
+    if wrap_mode {
+        // Collect remaining args for wrapper (excluding -t which we've parsed)
+        let wrapper_args: Vec<String> = args[1..]
+            .iter()
+            .filter(|a| *a != "--wrap")
+            .cloned()
+            .collect();
+        return run_wrapper_mode(&args[0], &wrapper_args);
+    }
 
     // Get the config file's parent directory for #cwd# substitution
     // If the path has no parent (e.g., just "config.yaml"), use current directory
@@ -413,19 +461,51 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut config: Config = match serde_yaml::from_str(&config_data) {
-        Ok(c) => c,
-        Err(_) => {
-            let config_data = config_data
-                .split('\n')
-                .filter(|s| !s.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            match serde_json::from_str(&config_data) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Could not parse config file: {}", e);
-                    return ExitCode::from(1);
+    // Determine format by file extension, with fallback parsing
+    let is_json_ext = config_path.ends_with(".json");
+    let is_yaml_ext = config_path.ends_with(".yaml") || config_path.ends_with(".yml");
+
+    let mut config: Config = if is_json_ext {
+        // JSON file: strip comments and parse as JSON only
+        let config_data_stripped = config_data
+            .split('\n')
+            .filter(|s| !s.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match serde_json::from_str(&config_data_stripped) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Could not parse JSON config file: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else if is_yaml_ext {
+        // YAML file: parse as YAML only
+        match serde_yaml::from_str(&config_data) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Could not parse YAML config file: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // Unknown extension: try YAML first, then JSON, show both errors if both fail
+        match serde_yaml::from_str(&config_data) {
+            Ok(c) => c,
+            Err(yaml_err) => {
+                let config_data_stripped = config_data
+                    .split('\n')
+                    .filter(|s| !s.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match serde_json::from_str(&config_data_stripped) {
+                    Ok(c) => c,
+                    Err(json_err) => {
+                        eprintln!("Could not parse config file.");
+                        eprintln!("  As YAML: {}", yaml_err);
+                        eprintln!("  As JSON: {}", json_err);
+                        return ExitCode::from(1);
+                    }
                 }
             }
         }
@@ -472,7 +552,13 @@ fn main() -> ExitCode {
     // Shutdown flag to prevent race conditions when spawning new processes
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    let mut builder = Builder::new_current_thread();
+    let mut builder = if num_threads == 1 {
+        Builder::new_current_thread()
+    } else {
+        let mut mt = Builder::new_multi_thread();
+        mt.worker_threads(num_threads);
+        mt
+    };
     let runtime = match builder.enable_io().enable_time().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -662,10 +748,10 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
     let mut reaped_pids: HashSet<u32> = HashSet::new();
     let mut killed_pids: HashSet<u32> = HashSet::new();
 
-    // Build a set of our direct child PIDs (non-sudo)
-    let direct_child_pids: HashSet<u32> = all_pids
+    // All spawned processes are direct children (including sudo processes -
+    // the sudo binary itself is our child, not the command running under it)
+    let all_child_pids: HashSet<u32> = all_pids
         .iter()
-        .filter(|(sudo_user, _, _)| sudo_user.is_empty())
         .map(|(_, pid, _)| *pid)
         .collect();
 
@@ -674,6 +760,8 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
 
         // Event-driven: reap any children that have exited using waitpid
         // This is non-blocking (WNOHANG) and reaps zombies properly
+        // Loop immediately if we reaped a child (don't sleep unnecessarily)
+        let mut reaped_any = false;
         loop {
             let mut status: libc::c_int = 0;
             let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
@@ -684,37 +772,21 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
             }
 
             let exited_pid = result as u32;
-            if direct_child_pids.contains(&exited_pid) {
+            if all_child_pids.contains(&exited_pid) {
                 reaped_pids.insert(exited_pid);
+                reaped_any = true;
             }
         }
 
         // Check each process and send SIGKILL if timeout exceeded
         for (sudo_user, pid, info) in all_pids {
-            // Skip if already handled
+            // Skip if already reaped or killed
             if reaped_pids.contains(pid) || killed_pids.contains(pid) {
                 continue;
             }
 
-            // For direct children, we already know via waitpid if they're dead
-            // For sudo children, check with kill(pid, 0)
-            let is_direct = sudo_user.is_empty();
-            let alive = if is_direct && reaped_pids.contains(pid) {
-                false
-            } else if !is_direct {
-                is_process_alive(*pid)
-            } else {
-                // Direct child not yet reaped - still alive
-                true
-            };
-
-            if !alive {
-                reaped_pids.insert(*pid); // Mark as done
-                continue;
-            }
-
             // If this process has exceeded its timeout, kill it
-            if elapsed_secs >= info.shutdown_timeout && !killed_pids.contains(pid) {
+            if elapsed_secs >= info.shutdown_timeout {
                 eprintln!(
                     "Process {} exceeded {}s shutdown timeout, sending SIGKILL..",
                     pid, info.shutdown_timeout
@@ -724,17 +796,9 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
             }
         }
 
-        // Check if all processes are done
-        let any_alive = all_pids.iter().any(|(sudo_user, pid, _)| {
-            if reaped_pids.contains(pid) {
-                return false;
-            }
-            // For sudo processes, we must poll
-            if !sudo_user.is_empty() {
-                return is_process_alive(*pid);
-            }
-            // For direct children not yet reaped, assume alive
-            true
+        // Check if all processes are done (reaped via waitpid)
+        let any_alive = all_pids.iter().any(|(_, pid, _)| {
+            !reaped_pids.contains(pid)
         });
 
         if !any_alive {
@@ -755,9 +819,11 @@ fn graceful_shutdown_with_waitpid(all_pids: &[(String, u32, PidInfo)]) {
             break;
         }
 
-        // Short sleep only for sudo process polling (direct children are event-driven)
-        // This is much shorter than before since waitpid handles most cases
-        std::thread::sleep(Duration::from_millis(20));
+        // If we reaped a child this iteration, loop immediately to check for more
+        // Only sleep if no children exited (waitpid returned 0)
+        if !reaped_any {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
