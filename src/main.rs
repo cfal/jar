@@ -253,7 +253,7 @@ async fn start_proc_internal(
     }
 
     // Track PID with its shutdown configuration
-    lock_or_recover(&active_pids).insert(pid, PidInfo {
+    lock_or_recover(active_pids).insert(pid, PidInfo {
         is_process_group: opts.process_group,
         shutdown_timeout: opts.shutdown_timeout,
     });
@@ -405,13 +405,24 @@ fn main() -> ExitCode {
     }
 
     let config_path = &args[1];
+
+    // Get the config file's parent directory for #cwd# substitution
+    // If the path has no parent (e.g., just "config.yaml"), use current directory
     let config_parent_path = std::path::Path::new(config_path)
         .parent()
-        .expect("Could not read the parent path of the config file")
-        .to_string_lossy()
-        .into_owned();
+        .and_then(|p| {
+            let s = p.to_string_lossy();
+            // parent() returns Some("") for paths without directory component
+            if s.is_empty() { None } else { Some(s.into_owned()) }
+        })
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| ".".to_string());
 
-    let home_path = env::var("HOME").unwrap_or_default();
+    let home_path = env::var("HOME").unwrap_or_else(|_| ".".to_string());
 
     let config_data = match std::fs::read_to_string(config_path) {
         Ok(data) => data,
@@ -453,10 +464,7 @@ fn main() -> ExitCode {
         }
         if job_config.cwd.is_empty() {
             job_config.cwd = match env::current_dir() {
-                Ok(p) => p
-                    .into_os_string()
-                    .into_string()
-                    .expect("Could not parse current directory"),
+                Ok(p) => p.to_string_lossy().into_owned(),
                 Err(e) => {
                     eprintln!(
                         "Could not read current directory, defaulting to $HOME: {}",
@@ -484,13 +492,38 @@ fn main() -> ExitCode {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let mut builder = Builder::new_current_thread();
-    let runtime = builder
-        .enable_io()
-        .enable_time()
-        .build()
-        .expect("Could not build tokio runtime");
+    let runtime = match builder.enable_io().enable_time().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Could not build tokio runtime: {}", e);
+            return ExitCode::from(1);
+        }
+    };
 
     let active_pid_map = runtime.block_on(async move {
+        // Register signal handlers FIRST - if any fail, we cannot operate safely
+        // and should not start any jobs that we couldn't manage
+        macro_rules! register_signal {
+            ($kind:expr, $name:expr) => {
+                match signal($kind) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Failed to register {} handler: {}", $name, e);
+                        // Return None to signal failure to caller
+                        return None;
+                    }
+                }
+            };
+        }
+
+        let mut sigterm = register_signal!(SignalKind::terminate(), "SIGTERM");
+        let mut sighup = register_signal!(SignalKind::hangup(), "SIGHUP");
+        let mut sigint = register_signal!(SignalKind::interrupt(), "SIGINT");
+        let mut sigquit = register_signal!(SignalKind::quit(), "SIGQUIT");
+        let mut sigusr1 = register_signal!(SignalKind::user_defined1(), "SIGUSR1");
+        let mut sigusr2 = register_signal!(SignalKind::user_defined2(), "SIGUSR2");
+
+        // Now safe to start jobs since we can handle signals
         let mut pid_map: HashMap<String, Arc<Mutex<HashMap<u32, PidInfo>>>> = HashMap::new();
         let mut job_handles: Vec<JoinHandle<bool>> = Vec::new();
 
@@ -523,13 +556,6 @@ fn main() -> ExitCode {
             ));
             job_handles.push(handle);
         }
-
-        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
-        let mut sigquit = signal(SignalKind::quit()).expect("Failed to register SIGQUIT handler");
-        let mut sigusr1 = signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1 handler");
-        let mut sigusr2 = signal(SignalKind::user_defined2()).expect("Failed to register SIGUSR2 handler");
 
         // Signal handling loop: forward USR1/USR2, exit on termination signals
         let signal_name = loop {
@@ -603,11 +629,17 @@ fn main() -> ExitCode {
         // shutdown_background handle cleanup.
         drop(job_handles);
 
-        cloned_pid_map
+        Some(cloned_pid_map)
     });
 
     // Shutdown runtime - this will abort the blocked tasks
     runtime.shutdown_background();
+
+    // Handle signal registration failure (returned None)
+    let Some(active_pid_map) = active_pid_map else {
+        eprintln!("Failed to initialize signal handlers, exiting");
+        return ExitCode::from(1);
+    };
 
     // Collect all PIDs for graceful shutdown
     let all_pids: Vec<(String, u32, PidInfo)> = active_pid_map
@@ -688,11 +720,16 @@ fn main() -> ExitCode {
 
 /// Check if a process is still alive using libc::kill with signal 0
 fn is_process_alive(pid: u32) -> bool {
+    // Safely convert PID to pid_t - PIDs above i32::MAX are invalid
+    let Ok(pid_signed) = i32::try_from(pid) else {
+        return false; // Invalid PID cannot be alive
+    };
+
     // kill(pid, 0) checks if process exists without sending a signal
     // Returns 0 if process exists and we have permission to signal it
     // Returns -1 with ESRCH if process doesn't exist
     // Returns -1 with EPERM if process exists but we can't signal it (still alive)
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let result = unsafe { libc::kill(pid_signed as libc::pid_t, 0) };
     if result == 0 {
         return true;
     }
