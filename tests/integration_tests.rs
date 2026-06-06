@@ -1424,6 +1424,51 @@ fn test_cwd_placeholder_substitution() {
 }
 
 // =============================================================================
+// TEST: Runner CWD Placeholder Substitution (#runner_cwd#)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_runner_cwd_placeholder_substitution() {
+    use std::io::Write;
+
+    let runner_dir = tempfile::tempdir().expect("Failed to create runner dir");
+    let config_dir = tempfile::tempdir().expect("Failed to create config dir");
+    let config_path = config_dir.path().join("config.yaml");
+    let runner_marker = runner_dir.path().join("runner-marker.txt");
+    let config_marker = config_dir.path().join("runner-marker.txt");
+
+    let config = "jobs:\n  runner_cwd_test:\n    command: \"touch runner-marker.txt\"\n    cwd: \"#runner_cwd#\"\n";
+
+    let mut file = std::fs::File::create(&config_path).expect("Failed to create config");
+    file.write_all(config.as_bytes()).unwrap();
+
+    let mut child = Command::new(binary_path())
+        .arg(&config_path)
+        .current_dir(runner_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    thread::sleep(Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    assert!(
+        runner_marker.exists(),
+        "#runner_cwd# should expand to the directory where job-runner was started. Marker file should be at {:?}",
+        runner_marker
+    );
+    assert!(
+        !config_marker.exists(),
+        "#runner_cwd# should not expand to the config file directory. Unexpected marker file at {:?}",
+        config_marker
+    );
+}
+
+// =============================================================================
 // TEST: Home Placeholder Substitution (#home#)
 // =============================================================================
 

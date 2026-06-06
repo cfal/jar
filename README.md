@@ -130,6 +130,7 @@ Use these placeholders in `command` and `cwd`:
 |-------------|------------|
 | `#cwd#` | Directory containing the config file |
 | `#home#` | User's `$HOME` directory |
+| `#runner_cwd#` | Directory where job-runner was started |
 
 ## Signal Handling
 

@@ -452,6 +452,10 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| ".".to_string());
 
     let home_path = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let runner_cwd_path = env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
 
     let config_data = match std::fs::read_to_string(config_path) {
         Ok(data) => data,
@@ -532,12 +536,14 @@ fn main() -> ExitCode {
         job_config.cwd = job_config
             .cwd
             .replace("#cwd#", &config_parent_path)
-            .replace("#home#", &home_path);
+            .replace("#home#", &home_path)
+            .replace("#runner_cwd#", &runner_cwd_path);
 
         job_config.command = job_config
             .command
             .replace("#cwd#", &config_parent_path)
-            .replace("#home#", &home_path);
+            .replace("#home#", &home_path)
+            .replace("#runner_cwd#", &runner_cwd_path);
     }
 
     // Cache environment variables once at startup (perf improvement)
