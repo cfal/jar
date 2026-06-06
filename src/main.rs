@@ -537,13 +537,19 @@ fn main() -> ExitCode {
             .cwd
             .replace("#cwd#", &config_parent_path)
             .replace("#home#", &home_path)
-            .replace("#runner_cwd#", &runner_cwd_path);
+            .replace("#runner_cwd#", &runner_cwd_path)
+            .replace("$CWD", &config_parent_path)
+            .replace("$HOME", &home_path)
+            .replace("$RUNNER_CWD", &runner_cwd_path);
 
         job_config.command = job_config
             .command
             .replace("#cwd#", &config_parent_path)
             .replace("#home#", &home_path)
-            .replace("#runner_cwd#", &runner_cwd_path);
+            .replace("#runner_cwd#", &runner_cwd_path)
+            .replace("$CWD", &config_parent_path)
+            .replace("$HOME", &home_path)
+            .replace("$RUNNER_CWD", &runner_cwd_path);
     }
 
     // Cache environment variables once at startup (perf improvement)

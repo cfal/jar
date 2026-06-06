@@ -1469,6 +1469,64 @@ fn test_runner_cwd_placeholder_substitution() {
 }
 
 // =============================================================================
+// TEST: Dollar Placeholder Substitution ($CWD, $HOME, $RUNNER_CWD)
+// =============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_dollar_placeholder_substitution() {
+    use std::io::Write;
+
+    let runner_dir = tempfile::tempdir().expect("Failed to create runner dir");
+    let config_dir = tempfile::tempdir().expect("Failed to create config dir");
+    let config_path = config_dir.path().join("config.yaml");
+    let config_marker = config_dir.path().join("dollar-cwd-marker.txt");
+    let runner_marker = runner_dir.path().join("dollar-cwd-marker.txt");
+    let expected_home = std::env::var("HOME").unwrap_or_default();
+    let expected_runner_cwd = runner_dir.path().to_string_lossy().into_owned();
+
+    let config = "jobs:\n  dollar_test:\n    command: \"sh -c 'touch dollar-cwd-marker.txt; echo HOME_DIR=$HOME; echo RUNNER_DIR=$RUNNER_CWD'\"\n    cwd: \"$CWD\"\n";
+
+    let mut file = std::fs::File::create(&config_path).expect("Failed to create config");
+    file.write_all(config.as_bytes()).unwrap();
+
+    let mut child = Command::new(binary_path())
+        .arg(&config_path)
+        .current_dir(runner_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    let stdout = child.stdout.take().unwrap();
+    let output = collect_output_for(stdout, Duration::from_secs(2));
+
+    send_signal(child.id(), "TERM");
+    let _ = child.wait();
+
+    assert!(
+        config_marker.exists(),
+        "$CWD should expand to config file directory. Marker file should be at {:?}",
+        config_marker
+    );
+    assert!(
+        !runner_marker.exists(),
+        "$CWD should not expand to the runner startup directory. Unexpected marker file at {:?}",
+        runner_marker
+    );
+    assert!(
+        output.iter().any(|l| l.contains(&format!("HOME_DIR={}", expected_home))),
+        "$HOME should expand in command. Output: {:?}",
+        output
+    );
+    assert!(
+        output.iter().any(|l| l.contains(&format!("RUNNER_DIR={}", expected_runner_cwd))),
+        "$RUNNER_CWD should expand in command. Output: {:?}",
+        output
+    );
+}
+
+// =============================================================================
 // TEST: Home Placeholder Substitution (#home#)
 // =============================================================================
 
