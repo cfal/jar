@@ -449,6 +449,57 @@ fn very_short_jobs_restart_reliably() {
 }
 
 #[test]
+fn proc_churn_does_not_stop_scanner() {
+    let _resource_guard = serialize_resource_intensive_test();
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let script = temp.path().join("long-job.sh");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\ntouch {}\ntrap 'exit 0' TERM INT HUP QUIT\nwhile :; do sleep 1; done\n",
+            ready.display()
+        ),
+    );
+    fs::write(
+        &config,
+        format!("jobs:\n  long:\n    command: \"{}\"\n", script.display()),
+    )
+    .unwrap();
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(3), || ready.exists()));
+    let churn: Vec<_> = (0..4)
+        .map(|_| {
+            thread::spawn(|| {
+                Command::new("sh")
+                    .args([
+                        "-c",
+                        "i=0; while [ $i -lt 750 ]; do /bin/true; i=$((i + 1)); done",
+                    ])
+                    .status()
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert!(
+        churn
+            .into_iter()
+            .all(|handle| handle.join().unwrap().success())
+    );
+    assert!(runner.is_running(), "process churn stopped the supervisor");
+    assert!(
+        !runner.log().contains("Process scanner failed"),
+        "{}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
 fn job_group_signal_cannot_kill_the_supervisor() {
     let temp = tempfile::tempdir().unwrap();
     let runs = temp.path().join("runs");

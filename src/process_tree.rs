@@ -82,10 +82,17 @@ pub(crate) fn is_running(process: ProcessIdentity) -> bool {
 }
 
 pub(crate) fn is_running_checked(process: ProcessIdentity) -> io::Result<bool> {
-    read_stat(process.pid)
+    is_running_checked_with(process, read_stat)
+}
+
+fn is_running_checked_with<R>(process: ProcessIdentity, mut read_process: R) -> io::Result<bool>
+where
+    R: FnMut(u32) -> io::Result<ProcessStat>,
+{
+    read_process(process.pid)
         .map(|stat| stat.identity == process && stat.state != 'Z')
         .or_else(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
+            if process_disappeared(&error) {
                 Ok(false)
             } else {
                 Err(io::Error::new(
@@ -137,7 +144,7 @@ where
         };
         match read_process(pid) {
             Ok(stat) => processes.push(stat),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if process_disappeared(&error) => {}
             Err(error) => {
                 return Err(io::Error::new(
                     error.kind(),
@@ -148,6 +155,10 @@ where
     }
 
     Ok(processes)
+}
+
+fn process_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn read_stat(pid: u32) -> io::Result<ProcessStat> {
@@ -360,15 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn ignores_only_disappearing_process_stat_errors() {
+    fn ignores_disappearing_process_stat_errors() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("123"), "").unwrap();
 
-        let disappeared = snapshot_entries_with(std::fs::read_dir(temp.path()).unwrap(), |_| {
-            Err(io::Error::from(io::ErrorKind::NotFound))
-        })
-        .unwrap();
-        assert!(disappeared.is_empty());
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let disappeared =
+                snapshot_entries_with(std::fs::read_dir(temp.path()).unwrap(), |_| {
+                    Err(io::Error::from_raw_os_error(errno))
+                })
+                .unwrap();
+            assert!(disappeared.is_empty());
+        }
 
         let error = snapshot_entries_with(std::fs::read_dir(temp.path()).unwrap(), |_| {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
@@ -380,5 +394,23 @@ mod tests {
                 .to_string()
                 .contains("could not inspect /proc/123/stat")
         );
+    }
+
+    #[test]
+    fn treats_disappearing_process_as_not_running() {
+        let process = stat(123, 1, 123, 1).identity;
+
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            assert!(
+                !is_running_checked_with(process, |_| { Err(io::Error::from_raw_os_error(errno)) })
+                    .unwrap()
+            );
+        }
+
+        let error = is_running_checked_with(process, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
