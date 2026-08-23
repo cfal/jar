@@ -1,6 +1,6 @@
 # job-runner-rs
 
-A lightweight, async process supervisor written in Rust. Manages multiple background jobs with automatic restarts, graceful shutdown, signal forwarding, and colored output.
+A lightweight, async Linux process supervisor written in Rust. Manages multiple background jobs with automatic restarts, graceful shutdown, signal forwarding, and colored output.
 
 ## Features
 
@@ -8,7 +8,7 @@ A lightweight, async process supervisor written in Rust. Manages multiple backgr
 - **Auto-restart** - Automatically restart failed jobs with configurable delays
 - **Graceful shutdown** - SIGTERM with configurable timeout, then SIGKILL
 - **Signal forwarding** - Forward SIGUSR1/SIGUSR2 to all managed processes
-- **Process groups** - Optionally run jobs in their own session (setsid) to kill all children together
+- **Process isolation** - Run every job in a dedicated session and signal its process tree by default
 - **Colored output** - Each job gets its own color for easy visual distinction
 - **Timestamps** - Optional timestamp prefixes on log output
 - **Sudo support** - Run jobs as different users
@@ -59,7 +59,7 @@ jobs:
     delay: 1000                    # Initial startup delay (ms)
     restart_delay: 5000            # Delay before restart after failure (ms)
     disabled: false                # Set to true to skip this job
-    process_group: true            # Run in own session (kills children on exit)
+    process_group: true            # Signal the process tree (default: true)
     shutdown_timeout: 10           # Seconds to wait before SIGKILL
     env:                           # Additional environment variables
       NODE_ENV: production
@@ -98,13 +98,13 @@ JSON config files support C++ style comments:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `command` | string | *required* | Shell command to execute |
+| `command` | string | *required* | Shell source executed by `sh -c` |
 | `cwd` | string | current dir | Working directory |
 | `color` | string | random | Output color (see colors below) |
 | `delay` | integer | 0 | Initial startup delay in milliseconds |
 | `restart_delay` | integer | 15000 | Delay before restart after exit (ms) |
 | `disabled` | boolean | false | Skip this job |
-| `process_group` | boolean | false | Run in own session (setsid) |
+| `process_group` | boolean | true | Signal the job's process group and discovered descendants |
 | `shutdown_timeout` | integer | 5 | Seconds to wait for graceful exit |
 | `sudo_user` | string | none | Run as this user via sudo |
 | `env` | object | none | Additional environment variables |
@@ -124,13 +124,22 @@ JSON config files support C++ style comments:
 
 ### Path Substitution
 
-Use these placeholders in `command` and `cwd`:
+`#...#` placeholders are literal substitutions in `command` and `cwd`:
 
 | Placeholder | Expands To |
 |-------------|------------|
-| `#cwd#`, `$CWD` | Directory containing the config file |
-| `#home#`, `$HOME` | User's `$HOME` directory |
-| `#runner_cwd#`, `$RUNNER_CWD` | Directory where job-runner was started |
+| `#cwd#` | Directory containing the config file |
+| `#home#` | User's `$HOME` directory |
+| `#runner_cwd#` | Directory where job-runner was started |
+
+Jobs also receive `CWD` and `RUNNER_CWD` environment variables, plus the inherited
+`HOME`. The shell expands `$CWD`, `$RUNNER_CWD`, and `$HOME` in commands. An exact
+`cwd` value of `$CWD`, `$RUNNER_CWD`, or `$HOME` is also supported.
+
+Commands already run through `sh -c`; do not add another `sh -c` unless nested
+shell semantics are intentional. Each completed command is restarted after
+`restart_delay`, whether it succeeded or failed. Restarts always wait at least
+100 ms to prevent an accidental busy loop.
 
 ## Signal Handling
 
@@ -139,32 +148,58 @@ Use these placeholders in `command` and `cwd`:
 | `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT` | Initiate graceful shutdown |
 | `SIGUSR1`, `SIGUSR2` | Forward to all managed processes |
 
+A second termination signal skips the remaining graceful timeout and sends
+`SIGKILL`.
+
 ### Graceful Shutdown
 
 When a termination signal is received:
 
-1. Send `SIGTERM` to all managed processes
+1. Snapshot and send `SIGTERM` to all managed process trees
 2. Wait up to `shutdown_timeout` seconds per job
 3. Send `SIGKILL` to processes that haven't exited
-4. Exit
+4. Reap every direct child, drain output for a bounded interval, and exit
 
 ### Process Groups
 
-When `process_group: true`:
+Every job starts in a dedicated noninteractive session via `setsid()`. This
+prevents a job using `kill(0, ...)` from signaling job-runner itself.
 
-- The job runs in its own session via `setsid()`
-- All child processes inherit the process group
-- On shutdown, the entire process group is killed together
-- Useful for jobs that spawn child processes
+With the default `process_group: true`:
+
+- Signals target the dedicated process group.
+- Linux `/proc` ancestry is also tracked with PID and process start time so
+  descendants that create another session can be signaled when discovered.
+- Previously observed descendants, including processes that created another
+  session, are killed before the job restarts.
+
+Set `process_group: false` only when direct-shell signaling is required. The job
+is still session-isolated, but shutdown signals only its shell and descendants
+may survive. Jobs using `sudo_user` always use group/tree signaling because the
+direct `sudo` client is not the target workload. Validated workload descendants
+are signaled as the configured user; if delivery fails and a target remains
+alive, supervision fails instead of silently restarting or reporting success.
 
 ```yaml
 jobs:
-  # This job spawns workers - process_group ensures they're all killed
+  # Process-group signaling is enabled by default; this is explicit for clarity.
   supervisor:
     command: "python manage.py runserver"
     process_group: true
     shutdown_timeout: 10
 ```
+
+Process groups and `/proc` traversal are not hard containment. A descendant can
+escape between scans, PID identity validation still has a check/signal race, and
+an uninterruptible kernel task may remain after `SIGKILL`. A numeric process
+group can also be reused after its leader exits; retaining a previously validated
+leaderless group to close the final fork/exit gap can theoretically signal an
+unrelated reused group. Use a delegated cgroup v2 subtree and `cgroup.kill` when
+zero surviving descendants or strict isolation is a hard requirement.
+
+The supervisor exits with an error if it cannot enumerate `/proc` or inspect a
+listed process for any reason other than that process disappearing mid-scan;
+silently continuing would make escaped-descendant tracking unreliable.
 
 ## Output Format
 
@@ -175,6 +210,7 @@ Each line is prefixed with the job name and stream indicator:
 ```
 
 Where `stream` is:
+
 - `(s)` - Status messages (started, exited, etc.)
 - `(1)` - stdout
 - `(2)` - stderr
@@ -197,6 +233,14 @@ api (s) > 2024-01-15 10:30:45 > Started (pid 12345)
 api (1) > 2024-01-15 10:30:46 > Server listening on port 3000
 ```
 
+Each serialized output frame, including its prefix and newline, is capped at
+64 KiB. Long payloads are split and oversized prefixes or diagnostics are
+truncated. Each stream has a 4 MiB bounded queue and a dedicated writer thread;
+runtime diagnostics use the same nonblocking stderr path. A blocked destination
+therefore cannot stall shutdown. Once a queue fills, excess output is dropped.
+Normal exit uses bounded flush barriers; a blocked destination may still leave
+accepted frames unwritten when that deadline expires.
+
 ## Wrapper Mode
 
 The `--wrap` flag runs job-runner itself under supervision:
@@ -206,6 +250,37 @@ job-runner-rs --wrap config.yaml
 ```
 
 If the inner job-runner exits (crash, config error, etc.), the wrapper waits 15 seconds and restarts it. Useful for production deployments where you want the supervisor to be resilient.
+
+Wrapper signal handlers are installed before the inner process starts. The
+wrapper forwards termination and `SIGUSR1`/`SIGUSR2` signals, and its restart
+backoff is interruptible. Signals are queued only across an in-progress spawn;
+user signals received while no inner generation exists are dropped. Wrapper
+mode is not a PID 1 implementation and cannot guarantee cleanup of jobs left by
+an abruptly killed inner runner. `job-runner-rs` refuses to start when its own
+PID is 1 because it does not own a global `waitpid(-1)` reaper. In a container,
+use an external init:
+
+```bash
+tini -- job-runner-rs config.yaml
+```
+
+The Tokio supervisor deliberately does not act as a child subreaper: each
+direct child has one Tokio owner responsible for waiting and reaping it.
+
+## Docker Jobs
+
+Supported contract: attached `docker run` (the default), with container PID 1
+handling `SIGTERM`. Docker CLI then proxies the graceful signal, and `--rm`
+removes the container after it exits.
+
+Process supervision of the Docker CLI does not provide container ownership:
+
+- Killing or crashing the CLI cannot proxy `SIGKILL` to the container.
+- CLI exit, daemon disconnect, or runner force escalation may leave the
+  container running.
+- `docker run -d` exits immediately and must not be used as a supervised job.
+- Reliable forced cleanup requires a job shutdown hook that calls the Docker
+  API/CLI by container ID or native Docker lifecycle integration.
 
 ## Examples
 
