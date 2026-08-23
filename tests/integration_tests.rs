@@ -28,7 +28,6 @@ fn create_temp_config(content: &str) -> tempfile::NamedTempFile {
     file
 }
 
-
 /// Helper to collect output for a duration
 fn collect_output_for(
     reader: impl std::io::Read + Send + 'static,
@@ -38,10 +37,8 @@ fn collect_output_for(
 
     thread::spawn(move || {
         let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let _ = tx.send(line);
-            }
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(line);
         }
     });
 
@@ -353,9 +350,7 @@ jobs:
     let _ = child.wait();
 
     // The child process in the group should have received USR1
-    let child_received = output
-        .iter()
-        .any(|line| line.contains("CHILD_GOT_USR1"));
+    let child_received = output.iter().any(|line| line.contains("CHILD_GOT_USR1"));
     assert!(
         child_received,
         "Child process in group should receive signal. Output: {:?}",
@@ -423,7 +418,8 @@ jobs:
     }
 
     assert_eq!(
-        alive_count, 0,
+        alive_count,
+        0,
         "All {} sleep processes should be killed, but {} are still alive. PIDs: {:?}",
         sleep_pids_before.len(),
         alive_count,
@@ -434,17 +430,17 @@ jobs:
 }
 
 // =============================================================================
-// TEST: Process Group Disabled (default behavior)
+// TEST: Process Group Enabled by Default
 // =============================================================================
 
 #[test]
 #[cfg(unix)]
-fn test_process_group_disabled_by_default() {
+fn test_process_group_enabled_by_default() {
     let config = r#"
 jobs:
   parent:
     command: "bash -c 'bash -c \"sleep 301\" & wait'"
-    # process_group not set, defaults to false
+    # process_group not set, defaults to true
 "#;
 
     let config_file = create_temp_config(config);
@@ -473,17 +469,29 @@ jobs:
     // Send TERM to job-runner
     send_signal(child.id(), "TERM");
 
-    // Wait for shutdown (should still kill via SIGKILL fallback)
-    thread::sleep(Duration::from_secs(7));
-
-    // Cleanup any remaining sleep processes
-    for pid in &sleep_pids {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
     }
 
-    let _ = child.wait();
+    let surviving_pids: Vec<u32> = sleep_pids
+        .iter()
+        .copied()
+        .filter(|pid| is_process_alive(*pid))
+        .collect();
+
+    for pid in &surviving_pids {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "job-runner did not shut down"
+    );
+    assert!(
+        surviving_pids.is_empty(),
+        "default process-group shutdown left children alive: {surviving_pids:?}"
+    );
 }
 
 // =============================================================================
@@ -524,9 +532,9 @@ jobs:
     let _ = child.wait();
 
     // Should see SIGKILL message since the process ignores SIGTERM
-    let sigkill_sent = output
-        .iter()
-        .any(|line| line.contains("SIGKILL") || line.contains("exceeded") || line.contains("timeout"));
+    let sigkill_sent = output.iter().any(|line| {
+        line.contains("SIGKILL") || line.contains("exceeded") || line.contains("timeout")
+    });
 
     assert!(
         sigkill_sent,
@@ -574,9 +582,10 @@ jobs:
 
     // When the process has already exited, we should see graceful exit
     // (no SIGKILL needed because process is already gone)
-    let graceful_or_no_remaining = output.iter().any(|line| {
-        line.contains("gracefully") || line.contains("Exited with code 0")
-    }) || !output.iter().any(|line| line.contains("SIGKILL"));
+    let graceful_or_no_remaining = output
+        .iter()
+        .any(|line| line.contains("gracefully") || line.contains("Exited with code 0"))
+        || !output.iter().any(|line| line.contains("SIGKILL"));
 
     assert!(
         graceful_or_no_remaining,
@@ -646,7 +655,10 @@ fn test_multiple_usr_signals() {
     let config = r#"
 jobs:
   counter:
-    command: "sh -c 'count=0; trap \"count=$((count+1)); echo COUNT=$count\" USR1; while true; do sleep 0.2; done'"
+    command: |
+      count=0
+      trap 'count=$((count+1)); echo COUNT=$count' USR1
+      while true; do sleep 0.2; done
 "#;
 
     let config_file = create_temp_config(config);
@@ -724,7 +736,11 @@ jobs:
         .iter()
         .any(|line| line.contains("Skipping disabled job"));
 
-    assert!(skipped, "Expected disabled job to be skipped. Output: {:?}", output);
+    assert!(
+        skipped,
+        "Expected disabled job to be skipped. Output: {:?}",
+        output
+    );
 }
 
 // =============================================================================
@@ -860,7 +876,9 @@ fn test_json_config_with_comments() {
     let status = child.wait().expect("Failed to wait");
 
     // Should have parsed the JSON and run the job
-    let job_ran = output.iter().any(|line| line.contains("json_with_comments"));
+    let job_ran = output
+        .iter()
+        .any(|line| line.contains("json_with_comments"));
     assert!(
         job_ran || status.success(),
         "JSON with comments should be parsed correctly. Output: {:?}",
@@ -934,7 +952,7 @@ fn test_signal_killed_reports_signal_number() {
     let config = r#"
 jobs:
   self_killer:
-    command: "sh -c 'sleep 0.5; kill -KILL $$'"
+    command: "sleep 0.5; kill -KILL $$"
     restart_delay: 100
 "#;
 
@@ -956,9 +974,7 @@ jobs:
     let _ = child.wait();
 
     // Should see "Killed by signal 9" message (SIGKILL)
-    let signal_reported = output
-        .iter()
-        .any(|line| line.contains("Killed by signal"));
+    let signal_reported = output.iter().any(|line| line.contains("Killed by signal"));
 
     assert!(
         signal_reported,
@@ -1153,7 +1169,10 @@ fn test_libc_signal_term() {
     let status = child.wait().expect("Failed to wait");
 
     // Process should have been terminated by signal
-    assert!(!status.success(), "Process should not exit successfully after SIGTERM");
+    assert!(
+        !status.success(),
+        "Process should not exit successfully after SIGTERM"
+    );
 }
 
 // =============================================================================
@@ -1173,7 +1192,10 @@ fn test_libc_signal_nonexistent_process() {
 
     // Sending signal to non-existent process should return -1
     let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    assert_eq!(result, -1, "libc::kill should return -1 for non-existent process");
+    assert_eq!(
+        result, -1,
+        "libc::kill should return -1 for non-existent process"
+    );
 
     // Errno should be ESRCH (no such process)
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1207,7 +1229,10 @@ fn test_libc_signal_process_group() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    assert!(!child_pids.is_empty(), "Should have spawned child processes");
+    assert!(
+        !child_pids.is_empty(),
+        "Should have spawned child processes"
+    );
 
     // Send SIGTERM to the process group (negative PID)
     // Note: This only works if the process is a process group leader
@@ -1515,12 +1540,16 @@ fn test_dollar_placeholder_substitution() {
         runner_marker
     );
     assert!(
-        output.iter().any(|l| l.contains(&format!("HOME_DIR={}", expected_home))),
+        output
+            .iter()
+            .any(|l| l.contains(&format!("HOME_DIR={}", expected_home))),
         "$HOME should expand in command. Output: {:?}",
         output
     );
     assert!(
-        output.iter().any(|l| l.contains(&format!("RUNNER_DIR={}", expected_runner_cwd))),
+        output
+            .iter()
+            .any(|l| l.contains(&format!("RUNNER_DIR={}", expected_runner_cwd))),
         "$RUNNER_CWD should expand in command. Output: {:?}",
         output
     );
@@ -1534,7 +1563,8 @@ fn test_dollar_placeholder_substitution() {
 #[cfg(unix)]
 fn test_home_placeholder_substitution() {
     // Build config with placeholder - avoids raw string issues with #" in Rust 2024
-    let config = "jobs:\n  home_test:\n    command: \"sh -c 'echo HOME_DIR=$PWD'\"\n    cwd: \"#home#\"\n";
+    let config =
+        "jobs:\n  home_test:\n    command: \"sh -c 'echo HOME_DIR=$PWD'\"\n    cwd: \"#home#\"\n";
 
     let config_file = create_temp_config(config);
     let expected_home = std::env::var("HOME").unwrap_or_default();
@@ -1606,8 +1636,7 @@ jobs:
     assert!(
         has_timestamp,
         "Output should contain timestamp with date {}. Output: {:?}",
-        today,
-        output
+        today, output
     );
 }
 
@@ -1767,9 +1796,7 @@ jobs:
     send_signal(child.id(), "TERM");
     let _ = child.wait();
 
-    let color_warning = output
-        .iter()
-        .any(|l| l.contains("No such color, ignoring"));
+    let color_warning = output.iter().any(|l| l.contains("No such color, ignoring"));
 
     assert!(
         color_warning,
@@ -1788,7 +1815,7 @@ fn test_camelcase_config_aliases() {
     let config = r#"
 jobs:
   camel_test:
-    command: "bash -c 'sleep 60 &; wait'"
+    command: "sh -c 'trap \"\" TERM; while true; do sleep 1; done'"
     processGroup: true
     shutdownTimeout: 1
     restartDelay: 500
@@ -1815,8 +1842,7 @@ jobs:
     let _ = child.wait();
     let elapsed = start.elapsed();
 
-    // Check that processGroup was parsed (job initialized)
-    let initialized = output.iter().any(|l| l.contains("process_group: true"));
+    let initialized = output.iter().any(|l| l.contains("Started (pid"));
 
     // Check shutdown was ~1s (shutdownTimeout worked)
     assert!(
@@ -1842,8 +1868,14 @@ fn test_signal_zero_current_process() {
     // We can always signal ourselves
     let pid = std::process::id();
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    assert_eq!(result, 0, "Should be able to signal our own process with kill(pid, 0)");
-    assert!(is_process_alive(pid), "is_process_alive should return true for current process");
+    assert_eq!(
+        result, 0,
+        "Should be able to signal our own process with kill(pid, 0)"
+    );
+    assert!(
+        is_process_alive(pid),
+        "is_process_alive should return true for current process"
+    );
 }
 
 // =============================================================================
