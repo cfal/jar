@@ -6,11 +6,19 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 static CONTAINER_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static RESOURCE_INTENSIVE_TEST: Mutex<()> = Mutex::new(());
+
+fn serialize_resource_intensive_test() -> MutexGuard<'static, ()> {
+    RESOURCE_INTENSIVE_TEST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 struct Runner {
     child: Child,
@@ -830,6 +838,7 @@ fn user_signal_reaches_observed_reparented_new_session_descendant() {
 
 #[test]
 fn blocked_runner_output_does_not_delay_shutdown() {
+    let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("producer.pid");
     let script = temp.path().join("producer.sh");
@@ -869,6 +878,7 @@ fn blocked_runner_output_does_not_delay_shutdown() {
 
 #[test]
 fn oversized_job_prefix_keeps_output_queue_memory_bounded() {
+    let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("producer.pid");
     let script = temp.path().join("producer.sh");
@@ -974,6 +984,7 @@ fn exact_reader_chunk_boundary_does_not_add_blank_output() {
 
 #[test]
 fn blocked_runner_stderr_does_not_delay_shutdown() {
+    let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("producer.pid");
     let script = temp.path().join("producer.sh");
@@ -1042,6 +1053,7 @@ fn second_termination_signal_forces_shutdown() {
 
 #[test]
 fn parallel_start_shutdown_does_not_orphan_jobs() {
+    let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
     let script = temp.path().join("long-job.sh");
     write_executable(
@@ -1074,7 +1086,11 @@ fn parallel_start_shutdown_does_not_orphan_jobs() {
             .contains("Initializing job")));
         thread::sleep(Duration::from_millis((iteration % 4) + 1));
         runner.signal(libc::SIGTERM);
-        assert!(runner.wait(Duration::from_secs(5)).success());
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "iteration {iteration} failed: {}",
+            runner.log()
+        );
         let pids = read_pids(&iteration_pid_files);
         spawned += pids.len();
         assert!(
