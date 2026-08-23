@@ -109,10 +109,8 @@ struct JobConfig {
     restart_delay: u64,
     #[serde(default)]
     datetime: DateTimeConfig,
-    /// Signal the job's process group and descendants during shutdown.
     #[serde(default = "default_process_group", alias = "processGroup")]
     process_group: bool,
-    /// Seconds to wait after SIGTERM before sending SIGKILL (default: 5)
     #[serde(default = "default_shutdown_timeout", alias = "shutdownTimeout")]
     shutdown_timeout: u64,
 }
@@ -139,9 +137,6 @@ fn default_restart_delay() -> u64 {
     15_000
 }
 
-/// Lock a mutex, recovering from poison if necessary.
-/// For a process supervisor, it's better to continue with potentially stale data
-/// than to crash entirely during shutdown.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| {
         eprintln!("Supervisor state mutex was poisoned");
@@ -153,8 +148,6 @@ fn default_datetime_format() -> String {
     String::from("%Y-%m-%d %H:%M:%S %Z")
 }
 
-/// Validate that a sudo username contains only safe characters.
-/// Prevents shell injection via malicious usernames like "root; rm -rf /".
 fn is_valid_username(user: &str) -> bool {
     !user.is_empty()
         && user
@@ -171,7 +164,6 @@ struct Config {
     jobs: BTreeMap<String, JobConfig>,
 }
 
-/// Information tracked for each running process
 #[derive(Clone, Copy, Debug)]
 struct PidInfo {
     is_process_group: bool,
@@ -1188,7 +1180,6 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Parse arguments
     let mut num_threads: usize = 1;
     let mut config_path: Option<&str> = None;
     let mut wrap_mode = false;
@@ -1231,7 +1222,6 @@ fn main() -> ExitCode {
     };
 
     if wrap_mode {
-        // Collect remaining args for wrapper (excluding -t which we've parsed)
         let wrapper_args: Vec<String> = args[1..]
             .iter()
             .filter(|a| *a != "--wrap")
@@ -1261,7 +1251,6 @@ fn main() -> ExitCode {
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| runner_cwd_path.clone());
 
-    // Helper to strip // comments from JSON
     let strip_json_comments = |data: &str| -> String {
         data.lines()
             .filter(|s| !s.trim_start().starts_with("//"))
@@ -1269,7 +1258,6 @@ fn main() -> ExitCode {
             .join("\n")
     };
 
-    // Determine format by file extension, with fallback parsing
     let is_json_ext = config_path.ends_with(".json");
     let is_yaml_ext = config_path.ends_with(".yaml") || config_path.ends_with(".yml");
 
@@ -1290,7 +1278,6 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        // Unknown extension: try YAML first, then JSON
         match serde_yaml::from_str(&config_data) {
             Ok(c) => c,
             Err(yaml_err) => match serde_json::from_str(&strip_json_comments(&config_data)) {

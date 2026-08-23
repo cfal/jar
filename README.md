@@ -1,11 +1,12 @@
 # job-runner-rs
 
-A lightweight, async Linux process supervisor written in Rust. Manages multiple background jobs with automatic restarts, graceful shutdown, signal forwarding, and colored output.
+A lightweight asynchronous process supervisor for Linux. It runs multiple jobs,
+restarts them after exit, forwards signals, and shuts down their process trees.
 
 ## Features
 
 - **Multi-job execution** - Run multiple processes concurrently from a single config file
-- **Auto-restart** - Automatically restart failed jobs with configurable delays
+- **Auto-restart** - Restart completed jobs with configurable delays
 - **Graceful shutdown** - SIGTERM with configurable timeout, then SIGKILL
 - **Signal forwarding** - Forward SIGUSR1/SIGUSR2 to all managed processes
 - **Process isolation** - Run every job in a dedicated session and signal its process tree by default
@@ -77,7 +78,7 @@ jobs:
 
 ### JSON with Comments
 
-JSON config files support C++ style comments:
+JSON config files may contain full-line comments beginning with `//`:
 
 ```json
 {
@@ -99,7 +100,7 @@ JSON config files support C++ style comments:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `command` | string | *required* | Shell source executed by `sh -c` |
-| `cwd` | string | current dir | Working directory |
+| `cwd` | string | runner cwd | Working directory |
 | `color` | string | random | Output color (see colors below) |
 | `delay` | integer | 0 | Initial startup delay in milliseconds |
 | `restart_delay` | integer | 15000 | Delay before restart after exit (ms) |
@@ -190,12 +191,10 @@ jobs:
 ```
 
 Process groups and `/proc` traversal are not hard containment. A descendant can
-escape between scans, PID identity validation still has a check/signal race, and
-an uninterruptible kernel task may remain after `SIGKILL`. A numeric process
-group can also be reused after its leader exits; retaining a previously validated
-leaderless group to close the final fork/exit gap can theoretically signal an
-unrelated reused group. Use a delegated cgroup v2 subtree and `cgroup.kill` when
-zero surviving descendants or strict isolation is a hard requirement.
+escape between scans, PID validation has a check/signal race, and an
+uninterruptible kernel task may remain after `SIGKILL`. A numeric process group
+can also be reused after its leader exits. Use a delegated cgroup v2 subtree and
+`cgroup.kill` when zero surviving descendants or strict isolation is required.
 
 The supervisor exits with an error if it cannot enumerate `/proc` or inspect a
 listed process for any reason other than that process disappearing mid-scan;
@@ -233,13 +232,10 @@ api (s) > 2024-01-15 10:30:45 > Started (pid 12345)
 api (1) > 2024-01-15 10:30:46 > Server listening on port 3000
 ```
 
-Each serialized output frame, including its prefix and newline, is capped at
-64 KiB. Long payloads are split and oversized prefixes or diagnostics are
-truncated. Each stream has a 4 MiB bounded queue and a dedicated writer thread;
-runtime diagnostics use the same nonblocking stderr path. A blocked destination
-therefore cannot stall shutdown. Once a queue fills, excess output is dropped.
-Normal exit uses bounded flush barriers; a blocked destination may still leave
-accepted frames unwritten when that deadline expires.
+Each serialized output frame is capped at 64 KiB. Long payloads are split, and
+oversized prefixes or diagnostics are truncated. Each stream has a 4 MiB
+bounded queue and a dedicated writer thread, so blocked output cannot stall
+shutdown. Output is dropped after a queue fills or a bounded exit flush expires.
 
 ## Wrapper Mode
 
@@ -249,7 +245,7 @@ The `--wrap` flag runs job-runner itself under supervision:
 job-runner-rs --wrap config.yaml
 ```
 
-If the inner job-runner exits (crash, config error, etc.), the wrapper waits 15 seconds and restarts it. Useful for production deployments where you want the supervisor to be resilient.
+When the inner job-runner exits, the wrapper waits 15 seconds and restarts it.
 
 Wrapper signal handlers are installed before the inner process starts. The
 wrapper forwards termination and `SIGUSR1`/`SIGUSR2` signals, and its restart
@@ -264,8 +260,8 @@ use an external init:
 tini -- job-runner-rs config.yaml
 ```
 
-The Tokio supervisor deliberately does not act as a child subreaper: each
-direct child has one Tokio owner responsible for waiting and reaping it.
+The supervisor does not act as a child subreaper. Each direct child has one
+Tokio task responsible for waiting and reaping it.
 
 ## Docker Jobs
 
@@ -340,19 +336,6 @@ logrotate /etc/logrotate.conf
 kill -USR1 $(pidof job-runner-rs)
 ```
 
-## Building from Source
-
-```bash
-# Debug build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Run tests
-cargo test
-```
-
 ## License
 
-MIT
+[GNU General Public License v3.0](LICENSE)
