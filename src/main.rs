@@ -30,6 +30,8 @@ const MIN_RESTART_DELAY: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_SCAN_WARNING_CHANGE_FLOOR: Duration = Duration::from_secs(1);
+const PROCESS_SCAN_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 const SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_RETRY_LIMIT: usize = 3;
@@ -614,6 +616,7 @@ async fn start_proc_internal(
     let mut child_wait_error = None;
     let mut kill_sent_at = None;
     let mut signal_delivery_error = None;
+    let mut consecutive_inspection_failures = 0;
     let mut snapshots_closed = false;
     let mut post_kill_timed_out = false;
     let deadline = Instant::now() + Duration::from_secs(opts.shutdown_timeout);
@@ -625,15 +628,15 @@ async fn start_proc_internal(
         if let Err(error) =
             signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGTERM).await
         {
-            eprintln!("{} > Could not deliver SIGTERM: {}", status_prefix, error);
-            signal_delivery_error = Some(error);
+            log_signal_error(status_prefix, libc::SIGTERM, &error);
+            signal_delivery_error = Some(error.error);
         }
     } else {
         if let Err(error) =
             signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
         {
-            eprintln!("{} > Could not deliver SIGKILL: {}", status_prefix, error);
-            signal_delivery_error = Some(error);
+            log_signal_error(status_prefix, libc::SIGKILL, &error);
+            signal_delivery_error = Some(error.error);
         }
         let sent_at = Instant::now();
         kill_sent_at = Some(sent_at);
@@ -645,7 +648,28 @@ async fn start_proc_internal(
             known = related_processes(snapshots, identity, &known);
             update_active_descendants(active_pids, info, &known);
         }
-        let descendants_running = known.iter().copied().any(process_tree::is_running);
+        let mut inspection_errors = SignalErrors::default();
+        let observed_descendant = any_process_running_best_effort(&known, &mut inspection_errors);
+        let descendants_running = observed_descendant || inspection_errors.error.is_some();
+        if inspection_failure_requires_kill(
+            &mut consecutive_inspection_failures,
+            inspection_errors.error.is_some(),
+            kill_sent_at.is_some(),
+        ) {
+            eprintln!(
+                "{} > Could not verify process tree during shutdown, sending SIGKILL..",
+                status_prefix
+            );
+            if let Err(error) =
+                signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
+            {
+                log_signal_error(status_prefix, libc::SIGKILL, &error);
+                signal_delivery_error = Some(error.error);
+            }
+            let sent_at = Instant::now();
+            kill_sent_at = Some(sent_at);
+            post_kill_sleep.as_mut().reset(sent_at + POST_KILL_WAIT);
+        }
         let post_exit_snapshot_ready = snapshots_closed
             || child_exit_observed_at
                 .is_none_or(|observed| snapshots.borrow().started_after(observed));
@@ -690,8 +714,8 @@ async fn start_proc_internal(
                         if let Err(error) =
                             signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
                         {
-                            eprintln!("{} > Could not deliver SIGKILL: {}", status_prefix, error);
-                            signal_delivery_error = Some(error);
+                            log_signal_error(status_prefix, libc::SIGKILL, &error);
+                            signal_delivery_error = Some(error.error);
                         }
                         let sent_at = Instant::now();
                         kill_sent_at = Some(sent_at);
@@ -722,8 +746,8 @@ async fn start_proc_internal(
                 if let Err(error) =
                     signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
                 {
-                    eprintln!("{} > Could not deliver SIGKILL: {}", status_prefix, error);
-                    signal_delivery_error = Some(error);
+                    log_signal_error(status_prefix, libc::SIGKILL, &error);
+                    signal_delivery_error = Some(error.error);
                 }
                 let sent_at = Instant::now();
                 kill_sent_at = Some(sent_at);
@@ -741,8 +765,8 @@ async fn start_proc_internal(
                     if let Err(error) =
                         signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
                     {
-                        eprintln!("{} > Could not deliver SIGKILL: {}", status_prefix, error);
-                        signal_delivery_error = Some(error);
+                        log_signal_error(status_prefix, libc::SIGKILL, &error);
+                        signal_delivery_error = Some(error.error);
                     }
                     let sent_at = Instant::now();
                     kill_sent_at = Some(sent_at);
@@ -800,13 +824,19 @@ async fn start_proc_internal(
             Err(error) => return Err(ProcessRunError::Fatal(error)),
         }
     }
-    let unresolved_signal_error = signal_delivery_error.filter(|_| {
-        process_tree::is_running(info.identity)
-            || known.iter().copied().any(process_tree::is_running)
-    });
     if let Some(error) = timeout_error {
         return Err(ProcessRunError::Fatal(error));
     }
+    let unresolved_signal_error = if let Some(error) = signal_delivery_error {
+        let tree_is_running = process_tree::is_running_checked(info.identity)
+            .and_then(|root| {
+                any_process_running_checked(&known).map(|descendant| root || descendant)
+            })
+            .map_err(ProcessRunError::Fatal)?;
+        tree_is_running.then_some(error)
+    } else {
+        None
+    };
     if let Some(error) = unresolved_signal_error {
         return Err(ProcessRunError::Fatal(error));
     }
@@ -822,6 +852,62 @@ fn post_kill_timeout_error(
         descendants,
         process_tree::is_running_checked,
     )
+}
+
+fn any_process_running_checked(processes: &HashSet<ProcessIdentity>) -> std::io::Result<bool> {
+    any_process_running_checked_with(processes, process_tree::is_running_checked)
+}
+
+fn inspection_failure_requires_kill(
+    consecutive_failures: &mut usize,
+    inspection_failed: bool,
+    kill_was_sent: bool,
+) -> bool {
+    *consecutive_failures = if inspection_failed {
+        consecutive_failures.saturating_add(1)
+    } else {
+        0
+    };
+    *consecutive_failures >= 2 && !kill_was_sent
+}
+
+fn any_process_running_checked_with<P>(
+    processes: &HashSet<ProcessIdentity>,
+    mut probe: P,
+) -> std::io::Result<bool>
+where
+    P: FnMut(ProcessIdentity) -> std::io::Result<bool>,
+{
+    for process in processes {
+        if probe(*process)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn any_process_running_best_effort(
+    processes: &HashSet<ProcessIdentity>,
+    errors: &mut SignalErrors,
+) -> bool {
+    any_process_running_best_effort_with(processes, errors, process_tree::is_running_checked)
+}
+
+fn any_process_running_best_effort_with<P>(
+    processes: &HashSet<ProcessIdentity>,
+    errors: &mut SignalErrors,
+    mut probe: P,
+) -> bool
+where
+    P: FnMut(ProcessIdentity) -> std::io::Result<bool>,
+{
+    let mut any_running = false;
+    for process in processes {
+        if process_is_running_best_effort_with(*process, errors, &mut probe) {
+            any_running = true;
+        }
+    }
+    any_running
 }
 
 fn post_kill_timeout_error_with<P>(
@@ -912,29 +998,47 @@ async fn cleanup_after_natural_exit(
         return Ok(());
     }
 
-    let descendants: HashSet<_> = known
-        .iter()
-        .copied()
-        .filter(|process| process_tree::is_running(*process))
-        .collect();
-    if descendants.is_empty() {
+    let signal_prefix = status_prefix.to_string();
+    cleanup_known_processes_with(
+        known,
+        process_tree::is_running_checked,
+        |targets| async move {
+            eprintln!(
+                "{} > Cleaning up processes left behind by exited job",
+                status_prefix
+            );
+            signal_run_with_retry(&signal_prefix, opts, info, &targets, libc::SIGKILL)
+                .await
+                .map_err(|error| error.error)
+        },
+    )
+    .await
+}
+
+async fn cleanup_known_processes_with<P, S, F>(
+    known: &HashSet<ProcessIdentity>,
+    mut probe: P,
+    signal: S,
+) -> std::io::Result<()>
+where
+    P: FnMut(ProcessIdentity) -> std::io::Result<bool>,
+    S: FnOnce(HashSet<ProcessIdentity>) -> F,
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut initial_errors = SignalErrors::default();
+    let any_running = any_process_running_best_effort_with(known, &mut initial_errors, &mut probe);
+    if !any_running && initial_errors.error.is_none() {
         return Ok(());
     }
 
-    eprintln!(
-        "{} > Cleaning up processes left behind by exited job",
-        status_prefix
-    );
-    let result = signal_run_with_retry(
-        &status_prefix.to_string(),
-        opts,
-        info,
-        &descendants,
-        libc::SIGKILL,
-    )
-    .await;
+    let result = signal(known.clone()).await;
+    let mut validation_errors = SignalErrors::default();
+    let survivors = any_process_running_best_effort_with(known, &mut validation_errors, &mut probe);
+    if let Some(error) = validation_errors.error {
+        return Err(error);
+    }
     if let Err(error) = result
-        && descendants.iter().copied().any(process_tree::is_running)
+        && survivors
     {
         return Err(error);
     }
@@ -1372,6 +1476,12 @@ async fn run_supervisor(
     config: Config,
     base_env: Arc<HashMap<String, String>>,
 ) -> std::io::Result<()> {
+    process_tree::validate_procfs().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not validate Linux procfs: {error}"),
+        )
+    })?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -1475,7 +1585,6 @@ async fn run_supervisor(
                     Ok(snapshot) => {
                         if let Err(error) = forward_signal_to_jobs(&pid_map, &snapshot, libc::SIGUSR1).await {
                             eprintln!("Signal forwarding failed: {}", error);
-                            break ("SIGNAL FAILURE", true);
                         }
                     }
                     Err(error) => {
@@ -1490,7 +1599,6 @@ async fn run_supervisor(
                     Ok(snapshot) => {
                         if let Err(error) = forward_signal_to_jobs(&pid_map, &snapshot, libc::SIGUSR2).await {
                             eprintln!("Signal forwarding failed: {}", error);
-                            break ("SIGNAL FAILURE", true);
                         }
                     }
                     Err(error) => {
@@ -1583,10 +1691,12 @@ fn run_process_scanner<C>(
 where
     C: FnMut() -> std::io::Result<ProcessSnapshot>,
 {
+    let mut last_anomaly_log = None;
     loop {
         match scanner_request_rx.recv_timeout(scan_interval) {
             Ok(ProcessScannerRequest::Refresh(acknowledge)) => match capture() {
                 Ok(snapshot) => {
+                    log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
                     let snapshot = Arc::new(snapshot);
                     let published = snapshot_tx.send(snapshot.clone()).is_ok();
                     let _ = acknowledge.send(Ok(snapshot));
@@ -1602,11 +1712,31 @@ where
             },
             Ok(ProcessScannerRequest::Stop) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
-                if snapshot_tx.send(Arc::new(capture()?)).is_err() {
+                let snapshot = capture()?;
+                log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
+                if snapshot_tx.send(Arc::new(snapshot)).is_err() {
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+fn log_process_scan_anomalies(
+    snapshot: &ProcessSnapshot,
+    last_log: &mut Option<(Instant, HashSet<std::io::ErrorKind>)>,
+) {
+    let kinds = snapshot.anomaly_kinds();
+    if kinds.is_empty() {
+        return;
+    }
+    let should_log = last_log.as_ref().is_none_or(|(last, previous_kinds)| {
+        last.elapsed() >= PROCESS_SCAN_WARNING_INTERVAL
+            || (kinds != previous_kinds && last.elapsed() >= PROCESS_SCAN_WARNING_CHANGE_FLOOR)
+    });
+    if should_log && let Some(summary) = snapshot.anomaly_summary() {
+        eprintln!("Process scanner warning: {summary}");
+        *last_log = Some((Instant::now(), kinds.clone()));
     }
 }
 
@@ -1664,7 +1794,7 @@ async fn forward_signal_to_jobs(
     signal: libc::c_int,
 ) -> std::io::Result<()> {
     let mut targets = Vec::new();
-    let mut delivery_error = None;
+    let mut delivery_error = SignalErrors::default();
     for (sudo_user, pids) in pid_map {
         targets.extend(
             lock_or_recover(pids)
@@ -1680,11 +1810,6 @@ async fn forward_signal_to_jobs(
         } else {
             HashSet::new()
         };
-        if !process_tree::exists(tracked.info.identity)
-            && !descendants.iter().copied().any(process_tree::is_running)
-        {
-            continue;
-        }
         if let Err(error) = signal_process_tree(
             "Signal forwarding",
             (!sudo_user.is_empty()).then_some(sudo_user.as_str()),
@@ -1694,10 +1819,10 @@ async fn forward_signal_to_jobs(
         )
         .await
         {
-            delivery_error.get_or_insert(error);
+            delivery_error.record_signal(error);
         }
     }
-    delivery_error.map_or(Ok(()), Err)
+    delivery_error.finish().map_err(|error| error.error)
 }
 
 async fn signal_run(
@@ -1706,7 +1831,7 @@ async fn signal_run(
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
     signal_process_tree(
         log_prefix,
         opts.sudo_user.as_deref(),
@@ -1723,7 +1848,7 @@ async fn signal_run_with_retry(
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
     let mut last_error = None;
     let attempts = if opts.sudo_user.is_some() {
         1
@@ -1733,13 +1858,30 @@ async fn signal_run_with_retry(
     for attempt in 0..attempts {
         match signal_run(log_prefix, opts, info, descendants, signal).await {
             Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
+            Err(error) if error.delivery_failed => last_error = Some(error),
+            Err(error) => return Err(error),
         }
         if attempt + 1 < attempts {
             sleep(SIGNAL_RETRY_INTERVAL).await;
         }
     }
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("signal delivery failed")))
+    Err(last_error
+        .unwrap_or_else(|| SignalError::delivery(std::io::Error::other("signal delivery failed"))))
+}
+
+fn log_signal_error(status_prefix: &PrefixWriter<'_>, signal: libc::c_int, error: &SignalError) {
+    let operation = if error.delivery_failed {
+        "deliver"
+    } else {
+        "verify targets for"
+    };
+    eprintln!(
+        "{} > Could not {} SIG{}: {}",
+        status_prefix,
+        operation,
+        signal_number_to_name(signal),
+        error.error
+    );
 }
 
 async fn signal_process_tree(
@@ -1748,24 +1890,24 @@ async fn signal_process_tree(
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
     let root = info.identity;
-    let root_exists = process_tree::exists(root);
+    let mut delivery_error = SignalErrors::default();
+    let root_exists = process_exists_best_effort(root, &mut delivery_error);
     if let Some(username) = sudo_user {
-        let mut delivery_error = None;
         if signal == libc::SIGKILL
             && root_exists
             && let Ok(pid) = i32::try_from(root.pid)
             && let Err(error) = send_signal_target(pid, signal)
             && error.raw_os_error() != Some(libc::ESRCH)
         {
-            delivery_error = Some(error);
+            delivery_error.record_delivery(error);
         }
 
-        let targets: Vec<ProcessIdentity> = descendants
+        let targets: HashSet<ProcessIdentity> = descendants
             .iter()
             .copied()
-            .filter(|process| process_tree::is_running(*process))
+            .filter(|process| process_is_running_best_effort(*process, &mut delivery_error))
             .collect();
         if targets.is_empty() {
             if signal != libc::SIGKILL
@@ -1774,25 +1916,31 @@ async fn signal_process_tree(
                 && let Err(error) = send_signal_target(pid, signal)
                 && error.raw_os_error() != Some(libc::ESRCH)
             {
-                delivery_error = Some(error);
+                delivery_error.record_delivery(error);
             }
         } else {
             for process in targets {
                 if let Err(error) =
                     signal_identity_as_user(log_prefix, username, signal, process).await
                 {
-                    delivery_error.get_or_insert(error);
+                    delivery_error.record_signal(error);
                 }
             }
         }
-        return delivery_error.map_or(Ok(()), Err);
+        return delivery_error.finish();
     }
 
-    let group_is_owned = root_exists
-        || descendants
-            .iter()
-            .copied()
-            .any(|process| process.process_group == root.pid && process_tree::is_running(process));
+    let mut group_is_owned = root_exists;
+    if !group_is_owned {
+        for process in descendants {
+            if process.process_group == root.pid
+                && process_is_running_best_effort(*process, &mut delivery_error)
+            {
+                group_is_owned = true;
+                break;
+            }
+        }
+    }
     let mut targets = Vec::new();
 
     if info.is_process_group && group_is_owned {
@@ -1808,7 +1956,9 @@ async fn signal_process_tree(
 
     if info.is_process_group {
         for process in descendants {
-            if process.process_group == root.pid || !process_tree::is_running(*process) {
+            if process.process_group == root.pid
+                || !process_is_running_best_effort(*process, &mut delivery_error)
+            {
                 continue;
             }
             let Ok(pid) = i32::try_from(process.pid) else {
@@ -1819,9 +1969,8 @@ async fn signal_process_tree(
     }
 
     if targets.is_empty() {
-        return Ok(());
+        return delivery_error.finish();
     }
-    let mut delivery_error = None;
     for target in targets {
         if let Err(error) = send_signal_target(target, signal)
             && error.raw_os_error() != Some(libc::ESRCH)
@@ -1833,10 +1982,106 @@ async fn signal_process_tree(
                 target,
                 error
             );
-            delivery_error.get_or_insert(error);
+            delivery_error.record_delivery(error);
         }
     }
-    delivery_error.map_or(Ok(()), Err)
+    delivery_error.finish()
+}
+
+struct SignalError {
+    error: std::io::Error,
+    delivery_failed: bool,
+}
+
+impl SignalError {
+    fn inspection(error: std::io::Error) -> Self {
+        Self {
+            error,
+            delivery_failed: false,
+        }
+    }
+
+    fn delivery(error: std::io::Error) -> Self {
+        Self {
+            error,
+            delivery_failed: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SignalErrors {
+    error: Option<std::io::Error>,
+    delivery_failed: bool,
+}
+
+impl SignalErrors {
+    fn record_inspection(&mut self, error: std::io::Error) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    fn record_delivery(&mut self, error: std::io::Error) {
+        if !self.delivery_failed {
+            self.error = Some(error);
+        }
+        self.delivery_failed = true;
+    }
+
+    fn record_signal(&mut self, error: SignalError) {
+        if error.delivery_failed {
+            self.record_delivery(error.error);
+        } else {
+            self.record_inspection(error.error);
+        }
+    }
+
+    fn finish(self) -> Result<(), SignalError> {
+        self.error.map_or(Ok(()), |error| {
+            Err(SignalError {
+                error,
+                delivery_failed: self.delivery_failed,
+            })
+        })
+    }
+}
+
+fn process_exists_best_effort(
+    process: ProcessIdentity,
+    inspection_error: &mut SignalErrors,
+) -> bool {
+    match process_tree::exists_checked(process) {
+        Ok(exists) => exists,
+        Err(error) => {
+            inspection_error.record_inspection(error);
+            false
+        }
+    }
+}
+
+fn process_is_running_best_effort(
+    process: ProcessIdentity,
+    inspection_error: &mut SignalErrors,
+) -> bool {
+    process_is_running_best_effort_with(process, inspection_error, process_tree::is_running_checked)
+}
+
+fn process_is_running_best_effort_with<P>(
+    process: ProcessIdentity,
+    inspection_error: &mut SignalErrors,
+    mut probe: P,
+) -> bool
+where
+    P: FnMut(ProcessIdentity) -> std::io::Result<bool>,
+{
+    match probe(process) {
+        Ok(running) => running,
+        Err(error) => {
+            inspection_error.record_inspection(error);
+            false
+        }
+    }
 }
 
 async fn signal_as_user(
@@ -1894,12 +2139,15 @@ async fn signal_identity_as_user(
     username: &str,
     signal: libc::c_int,
     process: ProcessIdentity,
-) -> std::io::Result<()> {
-    let pid = i32::try_from(process.pid)
-        .map_err(|_| std::io::Error::other("process ID does not fit signal target"))?;
+) -> Result<(), SignalError> {
+    let pid = i32::try_from(process.pid).map_err(|_| {
+        SignalError::delivery(std::io::Error::other(
+            "process ID does not fit signal target",
+        ))
+    })?;
     let mut last_error = None;
     for attempt in 0..SIGNAL_RETRY_LIMIT {
-        if !process_tree::is_running(process) {
+        if !process_tree::is_running_checked(process).map_err(SignalError::inspection)? {
             return Ok(());
         }
         match signal_as_user(log_prefix, username, signal, &[pid]).await {
@@ -1910,14 +2158,21 @@ async fn signal_identity_as_user(
             sleep(SIGNAL_RETRY_INTERVAL).await;
         }
     }
-    if !process_tree::is_running(process) {
+    if !process_tree::is_running_checked(process).map_err(SignalError::inspection)? {
         return Ok(());
     }
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("sudo signal delivery failed")))
+    Err(SignalError::delivery(last_error.unwrap_or_else(|| {
+        std::io::Error::other("sudo signal delivery failed")
+    })))
 }
 
 fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
     use std::os::unix::process::CommandExt;
+
+    if let Err(error) = process_tree::validate_procfs() {
+        eprintln!("[Wrapper] Could not validate Linux procfs: {error}");
+        return ExitCode::from(1);
+    }
 
     let signal_state = Arc::new(Mutex::new(WrapperSignalState::default()));
     let shutdown_state = Arc::new(AtomicU8::new(0));
@@ -2252,6 +2507,50 @@ mod tests {
     }
 
     #[test]
+    fn scanner_anomaly_logs_are_rate_limited_by_error_kind() {
+        let denied = ProcessSnapshot::with_anomaly(
+            1,
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        );
+        let invalid =
+            ProcessSnapshot::with_anomaly(1, std::io::ErrorKind::InvalidData, "invalid data");
+        let mixed = ProcessSnapshot::with_anomaly_kinds(
+            2,
+            HashSet::from([
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidData,
+            ]),
+            "mixed failures",
+        );
+        let mut last_log = None;
+
+        log_process_scan_anomalies(&denied, &mut last_log);
+        let first_log = last_log.clone();
+        log_process_scan_anomalies(&denied, &mut last_log);
+        assert_eq!(last_log, first_log);
+
+        log_process_scan_anomalies(&invalid, &mut last_log);
+        assert_eq!(last_log, first_log);
+        last_log.as_mut().unwrap().0 = Instant::now()
+            .checked_sub(PROCESS_SCAN_WARNING_CHANGE_FLOOR)
+            .unwrap();
+        log_process_scan_anomalies(&invalid, &mut last_log);
+        assert_eq!(
+            last_log.as_ref().map(|(_, kinds)| kinds),
+            Some(&HashSet::from([std::io::ErrorKind::InvalidData]))
+        );
+
+        log_process_scan_anomalies(&mixed, &mut last_log);
+        assert_eq!(last_log.as_ref().unwrap().1.len(), 1);
+        last_log.as_mut().unwrap().0 = Instant::now()
+            .checked_sub(PROCESS_SCAN_WARNING_CHANGE_FLOOR)
+            .unwrap();
+        log_process_scan_anomalies(&mixed, &mut last_log);
+        assert_eq!(last_log.as_ref().unwrap().1.len(), 2);
+    }
+
+    #[test]
     fn closed_snapshot_channel_forces_bounded_job_shutdown() {
         let temp = tempfile::tempdir().unwrap();
         let ready = temp.path().join("ready");
@@ -2335,5 +2634,241 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("known descendant 123"));
+    }
+
+    #[test]
+    fn tracked_liveness_errors_are_not_treated_as_exit() {
+        let process = ProcessIdentity {
+            pid: 123,
+            process_group: 123,
+            start_time: 456,
+        };
+        let error = any_process_running_checked_with(&HashSet::from([process]), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn shutdown_escalates_only_after_consecutive_inspection_failures() {
+        let mut failures = 0;
+
+        assert!(!inspection_failure_requires_kill(
+            &mut failures,
+            true,
+            false
+        ));
+        assert_eq!(failures, 1);
+        assert!(!inspection_failure_requires_kill(
+            &mut failures,
+            false,
+            false
+        ));
+        assert_eq!(failures, 0);
+        assert!(!inspection_failure_requires_kill(
+            &mut failures,
+            true,
+            false
+        ));
+        assert!(inspection_failure_requires_kill(&mut failures, true, false));
+        assert!(!inspection_failure_requires_kill(&mut failures, true, true));
+    }
+
+    #[test]
+    fn target_selection_records_inspection_errors_without_stopping() {
+        let first = ProcessIdentity {
+            pid: 123,
+            process_group: 123,
+            start_time: 456,
+        };
+        let second = ProcessIdentity {
+            pid: 124,
+            process_group: 123,
+            start_time: 457,
+        };
+        let mut inspection_errors = SignalErrors::default();
+
+        assert!(!process_is_running_best_effort_with(
+            first,
+            &mut inspection_errors,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ));
+        assert!(process_is_running_best_effort_with(
+            second,
+            &mut inspection_errors,
+            |_| Ok(true),
+        ));
+        assert_eq!(
+            inspection_errors.error.unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn signal_errors_report_the_first_delivery_failure() {
+        let mut errors = SignalErrors::default();
+        errors.record_inspection(std::io::Error::other("inspection"));
+        errors.record_delivery(std::io::Error::other("first delivery"));
+        errors.record_delivery(std::io::Error::other("second delivery"));
+
+        let error = errors.finish().unwrap_err();
+        assert!(error.delivery_failed);
+        assert_eq!(error.error.to_string(), "first delivery");
+    }
+
+    #[test]
+    fn cleanup_signals_before_returning_an_inspection_error() {
+        let unreadable = ProcessIdentity {
+            pid: 123,
+            process_group: 123,
+            start_time: 456,
+        };
+        let running = ProcessIdentity {
+            pid: 124,
+            process_group: 123,
+            start_time: 457,
+        };
+        let signaled = std::cell::RefCell::new(None);
+        let runtime = Builder::new_current_thread().build().unwrap();
+
+        let error = runtime
+            .block_on(cleanup_known_processes_with(
+                &HashSet::from([unreadable, running]),
+                |process| {
+                    if process == unreadable {
+                        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    } else {
+                        Ok(true)
+                    }
+                },
+                |targets| {
+                    signaled.replace(Some(targets));
+                    std::future::ready(Ok(()))
+                },
+            ))
+            .unwrap_err();
+
+        assert!(signaled.borrow().as_ref().unwrap().contains(&running));
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn zombie_root_still_owns_its_process_group() {
+        unsafe {
+            let mut pid_pipe = [0; 2];
+            assert_eq!(libc::pipe(pid_pipe.as_mut_ptr()), 0);
+            let mut alive_pipe = [0; 2];
+            assert_eq!(libc::pipe(alive_pipe.as_mut_ptr()), 0);
+
+            let root = libc::fork();
+            assert!(root >= 0, "fork failed");
+            if root == 0 {
+                libc::setsid();
+                let member = libc::fork();
+                if member == 0 {
+                    libc::close(pid_pipe[0]);
+                    libc::close(pid_pipe[1]);
+                    libc::close(alive_pipe[0]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+                if member < 0 {
+                    libc::_exit(1);
+                }
+                libc::close(alive_pipe[0]);
+                libc::close(alive_pipe[1]);
+                libc::close(pid_pipe[0]);
+                let root_pid = libc::getpid() as u32;
+                libc::write(
+                    pid_pipe[1],
+                    std::ptr::addr_of!(root_pid).cast::<libc::c_void>(),
+                    std::mem::size_of::<u32>(),
+                );
+                libc::close(pid_pipe[1]);
+                libc::usleep(400_000);
+                libc::_exit(0);
+            }
+            struct ProcessGroupGuard(libc::pid_t);
+            impl Drop for ProcessGroupGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::kill(-self.0, libc::SIGKILL);
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+            let _cleanup = ProcessGroupGuard(root);
+            libc::close(pid_pipe[1]);
+            libc::close(alive_pipe[1]);
+
+            let mut raw_pid = [0; std::mem::size_of::<u32>()];
+            assert_eq!(
+                libc::read(
+                    pid_pipe[0],
+                    raw_pid.as_mut_ptr().cast::<libc::c_void>(),
+                    raw_pid.len(),
+                ),
+                raw_pid.len() as isize
+            );
+            libc::close(pid_pipe[0]);
+            let root_pid = u32::from_ne_bytes(raw_pid);
+            let identity = process_tree::identity(root_pid).unwrap();
+            assert_eq!(identity.process_group, root_pid);
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let stat = std::fs::read(format!("/proc/{root_pid}/stat")).unwrap();
+                let close = stat.iter().rposition(|byte| *byte == b')').unwrap();
+                if stat[close + 2] == b'Z' {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "root never became a zombie");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+            let result = runtime.block_on(signal_process_tree(
+                "zombie root",
+                None,
+                PidInfo {
+                    is_process_group: true,
+                    identity,
+                },
+                &HashSet::new(),
+                libc::SIGKILL,
+            ));
+            assert!(result.is_ok(), "signaling reported an error");
+
+            libc::fcntl(alive_pipe[0], libc::F_SETFL, libc::O_NONBLOCK);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let group_member_died = loop {
+                let mut byte = 0;
+                let read = libc::read(
+                    alive_pipe[0],
+                    std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+                    1,
+                );
+                if read == 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if !group_member_died {
+                libc::kill(-(root_pid as libc::pid_t), libc::SIGKILL);
+            }
+            libc::close(alive_pipe[0]);
+
+            assert!(
+                group_member_died,
+                "group member survived SIGKILL while its root was a zombie"
+            );
+        }
     }
 }
