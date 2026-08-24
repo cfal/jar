@@ -135,6 +135,29 @@ impl ProcessSnapshot {
             unresolved_pids: HashSet::new(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_descendant(root: ProcessIdentity, descendant: ProcessIdentity) -> Self {
+        Self {
+            processes: vec![
+                ProcessStat {
+                    identity: root,
+                    parent_pid: 1,
+                    state: 'Z',
+                },
+                ProcessStat {
+                    identity: descendant,
+                    parent_pid: root.pid,
+                    state: 'S',
+                },
+            ],
+            started_at: std::time::Instant::now(),
+            anomaly_count: 0,
+            first_anomaly: None,
+            anomaly_kinds: HashSet::new(),
+            unresolved_pids: HashSet::new(),
+        }
+    }
 }
 
 pub(crate) fn identity(pid: u32) -> io::Result<ProcessIdentity> {

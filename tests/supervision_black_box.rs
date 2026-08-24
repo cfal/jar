@@ -275,6 +275,30 @@ fn process_group_id(pid: u32) -> Option<u32> {
         .ok()
 }
 
+fn zombie_child_count(parent_pid: u32) -> usize {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| fs::read(format!("/proc/{pid}/stat")).ok())
+        .filter_map(|stat| {
+            let close = stat.iter().rposition(|byte| *byte == b')')?;
+            let mut fields = stat[close + 1..]
+                .split(u8::is_ascii_whitespace)
+                .filter(|field| !field.is_empty());
+            let state = *fields.next()?.first()?;
+            let parent = std::str::from_utf8(fields.next()?)
+                .ok()?
+                .parse::<u32>()
+                .ok()?;
+            Some((state, parent))
+        })
+        .filter(|(state, parent)| *state == b'Z' && *parent == parent_pid)
+        .count()
+}
+
 fn resident_set_kib(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()?
@@ -314,8 +338,76 @@ fn install_failing_signal_sudo(root: &Path) -> String {
     write_executable(
         &fake_bin.join("sudo"),
         &format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && exit 77\ndone\nexec {} \"$@\"\n",
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    job-runner-signal|job-runner-reconcile) exit 77 ;;\n  esac\ndone\nexec {} \"$@\"\n",
             real_sudo
+        ),
+    );
+    format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn install_counting_signal_sudo(root: &Path, invocations: &Path) -> String {
+    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
+    assert!(sudo_output.status.success());
+    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
+        .trim()
+        .to_string();
+    let fake_bin = root.join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    write_executable(
+        &fake_bin.join("sudo"),
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    echo invocation >> {}\n    break\n  fi\ndone\nexec {} \"$@\"\n",
+            invocations.display(),
+            real_sudo
+        ),
+    );
+    format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn install_hanging_reconcile_sudo(root: &Path) -> String {
+    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
+    assert!(sudo_output.status.success());
+    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
+        .trim()
+        .to_string();
+    let fake_bin = root.join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    write_executable(
+        &fake_bin.join("sudo"),
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-reconcile ]; then exec sleep 30; fi\ndone\nexec {} \"$@\"\n",
+            real_sudo
+        ),
+    );
+    format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn install_fail_first_kill_sudo(root: &Path, invocations: &Path) -> String {
+    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
+    assert!(sudo_output.status.success());
+    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
+        .trim()
+        .to_string();
+    let fake_bin = root.join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    write_executable(
+        &fake_bin.join("sudo"),
+        &format!(
+            "#!/bin/sh\nsignal=0\nkill=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -KILL ] && kill=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$kill\" -eq 1 ]; then\n  echo invocation >> {invocations}\n  [ \"$(wc -l < {invocations})\" -eq 1 ] && exit 77\nfi\nexec {real_sudo} \"$@\"\n",
+            invocations = invocations.display(),
+            real_sudo = real_sudo,
         ),
     );
     format!(
@@ -817,9 +909,13 @@ fn natural_leader_exit_kills_observed_new_session_descendants() {
     let _cleanup = ProcessCleanup(vec![descendants.clone()]);
 
     let mut runner = Runner::start(&config, log, &[]);
-    assert!(wait_until(Duration::from_secs(5), || {
-        read_pids(std::slice::from_ref(&descendants)).len() >= 2
-    }));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            read_pids(std::slice::from_ref(&descendants)).len() >= 2
+        }),
+        "escaped job did not restart: {}",
+        runner.log()
+    );
     let descendant_pids = read_pids(std::slice::from_ref(&descendants));
     assert!(
         !process_is_running(descendant_pids[0]),
@@ -832,6 +928,129 @@ fn natural_leader_exit_kills_observed_new_session_descendants() {
         descendant_pids.iter().all(|pid| !process_is_running(*pid)),
         "escaped descendants remained after shutdown"
     );
+}
+
+#[test]
+fn natural_exit_cleans_daemon_reparented_before_the_first_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let descendants = temp.path().join("descendants");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  daemonizer:\n    command: \"before=$(wc -l < {descendants}); ( setsid sh -c 'echo $$ >> {descendants}; exec sleep 30' & ); while [ $(wc -l < {descendants}) -le $before ]; do :; done\"\n    restart_delay: 100\n",
+            descendants = descendants.display()
+        ),
+    )
+    .unwrap();
+    File::create(&descendants).unwrap();
+    let _cleanup = ProcessCleanup(vec![descendants.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            read_pids(std::slice::from_ref(&descendants)).len() >= 2
+        }),
+        "daemonizing job did not restart: {}",
+        runner.log()
+    );
+    let descendant_pids = read_pids(std::slice::from_ref(&descendants));
+    assert!(
+        wait_until(Duration::from_secs(2), || !process_is_running(
+            descendant_pids[0]
+        )),
+        "daemon from the first run survived its leader and restart: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert!(
+        descendant_pids.iter().all(|pid| !process_is_running(*pid)),
+        "daemonized descendants remained after shutdown"
+    );
+}
+
+#[test]
+fn externally_terminated_leader_restarts_after_bounded_descendant_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let leaders = temp.path().join("leaders");
+    let descendants = temp.path().join("descendants");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    File::create(&leaders).unwrap();
+    File::create(&descendants).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  externally_killed:\n    command: \"before=$(wc -l < {descendants}); echo $$ >> {leaders}; setsid sh -c 'echo $$ >> {descendants}; trap \\\"\\\" TERM; while :; do sleep 1; done' & while [ $(wc -l < {descendants}) -le $before ]; do sleep 0.01; done; wait\"\n    restart_delay: 100\n    shutdown_timeout: 1\n",
+            leaders = leaders.display(),
+            descendants = descendants.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![leaders.clone(), descendants.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(4), || {
+        read_pids(std::slice::from_ref(&leaders)).len() == 1
+            && read_pids(std::slice::from_ref(&descendants)).len() == 1
+    }));
+    let first_leader = read_pids(std::slice::from_ref(&leaders))[0];
+    let first_descendant = read_pids(std::slice::from_ref(&descendants))[0];
+    assert_eq!(
+        unsafe { libc::kill(first_leader as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            read_pids(std::slice::from_ref(&leaders)).len() >= 2
+        }),
+        "job did not restart after its leader was terminated: {}",
+        runner.log()
+    );
+    assert!(
+        !process_is_running(first_descendant),
+        "first run's descendant survived the restart: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn job_shim_reaps_adopted_children_while_the_main_command_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let ready = temp.path().join("ready");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  reaper:\n    command: |\n      echo $PPID > {shim_pid}\n      for _ in $(seq 1 30); do ( setsid sh -c 'sleep 0.05' & ); done\n      touch {ready}\n      trap 'exit 0' TERM\n      while :; do sleep 1; done\n",
+            shim_pid = shim_pid.display(),
+            ready = ready.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        zombie_child_count(shim),
+        0,
+        "job shim retained adopted zombies: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
 }
 
 #[test]
@@ -1257,7 +1476,7 @@ fn wrapper_restarts_a_killed_inner_runner_and_stops_during_backoff() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho $$ >> {}\npid=$PPID\nwhile [ \"$pid\" -gt 1 ]; do\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n    kill -KILL \"$pid\"\n    exit 0\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nexit 1\n",
+            "#!/bin/bash\necho $$ >> {}\npid=$PPID\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n    kill -KILL \"$pid\"\n    exit 0\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nexit 1\n",
             runs.display()
         ),
     );
@@ -1295,6 +1514,120 @@ fn wrapper_restarts_a_killed_inner_runner_and_stops_during_backoff() {
 }
 
 #[test]
+fn wrapper_reconciles_jobs_left_by_a_killed_inner_runner_before_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs = temp.path().join("runs");
+    let killed_once = temp.path().join("killed-once");
+    let script = temp.path().join("kill-runner-once.sh");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("wrapper.log");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
+            runs = runs.display(),
+            killed_once = killed_once.display(),
+        ),
+    );
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  survivor:\n    command: \"{}\"\n    restart_delay: 10000\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![runs.clone()]);
+
+    let mut wrapper = Runner::start(&config, log, &["--wrap"]);
+    assert!(
+        wait_until(Duration::from_secs(25), || {
+            read_pids(std::slice::from_ref(&runs)).len() >= 2
+        }),
+        "inner runner did not restart: {}",
+        wrapper.log()
+    );
+    let job_pids = read_pids(std::slice::from_ref(&runs));
+    assert!(
+        !process_is_running(job_pids[0]),
+        "previous-generation job overlapped its replacement: {}",
+        wrapper.log()
+    );
+    assert!(process_is_running(job_pids[1]));
+
+    wrapper.signal(libc::SIGTERM);
+    assert!(wrapper.wait(Duration::from_secs(5)).success());
+    assert!(wait_until(Duration::from_secs(2), || job_pids
+        .iter()
+        .all(|pid| !process_is_running(*pid))));
+}
+
+#[test]
+fn wrapper_reconciles_cross_uid_jobs_before_restart() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let runs = temp.path().join("runs");
+    let killed_once = temp.path().join("killed-once");
+    let script = temp.path().join("kill-runner-once.sh");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("wrapper.log");
+    File::create(&runs).unwrap();
+    let mut permissions = fs::metadata(&runs).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&runs, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
+            runs = runs.display(),
+            killed_once = killed_once.display(),
+        ),
+    );
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  root_survivor:\n    command: \"{}\"\n    sudo_user: {username}\n    restart_delay: 10000\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: runs.clone(),
+    };
+
+    let mut wrapper = Runner::start(&config, log, &["--wrap"]);
+    assert!(
+        wait_until(Duration::from_secs(25), || {
+            read_pids(std::slice::from_ref(&runs)).len() >= 2
+        }),
+        "inner runner did not restart after cross-UID cleanup: {}",
+        wrapper.log()
+    );
+    let job_pids = read_pids(std::slice::from_ref(&runs));
+    assert!(
+        !process_is_running(job_pids[0]),
+        "previous cross-UID generation overlapped its replacement: {}",
+        wrapper.log()
+    );
+    assert!(process_is_running(job_pids[1]));
+
+    wrapper.signal(libc::SIGTERM);
+    assert!(wrapper.wait(Duration::from_secs(5)).success());
+    assert!(wait_until(Duration::from_secs(2), || job_pids
+        .iter()
+        .all(|pid| !process_is_running(*pid))));
+}
+
+#[test]
 fn wrapper_drops_user_signals_received_during_backoff() {
     let temp = tempfile::tempdir().unwrap();
     let runs = temp.path().join("runs");
@@ -1307,7 +1640,7 @@ fn wrapper_drops_user_signals_received_during_backoff() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho run >> {runs}\nif [ \"$(wc -l < {runs})\" -eq 1 ]; then\n  pid=$PPID\n  while [ \"$pid\" -gt 1 ]; do\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n      kill -KILL \"$pid\"\n      exit 0\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  exit 1\nfi\necho $$ > {job_pid}\ntrap 'touch {stale_signal}' USR1\ntouch {stable}\nwhile :; do sleep 1; done\n",
+            "#!/bin/bash\necho run >> {runs}\nif [ \"$(wc -l < {runs})\" -eq 1 ]; then\n  pid=$PPID\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n      kill -KILL \"$pid\"\n      exit 0\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  exit 1\nfi\necho $$ > {job_pid}\ntrap 'touch {stale_signal}' USR1\ntouch {stable}\nwhile :; do sleep 1; done\n",
             runs = runs.display(),
             job_pid = job_pid.display(),
             stale_signal = stale_signal.display(),
@@ -1417,9 +1750,10 @@ fn sudo_signals_nested_and_escaped_workloads_once() {
     let pids = temp.path().join("jobs.pid");
     let received = temp.path().join("received");
     let ready = temp.path().join("ready");
+    let signal_invocations = temp.path().join("signal-invocations");
     let config = temp.path().join("jobs.yaml");
     let log = temp.path().join("runner.log");
-    for path in [&pids, &received, &ready] {
+    for path in [&pids, &received, &ready, &signal_invocations] {
         File::create(path).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o666);
@@ -1442,8 +1776,9 @@ fn sudo_signals_nested_and_escaped_workloads_once() {
         username: username.to_string(),
         pid_path: pids.clone(),
     };
+    let path = install_counting_signal_sudo(temp.path(), &signal_invocations);
 
-    let mut runner = Runner::start(&config, log, &[]);
+    let mut runner = Runner::start_with_path(&config, log, &path);
     assert!(wait_until(Duration::from_secs(5), || {
         fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0)
     }));
@@ -1465,6 +1800,14 @@ fn sudo_signals_nested_and_escaped_workloads_once() {
             "{label} received USR1 more than once: {deliveries:?}"
         );
     }
+    assert_eq!(
+        fs::read_to_string(&signal_invocations)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "sudo targets were not delivered in one helper invocation"
+    );
     assert!(runner.is_running(), "USR1 restarted the sudo job");
     assert!(process_is_running(process_ids[0]));
     runner.signal(libc::SIGTERM);
@@ -1475,12 +1818,237 @@ fn sudo_signals_nested_and_escaped_workloads_once() {
 }
 
 #[test]
-fn sudo_signal_helper_failure_fails_the_supervisor() {
+fn sudo_sigkill_retries_after_a_transient_helper_failure() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("job.pid");
+    let invocations = temp.path().join("kill-invocations");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&pid_file, &invocations] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  retry_kill:\n    command: |\n      echo $$ > {pid_file}\n      trap '' TERM\n      exec sleep 30\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            pid_file = pid_file.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: pid_file.clone(),
+    };
+    let path = install_fail_first_kill_sudo(temp.path(), &invocations);
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&pid_file)).is_empty()
+    }));
+    let pid = read_pids(std::slice::from_ref(&pid_file))[0];
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(6)).success());
+    assert!(!process_is_running(pid));
+    assert_eq!(
+        fs::read_to_string(&invocations).unwrap().lines().count(),
+        2,
+        "SIGKILL helper was not retried exactly once"
+    );
+}
+
+#[test]
+fn sudo_job_shim_kills_escaped_descendant_before_exiting() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let descendant = temp.path().join("descendant.pid");
+    let log = temp.path().join("shim.log");
+    File::create(&descendant).unwrap();
+    let mut permissions = fs::metadata(&descendant).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&descendant, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let command = format!(
+        "setsid sh -c 'echo $$ > {}; exec sleep 30' & while [ ! -s {} ]; do sleep 0.01; done",
+        descendant.display(),
+        descendant.display()
+    );
+    let output = File::create(&log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"))
+        .args([
+            "--job-shim",
+            "--shutdown-timeout",
+            "1",
+            "--sudo-user",
+            username,
+            "--",
+            &command,
+        ])
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: descendant.clone(),
+    };
+    let mut shim = Runner {
+        child,
+        log_path: log,
+    };
+
+    let status = shim.wait(Duration::from_secs(5));
+    assert!(status.success(), "{}", shim.log());
+    let descendant_pid = read_pids(std::slice::from_ref(&descendant))[0];
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_is_running(
+            descendant_pid
+        )),
+        "sudo descendant survived the shim: {}",
+        shim.log()
+    );
+}
+
+#[test]
+fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
     let Some(username) = current_username() else {
         eprintln!("skipped: current username unavailable");
         return;
     };
     if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let descendant = temp.path().join("descendant.pid");
+    let log = temp.path().join("shim.log");
+    File::create(&descendant).unwrap();
+    let mut permissions = fs::metadata(&descendant).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&descendant, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let command = format!(
+        "setsid sh -c 'echo $$ > {}; exec sleep 30' & while [ ! -s {} ]; do sleep 0.01; done",
+        descendant.display(),
+        descendant.display()
+    );
+    let output = File::create(&log).unwrap();
+    let path = install_hanging_reconcile_sudo(temp.path());
+    let child = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"))
+        .args([
+            "--job-shim",
+            "--shutdown-timeout",
+            "1",
+            "--sudo-user",
+            &username,
+            "--",
+            &command,
+        ])
+        .env("PATH", path)
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: descendant.clone(),
+    };
+    let mut shim = Runner {
+        child,
+        log_path: log,
+    };
+
+    let started = Instant::now();
+    let status = shim.wait(Duration::from_secs(5));
+    assert!(status.success(), "{}", shim.log());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let descendant_pid = read_pids(std::slice::from_ref(&descendant))[0];
+    assert!(
+        !process_is_running(descendant_pid),
+        "successfully killed descendant was reported as alive: {}",
+        shim.log()
+    );
+}
+
+#[test]
+fn sudo_graceful_shutdown_notifies_shim_before_workload_exit() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let graceful = temp.path().join("graceful");
+    let release = temp.path().join("release");
+    let child_pid = temp.path().join("child.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&ready, &graceful, &child_pid] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  sudo_graceful:\n    command: |\n      sh -c 'echo $$ > {child_pid}; trap \"while [ ! -e {release} ]; do sleep 0.01; done; echo done > {graceful}; exit 0\" TERM; while :; do sleep 1; done' &\n      touch {ready}\n      trap 'exit 0' TERM\n      wait\n    sudo_user: {username}\n    shutdown_timeout: 2\n",
+            child_pid = child_pid.display(),
+            graceful = graceful.display(),
+            release = release.display(),
+            ready = ready.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: child_pid.clone(),
+    };
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()
+        && !read_pids(std::slice::from_ref(&child_pid)).is_empty()));
+    runner.signal(libc::SIGTERM);
+    thread::sleep(Duration::from_millis(300));
+    File::create(&release).unwrap();
+    assert!(runner.wait(Duration::from_secs(6)).success());
+    assert!(
+        fs::metadata(&graceful).is_ok_and(|metadata| metadata.len() > 0),
+        "shim killed a gracefully exiting sudo descendant: {}",
+        runner.log()
+    );
+}
+
+#[test]
+fn sudo_signal_helper_failure_fails_the_supervisor() {
+    let username = "root";
+    if !sudo_available_for(username) {
         eprintln!("skipped: noninteractive sudo unavailable for {username}");
         return;
     }
@@ -1507,7 +2075,7 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     )
     .unwrap();
     let _cleanup = SudoProcessCleanup {
-        username,
+        username: username.to_string(),
         pid_path: pid_file.clone(),
     };
     let mut runner = Runner::start_with_path(&config, log, &path);
@@ -1516,6 +2084,11 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     }));
     let status = runner.wait(Duration::from_secs(8));
     assert!(!status.success(), "signal helper failure returned success");
+    let escaped_pid = read_pids(std::slice::from_ref(&pid_file))[0];
+    assert!(
+        process_is_running(escaped_pid),
+        "supervisor failed even though no cross-UID survivor remained"
+    );
     let output = runner.log();
     assert!(output.contains("sudo signal helper exited"), "{output}");
     assert!(

@@ -30,9 +30,12 @@ const MIN_RESTART_DELAY: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_SCAN_FAILURE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_SCAN_FAILURE_WINDOW: Duration = Duration::from_secs(1);
 const PROCESS_SCAN_WARNING_CHANGE_FLOOR: Duration = Duration::from_secs(1);
 const PROCESS_SCAN_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
+const RECONCILE_CONVERGENCE_RESERVE: Duration = Duration::from_millis(250);
 const SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_RETRY_LIMIT: usize = 3;
 const SUDO_SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -159,6 +162,13 @@ fn is_valid_username(user: &str) -> bool {
 
 fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && !key.contains(['=', '\0'])
+}
+
+fn strip_json_comments(data: &str) -> String {
+    data.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,10 +436,33 @@ async fn start_proc_internal(
     }
 
     let use_process_group = opts.process_group || opts.sudo_user.is_some();
-    let mut cmd = if let Some(username) = &opts.sudo_user {
+    // In-process tests execute through the libtest binary, which cannot enter this hidden mode.
+    let use_job_shim = use_process_group && !cfg!(test);
+    let mut cmd = if use_job_shim {
+        let mut cmd = Command::new(env::current_exe()?);
+        cmd.args([
+            "--job-shim",
+            "--shutdown-timeout",
+            &opts.shutdown_timeout.to_string(),
+        ]);
+        if let Some(username) = &opts.sudo_user {
+            cmd.args(["--sudo-user", username]);
+            for key in ["CWD", "RUNNER_CWD"] {
+                if let Some(value) = base_env.get(key) {
+                    cmd.args(["--job-env", key, value]);
+                }
+            }
+            if let Some(additional_env) = &opts.env {
+                for (key, value) in additional_env {
+                    cmd.args(["--job-env", key, value]);
+                }
+            }
+        }
+        cmd.arg("--").arg(&opts.command);
+        cmd
+    } else if let Some(username) = &opts.sudo_user {
         let mut cmd = Command::new("sudo");
-        cmd.args(["-n", "-u", username, "--"]);
-        cmd.args(["env", "--"]);
+        cmd.args(["-n", "-u", username, "--", "env", "--"]);
         for key in ["CWD", "RUNNER_CWD"] {
             if let Some(value) = base_env.get(key) {
                 cmd.arg(format!("{key}={value}"));
@@ -459,14 +492,15 @@ async fn start_proc_internal(
         cmd.envs(additional_env);
     }
 
-    #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    if !use_job_shim {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = cmd.spawn()?;
@@ -615,6 +649,7 @@ async fn start_proc_internal(
     let mut child_exit_observed_at = None;
     let mut child_wait_error = None;
     let mut kill_sent_at = None;
+    let mut kill_attempted = HashSet::new();
     let mut signal_delivery_error = None;
     let mut consecutive_inspection_failures = 0;
     let mut snapshots_closed = false;
@@ -640,6 +675,7 @@ async fn start_proc_internal(
         }
         let sent_at = Instant::now();
         kill_sent_at = Some(sent_at);
+        kill_attempted.extend(known.iter().copied());
         post_kill_sleep.as_mut().reset(sent_at + POST_KILL_WAIT);
     }
 
@@ -647,6 +683,24 @@ async fn start_proc_internal(
         if use_process_group {
             known = related_processes(snapshots, identity, &known);
             update_active_descendants(active_pids, info, &known);
+        }
+        if kill_sent_at.is_some() {
+            let new_targets: HashSet<_> = known.difference(&kill_attempted).copied().collect();
+            if !new_targets.is_empty() {
+                kill_attempted.extend(new_targets.iter().copied());
+                if let Err(error) = signal_run_with_retry(
+                    &signal_log_prefix,
+                    opts,
+                    info,
+                    &new_targets,
+                    libc::SIGKILL,
+                )
+                .await
+                {
+                    log_signal_error(status_prefix, libc::SIGKILL, &error);
+                    signal_delivery_error = Some(error.error);
+                }
+            }
         }
         let mut inspection_errors = SignalErrors::default();
         let observed_descendant = any_process_running_best_effort(&known, &mut inspection_errors);
@@ -668,6 +722,7 @@ async fn start_proc_internal(
             }
             let sent_at = Instant::now();
             kill_sent_at = Some(sent_at);
+            kill_attempted.extend(known.iter().copied());
             post_kill_sleep.as_mut().reset(sent_at + POST_KILL_WAIT);
         }
         let post_exit_snapshot_ready = snapshots_closed
@@ -719,6 +774,7 @@ async fn start_proc_internal(
                         }
                         let sent_at = Instant::now();
                         kill_sent_at = Some(sent_at);
+                        kill_attempted.extend(known.iter().copied());
                         post_kill_sleep
                             .as_mut()
                             .reset(sent_at + POST_KILL_WAIT);
@@ -751,6 +807,7 @@ async fn start_proc_internal(
                 }
                 let sent_at = Instant::now();
                 kill_sent_at = Some(sent_at);
+                kill_attempted.extend(known.iter().copied());
                 post_kill_sleep
                     .as_mut()
                     .reset(sent_at + POST_KILL_WAIT);
@@ -770,6 +827,7 @@ async fn start_proc_internal(
                     }
                     let sent_at = Instant::now();
                     kill_sent_at = Some(sent_at);
+                    kill_attempted.extend(known.iter().copied());
                     post_kill_sleep
                         .as_mut()
                         .reset(sent_at + POST_KILL_WAIT);
@@ -1268,6 +1326,221 @@ fn create_prefix(color: &str, tag: &str) -> String {
     format!("{}{}{}", code, tag, reset)
 }
 
+const JOB_SHIM_SIGNALS: [libc::c_int; 6] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+static JOB_SHIM_TERMINATION_RECEIVED: AtomicU8 = AtomicU8::new(0);
+
+extern "C" fn job_shim_signal_handler(signal: libc::c_int) {
+    if matches!(
+        signal,
+        libc::SIGTERM | libc::SIGHUP | libc::SIGINT | libc::SIGQUIT
+    ) {
+        JOB_SHIM_TERMINATION_RECEIVED.store(1, Ordering::Relaxed);
+    }
+}
+
+fn run_job_shim(args: &[String]) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut sudo_user = None;
+    let mut shutdown_timeout = None;
+    let mut job_env = Vec::new();
+    let mut command = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sudo-user" if index + 1 < args.len() => {
+                sudo_user = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--shutdown-timeout" if index + 1 < args.len() => {
+                shutdown_timeout = args[index + 1].parse::<u64>().ok();
+                index += 2;
+            }
+            "--job-env" if index + 2 < args.len() => {
+                job_env.push((args[index + 1].clone(), args[index + 2].clone()));
+                index += 3;
+            }
+            "--" if index + 2 == args.len() => {
+                command = Some(args[index + 1].clone());
+                break;
+            }
+            argument => {
+                std::eprintln!("Invalid job shim argument: {argument}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let Some(command_text) = command else {
+        std::eprintln!("Job shim command is missing");
+        return ExitCode::from(1);
+    };
+    let Some(shutdown_timeout) = shutdown_timeout else {
+        std::eprintln!("Job shim shutdown timeout is missing or invalid");
+        return ExitCode::from(1);
+    };
+
+    if unsafe { libc::setsid() } == -1 {
+        std::eprintln!(
+            "Job shim could not create a session: {}",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::from(1);
+    }
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
+        std::eprintln!(
+            "Job shim could not become a child subreaper: {}",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::from(1);
+    }
+    for signal in JOB_SHIM_SIGNALS {
+        if unsafe {
+            libc::signal(
+                signal,
+                job_shim_signal_handler as *const () as libc::sighandler_t,
+            )
+        } == libc::SIG_ERR
+        {
+            std::eprintln!(
+                "Job shim could not install a signal handler: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(1);
+        }
+    }
+    let identity = match process_tree::identity(std::process::id()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            std::eprintln!("Job shim could not inspect itself: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut child = if let Some(username) = &sudo_user {
+        let mut child = std::process::Command::new("sudo");
+        child.args(["-n", "-u", username, "--", "env", "--"]);
+        for (key, value) in &job_env {
+            child.arg(format!("{key}={value}"));
+        }
+        child.args(["sh", "-c", &command_text]);
+        child
+    } else {
+        let mut child = std::process::Command::new("sh");
+        child.args(["-c", &command_text]);
+        child
+    };
+    let child = match child.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            std::eprintln!("Job shim could not start command: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let status = match wait_for_job_shim_main_child(&child) {
+        Ok(status) => status,
+        Err(error) => {
+            std::eprintln!("Job shim could not wait for command: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let termination_observed = JOB_SHIM_TERMINATION_RECEIVED.load(Ordering::Relaxed) != 0
+        || status.signal().is_some_and(|signal| {
+            matches!(
+                signal,
+                libc::SIGTERM | libc::SIGHUP | libc::SIGINT | libc::SIGQUIT
+            )
+        });
+    let cleanup = if termination_observed {
+        match wait_for_descendants(identity, Duration::from_secs(shutdown_timeout)) {
+            Ok(true) => Ok(()),
+            Ok(false) => reconcile_descendants(identity, sudo_user.as_deref(), "Job shim"),
+            Err(error) => Err(error),
+        }
+    } else {
+        reconcile_descendants(identity, sudo_user.as_deref(), "Job shim")
+    };
+    if let Err(error) = cleanup {
+        std::eprintln!("Job shim could not supervise descendants: {error}");
+        return ExitCode::from(1);
+    }
+
+    if let Some(code) = status.code() {
+        return ExitCode::from(code as u8);
+    }
+    if let Some(signal) = status.signal() {
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+        return ExitCode::from((128 + signal).min(255) as u8);
+    }
+    ExitCode::from(1)
+}
+
+fn wait_for_job_shim_main_child(
+    child: &std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let main_pid = i32::try_from(child.id())
+        .map_err(|_| std::io::Error::other("process ID does not fit wait target"))?;
+    loop {
+        let mut raw_status = 0;
+        let waited = unsafe { libc::waitpid(-1, &mut raw_status, 0) };
+        if waited == main_pid {
+            return Ok(std::process::ExitStatus::from_raw(raw_status));
+        }
+        if waited > 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + duration;
+    let mut known = HashSet::new();
+    let mut last_capture_failure_log = None;
+    loop {
+        let capture_failure_window = PROCESS_SCAN_FAILURE_WINDOW.min(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(PROCESS_SCAN_INTERVAL),
+        );
+        let snapshot = capture_snapshot_with_retry(
+            &mut ProcessSnapshot::capture,
+            PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
+            capture_failure_window,
+            &mut last_capture_failure_log,
+        )?;
+        known = snapshot.related_processes(root, false, &known);
+        let mut any_running = false;
+        for process in &known {
+            if process_tree::is_running_checked(*process)? {
+                any_running = true;
+            }
+        }
+        reap_adopted_children()?;
+        if !any_running {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(PROCESS_SCAN_INTERVAL);
+    }
+}
+
 fn main() -> ExitCode {
     if unsafe { libc::getpid() } == 1 {
         std::eprintln!(
@@ -1277,6 +1550,9 @@ fn main() -> ExitCode {
     }
 
     let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|argument| argument == "--job-shim") {
+        return run_job_shim(&args[2..]);
+    }
     if args.len() < 2 || args.iter().any(|arg| arg.as_str() == "--help") {
         std::eprintln!("Usage: {} [--wrap] [-t NUM_THREADS] config.yaml", args[0]);
         std::eprintln!("  --wrap          Run in wrapper mode (auto-restart on exit)");
@@ -1354,13 +1630,6 @@ fn main() -> ExitCode {
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| runner_cwd_path.clone());
-
-    let strip_json_comments = |data: &str| -> String {
-        data.lines()
-            .filter(|s| !s.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
 
     let is_json_ext = config_path.ends_with(".json");
     let is_yaml_ext = config_path.ends_with(".yaml") || config_path.ends_with(".yml");
@@ -1692,9 +1961,15 @@ where
     C: FnMut() -> std::io::Result<ProcessSnapshot>,
 {
     let mut last_anomaly_log = None;
+    let mut last_capture_failure_log = None;
     loop {
         match scanner_request_rx.recv_timeout(scan_interval) {
-            Ok(ProcessScannerRequest::Refresh(acknowledge)) => match capture() {
+            Ok(ProcessScannerRequest::Refresh(acknowledge)) => match capture_snapshot_with_retry(
+                &mut capture,
+                PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
+                PROCESS_SCAN_FAILURE_WINDOW,
+                &mut last_capture_failure_log,
+            ) {
                 Ok(snapshot) => {
                     log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
                     let snapshot = Arc::new(snapshot);
@@ -1712,11 +1987,47 @@ where
             },
             Ok(ProcessScannerRequest::Stop) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
-                let snapshot = capture()?;
+                let snapshot = capture_snapshot_with_retry(
+                    &mut capture,
+                    PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
+                    PROCESS_SCAN_FAILURE_WINDOW,
+                    &mut last_capture_failure_log,
+                )?;
                 log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
                 if snapshot_tx.send(Arc::new(snapshot)).is_err() {
                     return Ok(());
                 }
+            }
+        }
+    }
+}
+
+fn capture_snapshot_with_retry<C>(
+    capture: &mut C,
+    retry_interval: Duration,
+    failure_window: Duration,
+    last_log: &mut Option<std::time::Instant>,
+) -> std::io::Result<ProcessSnapshot>
+where
+    C: FnMut() -> std::io::Result<ProcessSnapshot>,
+{
+    let failed_at = std::time::Instant::now();
+    loop {
+        match capture() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => {
+                let now = std::time::Instant::now();
+                if last_log
+                    .is_none_or(|last| now.duration_since(last) >= PROCESS_SCAN_WARNING_INTERVAL)
+                {
+                    eprintln!("Process scanner warning: capture failed, retrying: {error}");
+                    *last_log = Some(now);
+                }
+                let elapsed = failed_at.elapsed();
+                if elapsed >= failure_window {
+                    return Err(error);
+                }
+                std::thread::sleep(retry_interval.min(failure_window - elapsed));
             }
         }
     }
@@ -1850,18 +2161,13 @@ async fn signal_run_with_retry(
     signal: libc::c_int,
 ) -> Result<(), SignalError> {
     let mut last_error = None;
-    let attempts = if opts.sudo_user.is_some() {
-        1
-    } else {
-        SIGNAL_RETRY_LIMIT
-    };
-    for attempt in 0..attempts {
+    for attempt in 0..SIGNAL_RETRY_LIMIT {
         match signal_run(log_prefix, opts, info, descendants, signal).await {
             Ok(()) => return Ok(()),
             Err(error) if error.delivery_failed => last_error = Some(error),
             Err(error) => return Err(error),
         }
-        if attempt + 1 < attempts {
+        if attempt + 1 < SIGNAL_RETRY_LIMIT {
             sleep(SIGNAL_RETRY_INTERVAL).await;
         }
     }
@@ -1895,8 +2201,7 @@ async fn signal_process_tree(
     let mut delivery_error = SignalErrors::default();
     let root_exists = process_exists_best_effort(root, &mut delivery_error);
     if let Some(username) = sudo_user {
-        if signal == libc::SIGKILL
-            && root_exists
+        if root_exists
             && let Ok(pid) = i32::try_from(root.pid)
             && let Err(error) = send_signal_target(pid, signal)
             && error.raw_os_error() != Some(libc::ESRCH)
@@ -1909,23 +2214,11 @@ async fn signal_process_tree(
             .copied()
             .filter(|process| process_is_running_best_effort(*process, &mut delivery_error))
             .collect();
-        if targets.is_empty() {
-            if signal != libc::SIGKILL
-                && root_exists
-                && let Ok(pid) = i32::try_from(root.pid)
-                && let Err(error) = send_signal_target(pid, signal)
-                && error.raw_os_error() != Some(libc::ESRCH)
-            {
-                delivery_error.record_delivery(error);
-            }
-        } else {
-            for process in targets {
-                if let Err(error) =
-                    signal_identity_as_user(log_prefix, username, signal, process).await
-                {
-                    delivery_error.record_signal(error);
-                }
-            }
+        if !targets.is_empty()
+            && let Err(error) =
+                signal_identities_as_user(log_prefix, username, signal, &targets).await
+        {
+            delivery_error.record_signal(error);
         }
         return delivery_error.finish();
     }
@@ -1994,13 +2287,6 @@ struct SignalError {
 }
 
 impl SignalError {
-    fn inspection(error: std::io::Error) -> Self {
-        Self {
-            error,
-            delivery_failed: false,
-        }
-    }
-
     fn delivery(error: std::io::Error) -> Self {
         Self {
             error,
@@ -2134,36 +2420,32 @@ async fn signal_as_user(
     }
 }
 
-async fn signal_identity_as_user(
+async fn signal_identities_as_user(
     log_prefix: &str,
     username: &str,
     signal: libc::c_int,
-    process: ProcessIdentity,
+    processes: &HashSet<ProcessIdentity>,
 ) -> Result<(), SignalError> {
-    let pid = i32::try_from(process.pid).map_err(|_| {
-        SignalError::delivery(std::io::Error::other(
-            "process ID does not fit signal target",
-        ))
-    })?;
-    let mut last_error = None;
-    for attempt in 0..SIGNAL_RETRY_LIMIT {
-        if !process_tree::is_running_checked(process).map_err(SignalError::inspection)? {
-            return Ok(());
-        }
-        match signal_as_user(log_prefix, username, signal, &[pid]).await {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < SIGNAL_RETRY_LIMIT {
-            sleep(SIGNAL_RETRY_INTERVAL).await;
+    let mut errors = SignalErrors::default();
+    let mut targets = Vec::with_capacity(processes.len());
+    for process in processes {
+        match process_tree::is_running_checked(*process) {
+            Ok(true) => match i32::try_from(process.pid) {
+                Ok(pid) => targets.push(pid),
+                Err(_) => errors.record_delivery(std::io::Error::other(
+                    "process ID does not fit signal target",
+                )),
+            },
+            Ok(false) => {}
+            Err(error) => errors.record_inspection(error),
         }
     }
-    if !process_tree::is_running_checked(process).map_err(SignalError::inspection)? {
-        return Ok(());
+    if !targets.is_empty()
+        && let Err(error) = signal_as_user(log_prefix, username, signal, &targets).await
+    {
+        errors.record_delivery(error);
     }
-    Err(SignalError::delivery(last_error.unwrap_or_else(|| {
-        std::io::Error::other("sudo signal delivery failed")
-    })))
+    errors.finish()
 }
 
 fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
@@ -2173,6 +2455,20 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
         eprintln!("[Wrapper] Could not validate Linux procfs: {error}");
         return ExitCode::from(1);
     }
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
+        eprintln!(
+            "[Wrapper] Could not become a child subreaper: {}",
+            std::io::Error::last_os_error()
+        );
+        return ExitCode::from(1);
+    }
+    let wrapper_identity = match process_tree::identity(std::process::id()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("[Wrapper] Could not inspect wrapper process: {error}");
+            return ExitCode::from(1);
+        }
+    };
 
     let signal_state = Arc::new(Mutex::new(WrapperSignalState::default()));
     let shutdown_state = Arc::new(AtomicU8::new(0));
@@ -2323,6 +2619,15 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
         }
         lock_or_recover(&signal_state).clear(identity);
 
+        if let Err(error) = reconcile_descendants_with_sudo_users(
+            wrapper_identity,
+            configured_wrapper_sudo_users(inner_args),
+            "Wrapper",
+        ) {
+            eprintln!("[Wrapper] Could not clean up previous-generation jobs: {error}");
+            return ExitCode::from(1);
+        }
+
         if shutdown_state.load(Ordering::Acquire) != 0 {
             eprintln!("[Wrapper] Shutdown complete, exiting..");
             return ExitCode::SUCCESS;
@@ -2330,6 +2635,265 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
 
         eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
         wrapper_delay(&shutdown_state, Duration::from_secs(15));
+    }
+}
+
+fn reconcile_descendants(
+    root: ProcessIdentity,
+    sudo_user: Option<&str>,
+    label: &str,
+) -> std::io::Result<()> {
+    reconcile_descendants_with_sudo_users(
+        root,
+        sudo_user.into_iter().map(str::to_owned).collect(),
+        label,
+    )
+}
+
+fn reconcile_descendants_with_sudo_users(
+    root: ProcessIdentity,
+    mut sudo_users: HashSet<String>,
+    label: &str,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + POST_KILL_WAIT;
+    let mut known = HashSet::new();
+    let mut cleanup_logged = false;
+    let mut last_capture_failure_log = None;
+    let mut last_kill_error = None;
+    loop {
+        let capture_failure_window = PROCESS_SCAN_FAILURE_WINDOW.min(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(RECONCILE_CONVERGENCE_RESERVE),
+        );
+        let snapshot = capture_snapshot_with_retry(
+            &mut ProcessSnapshot::capture,
+            PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
+            capture_failure_window,
+            &mut last_capture_failure_log,
+        )?;
+        known = snapshot.related_processes(root, false, &known);
+        let mut running = Vec::new();
+        for process in &known {
+            if process_tree::is_running_checked(*process)? {
+                running.push(*process);
+            }
+        }
+        if running.is_empty() {
+            reap_adopted_children()?;
+            return Ok(());
+        }
+        if !cleanup_logged {
+            std::eprintln!(
+                "[{label}] Cleaning up {} descendant process{}..",
+                running.len(),
+                if running.len() == 1 { "" } else { "es" }
+            );
+            cleanup_logged = true;
+        }
+        discover_job_shim_sudo_users(&running, &mut sudo_users);
+        if let Err(error) = kill_reconciled_processes(&running, &sudo_users, deadline) {
+            last_kill_error = Some(error);
+        }
+        reap_adopted_children()?;
+        if std::time::Instant::now() >= deadline {
+            let mut survivors = Vec::new();
+            for process in running {
+                if process_tree::is_running_checked(process)? {
+                    survivors.push(process);
+                }
+            }
+            if survivors.is_empty() {
+                reap_adopted_children()?;
+                return Ok(());
+            }
+            let survivor_pids = survivors
+                .iter()
+                .map(|process| process.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = last_kill_error
+                .as_ref()
+                .map(|error| format!("; last signal error: {error}"))
+                .unwrap_or_default();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "previous-generation processes remained alive after SIGKILL: {survivor_pids}{detail}"
+                ),
+            ));
+        }
+        std::thread::sleep(PROCESS_SCAN_INTERVAL);
+    }
+}
+
+fn configured_wrapper_sudo_users(inner_args: &[String]) -> HashSet<String> {
+    let mut config_path = None;
+    let mut skip_next = false;
+    for argument in inner_args {
+        if skip_next {
+            skip_next = false;
+        } else if argument == "-t" {
+            skip_next = true;
+        } else if !argument.starts_with('-') {
+            config_path = Some(argument);
+        }
+    }
+    let Some(config_path) = config_path else {
+        return HashSet::new();
+    };
+    let Ok(data) = std::fs::read_to_string(config_path) else {
+        return HashSet::new();
+    };
+    let without_json_comments = strip_json_comments(&data);
+    let config = serde_yaml::from_str::<Config>(&data)
+        .ok()
+        .or_else(|| serde_json::from_str::<Config>(&without_json_comments).ok());
+    config
+        .into_iter()
+        .flat_map(|config| config.jobs.into_values())
+        .filter_map(|job| job.sudo_user)
+        .filter(|username| is_valid_username(username))
+        .collect()
+}
+
+fn kill_reconciled_processes(
+    processes: &[ProcessIdentity],
+    sudo_users: &HashSet<String>,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let mut targets = Vec::with_capacity(processes.len());
+    for process in processes {
+        if process_tree::is_running_checked(*process)? {
+            targets.push(
+                i32::try_from(process.pid)
+                    .map_err(|_| std::io::Error::other("process ID does not fit signal target"))?,
+            );
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut first_error = None;
+    for (index, username) in sudo_users.iter().enumerate() {
+        let helpers_left = u32::try_from(sudo_users.len() - index).unwrap_or(u32::MAX);
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .saturating_sub(RECONCILE_CONVERGENCE_RESERVE);
+        let helper_timeout = (remaining / helpers_left).min(SUDO_SIGNAL_TIMEOUT);
+        if let Err(error) = run_sudo_reconcile_helper(username, &targets, helper_timeout)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    for target in targets {
+        if let Err(error) = send_signal_target(target, libc::SIGKILL)
+            && error.raw_os_error() != Some(libc::ESRCH)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn discover_job_shim_sudo_users(processes: &[ProcessIdentity], sudo_users: &mut HashSet<String>) {
+    let Ok(current_executable) = std::fs::read_link("/proc/self/exe") else {
+        return;
+    };
+    for process in processes {
+        let Ok(executable) = std::fs::read_link(format!("/proc/{}/exe", process.pid)) else {
+            continue;
+        };
+        if executable != current_executable {
+            continue;
+        }
+        let Ok(command_line) = std::fs::read(format!("/proc/{}/cmdline", process.pid)) else {
+            continue;
+        };
+        if !process_tree::exists_checked(*process).unwrap_or(false) {
+            continue;
+        }
+        let arguments: Vec<&[u8]> = command_line
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        if !arguments.iter().any(|argument| *argument == b"--job-shim") {
+            continue;
+        }
+        for pair in arguments.windows(2) {
+            if pair[0] != b"--sudo-user" {
+                continue;
+            }
+            let Ok(username) = std::str::from_utf8(pair[1]) else {
+                continue;
+            };
+            if is_valid_username(username) {
+                sudo_users.insert(username.to_string());
+            }
+        }
+    }
+}
+
+fn run_sudo_reconcile_helper(
+    username: &str,
+    targets: &[i32],
+    duration: Duration,
+) -> std::io::Result<()> {
+    let mut child = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "-u",
+            username,
+            "--",
+            "sh",
+            "-c",
+            "failed=0; for target do kill -KILL \"$target\" || failed=1; done; exit \"$failed\"",
+            "job-runner-reconcile",
+        ])
+        .args(targets.iter().map(i32::to_string))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "sudo cleanup helper exited with {status}"
+                )))
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sudo cleanup helper timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reap_adopted_children() -> std::io::Result<()> {
+    loop {
+        let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if waited > 0 {
+            continue;
+        }
+        if waited == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(()),
+            Some(libc::EINTR) => {}
+            _ => return Err(error),
+        }
     }
 }
 
@@ -2358,6 +2922,7 @@ fn signal_wrapper_identity(identity: ProcessIdentity, signal: libc::c_int) {
 fn wrapper_delay(shutdown: &AtomicU8, duration: Duration) {
     let deadline = std::time::Instant::now() + duration;
     while shutdown.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+        let _ = reap_adopted_children();
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -2474,36 +3039,71 @@ mod tests {
     }
 
     #[test]
-    fn scanner_refresh_propagates_capture_failure() {
+    fn scanner_refresh_recovers_from_a_transient_capture_failure() {
         let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
         let (request_tx, request_rx) = channel();
         let scanner = std::thread::spawn(move || {
+            let mut attempts = 0;
             run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(ProcessSnapshot::empty())
+                }
             })
         });
         let runtime = Builder::new_current_thread().build().unwrap();
 
-        let error = runtime
+        runtime
             .block_on(refresh_process_snapshot(&request_tx))
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            scanner.join().unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
+            .unwrap();
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
     }
 
     #[test]
-    fn periodic_capture_failure_stops_the_scanner() {
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
-        let (_request_tx, request_rx) = channel();
+    fn periodic_scanner_recovers_from_a_transient_capture_failure() {
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let scanner = std::thread::spawn(move || {
+            let mut attempts = 0;
+            run_process_scanner(snapshot_tx, request_rx, Duration::ZERO, || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                } else {
+                    Ok(ProcessSnapshot::empty())
+                }
+            })
+        });
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
 
-        let error = run_process_scanner(snapshot_tx, request_rx, Duration::ZERO, || {
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-        })
+        runtime
+            .block_on(async { timeout(Duration::from_secs(2), snapshot_rx.changed()).await })
+            .expect("scanner did not publish after a transient failure")
+            .unwrap();
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn persistent_capture_failure_remains_fatal() {
+        let mut last_log = None;
+        let mut attempts = 0;
+        let error = capture_snapshot_with_retry(
+            &mut || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(25),
+            &mut last_log,
+        )
         .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(attempts > 1, "persistent failure was not retried");
     }
 
     #[test]
@@ -2599,6 +3199,97 @@ mod tests {
                 .unwrap();
         });
         assert!(lock_or_recover(&active_pids).is_empty());
+    }
+
+    #[test]
+    fn shutdown_kills_a_descendant_first_observed_after_sigkill() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let config: Config = serde_yaml::from_str(&format!(
+            "jobs:\n  late_descendant:\n    command: |\n      trap '' TERM\n      touch {}\n      while :; do sleep 1; done\n    shutdown_timeout: 30\n",
+            ready.display()
+        ))
+        .unwrap();
+        let (_, mut job_config) = config.jobs.into_iter().next().unwrap();
+        job_config.cwd = temp.path().to_string_lossy().into_owned();
+
+        let mut late_process = std::process::Command::new("sleep");
+        late_process.arg("30");
+        unsafe {
+            late_process.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut late_process = late_process.spawn().unwrap();
+        let late_identity = process_tree::identity(late_process.id()).unwrap();
+
+        let active_pids = Arc::new(Mutex::new(HashMap::new()));
+        let active_pids_for_job = active_pids.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
+        let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let base_env = Arc::new(env::vars().collect());
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let result = runtime.block_on(async move {
+            let job = tokio::spawn(start_proc(
+                "late_descendant".to_string(),
+                job_config,
+                active_pids_for_job,
+                shutdown_rx,
+                snapshot_rx,
+                base_env,
+            ));
+            timeout(Duration::from_secs(3), async {
+                while !ready.exists() || lock_or_recover(&active_pids).is_empty() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("job did not start");
+            let root = lock_or_recover(&active_pids)
+                .values()
+                .next()
+                .unwrap()
+                .info
+                .identity;
+
+            shutdown_tx.send(ShutdownState::Force).unwrap();
+            sleep(Duration::from_millis(100)).await;
+            snapshot_tx
+                .send(Arc::new(ProcessSnapshot::with_descendant(
+                    root,
+                    late_identity,
+                )))
+                .unwrap();
+            sleep(Duration::from_millis(100)).await;
+            snapshot_tx
+                .send(Arc::new(ProcessSnapshot::with_descendant(
+                    root,
+                    late_identity,
+                )))
+                .unwrap();
+            timeout(Duration::from_secs(5), job)
+                .await
+                .expect("late descendant stalled shutdown")
+                .unwrap()
+        });
+
+        let late_survived = process_tree::is_running_checked(late_identity).unwrap();
+        if late_survived {
+            let _ = late_process.kill();
+        }
+        let _ = late_process.wait();
+        assert!(result.is_ok(), "late descendant made shutdown fatal");
+        assert!(!late_survived, "late descendant survived shutdown");
     }
 
     #[test]

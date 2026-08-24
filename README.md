@@ -163,23 +163,31 @@ When a termination signal is received:
 
 ### Process Groups
 
-Every job starts in a dedicated noninteractive session via `setsid()`. This
+With the default `process_group: true`, each job runs under a small internal
+reaper shim. The shim starts a dedicated noninteractive session via `setsid()`,
+acts as a Linux child subreaper, and launches the configured command. This
 prevents a job using `kill(0, ...)` from signaling job-runner itself.
 
-With the default `process_group: true`:
+The shim:
 
 - Signals target the dedicated process group.
+- Reaps daemonized helpers while the main command is running.
+- Kills and reaps adopted descendants before reporting a natural command exit,
+  including descendants that daemonize before the first `/proc` scan.
+- After a termination, waits up to `shutdown_timeout` for descendants, then
+  force-cleans them so an externally terminated leader cannot stall restarts.
 - Linux `/proc` ancestry is also tracked with PID and process start time so
   descendants that create another session can be signaled when discovered.
 - Previously observed descendants, including processes that created another
   session, are killed before the job restarts.
 
 Set `process_group: false` only when direct-shell signaling is required. The job
-is still session-isolated, but shutdown signals only its shell and descendants
-may survive. Jobs using `sudo_user` always use group/tree signaling because the
-direct `sudo` client is not the target workload. Validated workload descendants
-are signaled as the configured user; if delivery fails and a target remains
-alive, supervision fails instead of silently restarting or reporting success.
+starts directly in a session without the reaper shim; shutdown signals only its
+shell and descendants may survive. Jobs using `sudo_user` always use the shim
+and group/tree signaling because the direct `sudo` client is not the target
+workload. Validated workload descendants are signaled as the configured user;
+if delivery fails and a target remains alive, supervision fails instead of
+silently restarting or reporting success.
 
 ```yaml
 jobs:
@@ -190,24 +198,27 @@ jobs:
     shutdown_timeout: 10
 ```
 
-Process groups and `/proc` traversal are not hard containment. A descendant can
-escape between scans, PID validation has a check/signal race, and an
-uninterruptible kernel task may remain after `SIGKILL`. A numeric process group
-can also be reused after its leader exits. Use a delegated cgroup v2 subtree and
-`cgroup.kill` when zero surviving descendants or strict isolation is required.
+The reaper shim closes the ordinary daemonization gap without privileges, and a
+bounded post-`SIGKILL` sweep signals descendants first observed after the
+initial kill. It is still not kernel-enforced containment: PID validation has a
+check/signal race, an uninterruptible kernel task may remain after `SIGKILL`,
+and abruptly killing an unwrapped supervisor can leave jobs alive. Use a
+delegated cgroup v2 subtree and `cgroup.kill` when zero surviving descendants or
+strict isolation is required.
 
 At startup, the supervisor verifies that it can parse its own `/proc` record. It
 exits with an error if it cannot enumerate `/proc` or if every process in a
-snapshot fails inspection. Individual processes can exit while a snapshot is
-being captured, and Linux may expose a dead task briefly with incomplete
-process-group metadata; those entries are skipped. Other per-process inspection
-anomalies are skipped with a rate-limited warning so an unrelated host process
-cannot terminate every managed job. A tracked process remains associated with
-its job while its procfs record is unreadable, and all other verified targets
-are still signaled. Descendants behind a persistently unreadable intermediary
-cannot be attributed unless they remain in the managed process group. Inspection
-errors remain fatal when validating cleanup because successful containment
-cannot then be established.
+snapshot fails inspection for at least one second. A failed global capture is
+retried while the last successful snapshot remains published. Individual
+processes can exit while a snapshot is being captured, and Linux may expose a
+dead task briefly with incomplete process-group metadata; those entries are
+skipped. Other per-process inspection anomalies are skipped with a rate-limited
+warning so an unrelated host process cannot terminate every managed job. A
+tracked process remains associated with its job while its procfs record is
+unreadable, and all other verified targets are still signaled. Descendants
+behind a persistently unreadable intermediary cannot be attributed unless they
+remain in the managed process group. Inspection errors remain fatal when
+validating cleanup because successful containment cannot then be established.
 
 ## Output Format
 
@@ -254,23 +265,27 @@ The `--wrap` flag runs job-runner itself under supervision:
 job-runner-rs --wrap config.yaml
 ```
 
-When the inner job-runner exits, the wrapper waits 15 seconds and restarts it.
+When the inner job-runner exits, the wrapper adopts and kills any remaining
+previous-generation jobs before waiting 15 seconds and restarting it. Cleanup
+failure stops the wrapper instead of allowing old and new generations to
+overlap. For `sudo_user` jobs, the wrapper reloads configured usernames and
+uses the same bounded noninteractive sudo cleanup path; corresponding sudo
+permission must remain available to the wrapper.
 
 Wrapper signal handlers are installed before the inner process starts. The
 wrapper forwards termination and `SIGUSR1`/`SIGUSR2` signals, and its restart
 backoff is interruptible. Signals are queued only across an in-progress spawn;
-user signals received while no inner generation exists are dropped. Wrapper
-mode is not a PID 1 implementation and cannot guarantee cleanup of jobs left by
-an abruptly killed inner runner. `job-runner-rs` refuses to start when its own
-PID is 1 because it does not own a global `waitpid(-1)` reaper. In a container,
-use an external init:
+user signals received while no inner generation exists are dropped. The wrapper
+is a child subreaper, but wrapper mode is not a PID 1 implementation and cannot
+recover if the wrapper itself is abruptly killed. `job-runner-rs` refuses to
+start when its own PID is 1. In a container, use an external init:
 
 ```bash
 tini -- job-runner-rs config.yaml
 ```
 
-The supervisor does not act as a child subreaper. Each direct child has one
-Tokio task responsible for waiting and reaping it.
+Each default job shim reaps its command and adopted descendants. The supervisor
+retains one Tokio waiter per shim.
 
 ## Docker Jobs
 
