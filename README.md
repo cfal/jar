@@ -196,9 +196,18 @@ uninterruptible kernel task may remain after `SIGKILL`. A numeric process group
 can also be reused after its leader exits. Use a delegated cgroup v2 subtree and
 `cgroup.kill` when zero surviving descendants or strict isolation is required.
 
-The supervisor exits with an error if it cannot enumerate `/proc` or inspect a
-listed process for any reason other than that process disappearing mid-scan;
-silently continuing would make escaped-descendant tracking unreliable.
+At startup, the supervisor verifies that it can parse its own `/proc` record. It
+exits with an error if it cannot enumerate `/proc` or if every process in a
+snapshot fails inspection. Individual processes can exit while a snapshot is
+being captured, and Linux may expose a dead task briefly with incomplete
+process-group metadata; those entries are skipped. Other per-process inspection
+anomalies are skipped with a rate-limited warning so an unrelated host process
+cannot terminate every managed job. A tracked process remains associated with
+its job while its procfs record is unreadable, and all other verified targets
+are still signaled. Descendants behind a persistently unreadable intermediary
+cannot be attributed unless they remain in the managed process group. Inspection
+errors remain fatal when validating cleanup because successful containment
+cannot then be established.
 
 ## Output Format
 
