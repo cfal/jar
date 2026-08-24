@@ -151,6 +151,17 @@ impl Drop for Runner {
     }
 }
 
+struct ForkedProcess(libc::pid_t);
+
+impl Drop for ForkedProcess {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 struct ProcessCleanup(Vec<PathBuf>);
 
 impl Drop for ProcessCleanup {
@@ -211,6 +222,22 @@ fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
         thread::sleep(POLL_INTERVAL);
     }
     condition()
+}
+
+// Callers must take the child path directly to libc syscalls because other test threads may hold locks.
+fn fork_with_retry() -> libc::pid_t {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let pid = unsafe { libc::fork() };
+        if pid >= 0 {
+            return pid;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) || Instant::now() >= deadline {
+            panic!("fork failed: {error}");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn read_pids(paths: &[PathBuf]) -> Vec<u32> {
@@ -449,6 +476,63 @@ fn very_short_jobs_restart_reliably() {
 }
 
 #[test]
+fn non_utf8_process_name_does_not_stop_scanner() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper_pid = fork_with_retry();
+    if helper_pid == 0 {
+        let name = b"runner-\xff\xfe\0";
+        unsafe {
+            if libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) == -1 {
+                libc::_exit(1);
+            }
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    let helper = ForkedProcess(helper_pid);
+    assert!(
+        wait_until(Duration::from_secs(3), || fs::read(format!(
+            "/proc/{}/stat",
+            helper.0
+        ))
+        .is_ok_and(|stat| stat
+            .windows(9)
+            .any(|window| window == b"runner-\xff\xfe"))),
+        "helper process did not expose a non-UTF-8 comm"
+    );
+
+    let job_ready = temp.path().join("job-ready");
+    let script = temp.path().join("long-job.sh");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\ntouch {}\ntrap 'exit 0' TERM INT HUP QUIT\nwhile :; do sleep 1; done\n",
+            job_ready.display()
+        ),
+    );
+    fs::write(
+        &config,
+        format!("jobs:\n  long:\n    command: \"{}\"\n", script.display()),
+    )
+    .unwrap();
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(3), || job_ready.exists()));
+    thread::sleep(Duration::from_millis(250));
+    assert!(runner.is_running(), "non-UTF-8 comm stopped the supervisor");
+    assert!(
+        !runner.log().contains("Process scanner failed"),
+        "{}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
 fn proc_churn_does_not_stop_scanner() {
     let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
@@ -474,21 +558,31 @@ fn proc_churn_does_not_stop_scanner() {
     let churn: Vec<_> = (0..4)
         .map(|_| {
             thread::spawn(|| {
-                Command::new("sh")
-                    .args([
-                        "-c",
-                        "i=0; while [ $i -lt 750 ]; do /bin/true; i=$((i + 1)); done",
-                    ])
-                    .status()
-                    .unwrap()
+                // The parser unit test is the deterministic dead-task regression; this is a soak.
+                for _ in 0..1000 {
+                    let pid = fork_with_retry();
+                    if pid == 0 {
+                        unsafe { libc::_exit(0) };
+                    }
+                    let mut status = 0;
+                    loop {
+                        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                        if waited == pid {
+                            break;
+                        }
+                        assert_eq!(
+                            std::io::Error::last_os_error().raw_os_error(),
+                            Some(libc::EINTR),
+                            "waitpid failed"
+                        );
+                    }
+                }
             })
         })
         .collect();
-    assert!(
-        churn
-            .into_iter()
-            .all(|handle| handle.join().unwrap().success())
-    );
+    for handle in churn {
+        handle.join().unwrap();
+    }
     assert!(runner.is_running(), "process churn stopped the supervisor");
     assert!(
         !runner.log().contains("Process scanner failed"),
@@ -1431,7 +1525,7 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
 }
 
 #[test]
-fn sudo_user_signal_failure_initiates_invariant_shutdown() {
+fn sudo_user_signal_failure_does_not_stop_supervision() {
     let Some(username) = current_username() else {
         eprintln!("skipped: current username unavailable");
         return;
@@ -1478,11 +1572,23 @@ fn sudo_user_signal_failure_initiates_invariant_shutdown() {
         fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0)
     }));
     runner.signal(libc::SIGUSR1);
-    let status = runner.wait(Duration::from_secs(8));
-    assert!(!status.success(), "failed USR1 forwarding returned success");
+    assert!(wait_until(Duration::from_secs(3), || runner
+        .log()
+        .contains("Signal forwarding failed")));
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        runner.is_running(),
+        "failed USR1 forwarding stopped the supervisor"
+    );
     assert_eq!(fs::metadata(&received).unwrap().len(), 0);
     let output = runner.log();
     assert!(output.contains("Signal forwarding failed"), "{output}");
+    assert!(
+        !output.contains("shutting down active processes"),
+        "forwarding failure initiated shutdown: {output}"
+    );
+    runner.signal(libc::SIGTERM);
+    let _ = runner.wait(Duration::from_secs(8));
 }
 
 #[test]
