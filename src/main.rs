@@ -29,7 +29,8 @@ const OUTPUT_CHANNEL_CAPACITY: usize = OUTPUT_QUEUE_BYTES_PER_STREAM / MAX_OUTPU
 const MIN_RESTART_DELAY: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
-const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const PROCESS_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_SCAN_FAILURE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_SCAN_FAILURE_WINDOW: Duration = Duration::from_secs(1);
 const PROCESS_SCAN_WARNING_CHANGE_FLOOR: Duration = Duration::from_secs(1);
@@ -66,6 +67,7 @@ enum OutputMessage {
 
 enum ProcessScannerRequest {
     Refresh(oneshot::Sender<std::io::Result<Arc<ProcessSnapshot>>>),
+    SetInterval(Duration),
     Stop,
 }
 
@@ -326,6 +328,7 @@ async fn start_proc(
     active_pids: Arc<Mutex<HashMap<u32, TrackedRun>>>,
     mut shutdown: watch::Receiver<ShutdownState>,
     mut snapshots: watch::Receiver<Arc<ProcessSnapshot>>,
+    scanner: Sender<ProcessScannerRequest>,
     base_env: Arc<HashMap<String, String>>,
 ) -> std::io::Result<()> {
     let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
@@ -372,6 +375,7 @@ async fn start_proc(
             &active_pids,
             &mut shutdown,
             &mut snapshots,
+            &scanner,
             &base_env,
         )
         .await
@@ -391,6 +395,7 @@ async fn start_proc(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_proc_internal(
     status_prefix: &PrefixWriter<'_>,
     prefix: &str,
@@ -398,6 +403,7 @@ async fn start_proc_internal(
     active_pids: &Arc<Mutex<HashMap<u32, TrackedRun>>>,
     shutdown: &mut watch::Receiver<ShutdownState>,
     snapshots: &mut watch::Receiver<Arc<ProcessSnapshot>>,
+    scanner: &Sender<ProcessScannerRequest>,
     base_env: &Arc<HashMap<String, String>>,
 ) -> Result<bool, ProcessRunError> {
     if *shutdown.borrow() != ShutdownState::Running {
@@ -610,12 +616,13 @@ async fn start_proc_internal(
                     }
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            let exit_observed_at = std::time::Instant::now();
                             remove_active_pid(active_pids, info);
                             report_child_status(status_prefix, status);
                             if use_process_group {
-                                wait_for_snapshot_after(snapshots, exit_observed_at).await;
-                                known = related_processes(snapshots, identity, &known);
+                                let snapshot = refresh_process_snapshot(scanner)
+                                    .await
+                                    .map_err(ProcessRunError::Fatal)?;
+                                known = snapshot.related_processes(identity, true, &known);
                             }
                             if let Err(error) =
                                 cleanup_after_natural_exit(status_prefix, opts, info, &known).await
@@ -1010,17 +1017,6 @@ fn related_processes(
     known: &HashSet<ProcessIdentity>,
 ) -> HashSet<ProcessIdentity> {
     snapshots.borrow().related_processes(root, true, known)
-}
-
-async fn wait_for_snapshot_after(
-    snapshots: &mut watch::Receiver<Arc<ProcessSnapshot>>,
-    instant: std::time::Instant,
-) {
-    while !snapshots.borrow().started_after(instant) {
-        if snapshots.changed().await.is_err() {
-            break;
-        }
-    }
 }
 
 fn update_active_descendants(
@@ -1515,7 +1511,7 @@ fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::R
         let capture_failure_window = PROCESS_SCAN_FAILURE_WINDOW.min(
             deadline
                 .saturating_duration_since(std::time::Instant::now())
-                .saturating_sub(PROCESS_SCAN_INTERVAL),
+                .saturating_sub(PROCESS_CLEANUP_POLL_INTERVAL),
         );
         let snapshot = capture_snapshot_with_retry(
             &mut ProcessSnapshot::capture,
@@ -1537,7 +1533,7 @@ fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::R
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(PROCESS_SCAN_INTERVAL);
+        std::thread::sleep(PROCESS_CLEANUP_POLL_INTERVAL);
     }
 }
 
@@ -1796,6 +1792,7 @@ async fn run_supervisor(
         };
         let job_shutdown = shutdown_rx.clone();
         let job_snapshots = snapshot_rx.clone();
+        let job_scanner = scanner_request_tx.clone();
         let job_env = base_env.clone();
         job_handles.spawn(async move {
             start_proc(
@@ -1804,6 +1801,7 @@ async fn run_supervisor(
                 pid_set,
                 job_shutdown,
                 job_snapshots,
+                job_scanner,
                 job_env,
             )
             .await
@@ -1897,6 +1895,9 @@ async fn run_supervisor(
         "\nReceived {} signal, shutting down active processes..",
         first_signal
     );
+    let _ = scanner_request_tx.send(ProcessScannerRequest::SetInterval(
+        PROCESS_CLEANUP_POLL_INTERVAL,
+    ));
     let _ = shutdown_tx.send(ShutdownState::Graceful);
 
     let mut escalated = false;
@@ -1954,7 +1955,7 @@ async fn run_supervisor(
 fn run_process_scanner<C>(
     snapshot_tx: watch::Sender<Arc<ProcessSnapshot>>,
     scanner_request_rx: std::sync::mpsc::Receiver<ProcessScannerRequest>,
-    scan_interval: Duration,
+    initial_scan_interval: Duration,
     mut capture: C,
 ) -> std::io::Result<()>
 where
@@ -1962,6 +1963,7 @@ where
 {
     let mut last_anomaly_log = None;
     let mut last_capture_failure_log = None;
+    let mut scan_interval = initial_scan_interval;
     loop {
         match scanner_request_rx.recv_timeout(scan_interval) {
             Ok(ProcessScannerRequest::Refresh(acknowledge)) => match capture_snapshot_with_retry(
@@ -1974,8 +1976,26 @@ where
                     log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
                     let snapshot = Arc::new(snapshot);
                     let published = snapshot_tx.send(snapshot.clone()).is_ok();
-                    let _ = acknowledge.send(Ok(snapshot));
-                    if !published {
+                    let mut acknowledgements = vec![acknowledge];
+                    let mut stop = false;
+                    while let Ok(request) = scanner_request_rx.try_recv() {
+                        match request {
+                            ProcessScannerRequest::Refresh(acknowledge) => {
+                                acknowledgements.push(acknowledge);
+                            }
+                            ProcessScannerRequest::SetInterval(interval) => {
+                                scan_interval = interval;
+                            }
+                            ProcessScannerRequest::Stop => {
+                                stop = true;
+                                break;
+                            }
+                        }
+                    }
+                    for acknowledge in acknowledgements {
+                        let _ = acknowledge.send(Ok(snapshot.clone()));
+                    }
+                    if !published || stop {
                         return Ok(());
                     }
                 }
@@ -1985,6 +2005,7 @@ where
                     return Err(scanner_error);
                 }
             },
+            Ok(ProcessScannerRequest::SetInterval(interval)) => scan_interval = interval,
             Ok(ProcessScannerRequest::Stop) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
                 let snapshot = capture_snapshot_with_retry(
@@ -2723,7 +2744,7 @@ fn reconcile_descendants_with_sudo_users(
                 ),
             ));
         }
-        std::thread::sleep(PROCESS_SCAN_INTERVAL);
+        std::thread::sleep(PROCESS_CLEANUP_POLL_INTERVAL);
     }
 }
 
@@ -3053,13 +3074,178 @@ mod tests {
                 }
             })
         });
-        let runtime = Builder::new_current_thread().build().unwrap();
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
 
         runtime
-            .block_on(refresh_process_snapshot(&request_tx))
+            .block_on(async {
+                timeout(
+                    Duration::from_secs(1),
+                    refresh_process_snapshot(&request_tx),
+                )
+                .await
+                .expect("explicit refresh waited for the periodic scan interval")
+            })
             .unwrap();
         request_tx.send(ProcessScannerRequest::Stop).unwrap();
         scanner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn background_process_scan_interval_limits_host_wide_sweeps() {
+        assert_eq!(PROCESS_SCAN_INTERVAL, Duration::from_millis(250));
+        assert_eq!(PROCESS_CLEANUP_POLL_INTERVAL, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn scanner_switches_to_cleanup_cadence_on_request() {
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let (capture_tx, capture_rx) = channel();
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                let _ = capture_tx.send(());
+                Ok(ProcessSnapshot::empty())
+            })
+        });
+
+        request_tx
+            .send(ProcessScannerRequest::SetInterval(Duration::ZERO))
+            .unwrap();
+        capture_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scanner did not adopt the cleanup cadence");
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn concurrent_scanner_refreshes_share_one_capture() {
+        use std::sync::atomic::AtomicUsize;
+
+        let captures = Arc::new(AtomicUsize::new(0));
+        let captures_for_scanner = captures.clone();
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let (capture_started_tx, capture_started_rx) = sync_channel(1);
+        let (release_capture_tx, release_capture_rx) = sync_channel(1);
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                captures_for_scanner.fetch_add(1, Ordering::Relaxed);
+                let _ = capture_started_tx.send(());
+                release_capture_rx.recv().unwrap();
+                Ok(ProcessSnapshot::empty())
+            })
+        });
+
+        let (acknowledge, first_receiver) = oneshot::channel();
+        request_tx
+            .send(ProcessScannerRequest::Refresh(acknowledge))
+            .unwrap();
+        capture_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scanner did not start the requested capture");
+        let mut receivers = vec![first_receiver];
+        for _ in 1..8 {
+            let (acknowledge, receiver) = oneshot::channel();
+            request_tx
+                .send(ProcessScannerRequest::Refresh(acknowledge))
+                .unwrap();
+            receivers.push(receiver);
+        }
+        release_capture_tx.send(()).unwrap();
+
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            for receiver in receivers {
+                timeout(Duration::from_secs(1), receiver)
+                    .await
+                    .expect("coalesced refresh was not acknowledged")
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn natural_exit_requests_a_fresh_snapshot_before_cleanup() {
+        use std::sync::atomic::AtomicUsize;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config: Config = serde_yaml::from_str(
+            "jobs:\n  refresh_cleanup:\n    command: sleep 0.2\n    restart_delay: 10000\n",
+        )
+        .unwrap();
+        let (_, mut job_config) = config.jobs.into_iter().next().unwrap();
+        job_config.cwd = temp.path().to_string_lossy().into_owned();
+
+        let captures = Arc::new(AtomicUsize::new(0));
+        let captures_for_scanner = captures.clone();
+        let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                captures_for_scanner.fetch_add(1, Ordering::Relaxed);
+                Ok(ProcessSnapshot::empty())
+            })
+        });
+
+        let active_pids = Arc::new(Mutex::new(HashMap::new()));
+        let active_pids_for_job = active_pids.clone();
+        let active_pids_for_test = active_pids.clone();
+        let captures_for_test = captures.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
+        let request_tx_for_job = request_tx.clone();
+        let request_tx_for_trigger = request_tx.clone();
+        let base_env = Arc::new(env::vars().collect());
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let job = tokio::spawn(start_proc(
+                "refresh_cleanup".to_string(),
+                job_config,
+                active_pids_for_job,
+                shutdown_rx,
+                snapshot_rx,
+                request_tx_for_job,
+                base_env,
+            ));
+            timeout(Duration::from_secs(2), async {
+                while lock_or_recover(&active_pids_for_test).is_empty() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("job did not start");
+            sleep(Duration::from_millis(300)).await;
+            refresh_process_snapshot(&request_tx_for_trigger)
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while captures_for_test.load(Ordering::Relaxed) < 2 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("natural-exit cleanup did not request a fresh snapshot");
+            shutdown_tx.send(ShutdownState::Graceful).unwrap();
+            timeout(Duration::from_secs(2), job)
+                .await
+                .expect("job supervisor did not stop")
+                .unwrap()
+                .unwrap();
+        });
+
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+        assert_eq!(captures.load(Ordering::Relaxed), 2);
+        assert!(lock_or_recover(&active_pids).is_empty());
     }
 
     #[test]
@@ -3166,6 +3352,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let initial_snapshot = Arc::new(ProcessSnapshot::capture().unwrap());
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
+        let (scanner_tx, _scanner_rx) = channel();
         let base_env = Arc::new(env::vars().collect());
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -3180,6 +3367,7 @@ mod tests {
                 active_pids_for_job,
                 shutdown_rx,
                 snapshot_rx,
+                scanner_tx,
                 base_env,
             ));
             timeout(Duration::from_secs(3), async {
@@ -3232,6 +3420,7 @@ mod tests {
         let active_pids_for_job = active_pids.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (scanner_tx, _scanner_rx) = channel();
         let base_env = Arc::new(env::vars().collect());
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -3246,6 +3435,7 @@ mod tests {
                 active_pids_for_job,
                 shutdown_rx,
                 snapshot_rx,
+                scanner_tx,
                 base_env,
             ));
             timeout(Duration::from_secs(3), async {

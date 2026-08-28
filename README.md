@@ -209,7 +209,10 @@ strict isolation is required.
 At startup, the supervisor verifies that it can parse its own `/proc` record. It
 exits with an error if it cannot enumerate `/proc` or if every process in a
 snapshot fails inspection for at least one second. A failed global capture is
-retried while the last successful snapshot remains published. Individual
+retried while the last successful snapshot remains published. The host-wide
+scan runs every 250 ms during normal supervision and every 50 ms during
+shutdown; startup, signal handling, and natural-exit cleanup request an
+immediate snapshot. Individual
 processes can exit while a snapshot is being captured, and Linux may expose a
 dead task briefly with incomplete process-group metadata; those entries are
 skipped. Other per-process inspection anomalies are skipped with a rate-limited
