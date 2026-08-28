@@ -598,7 +598,7 @@ async fn start_proc_internal(
         Some(shutdown_at_registration)
     } else {
         loop {
-            tokio::select! {
+            let snapshot_changed = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() {
@@ -608,43 +608,56 @@ async fn start_proc_internal(
                     if state != ShutdownState::Running {
                         break Some(state);
                     }
+                    continue;
                 }
                 snapshot_changed = snapshots.changed() => {
                     if snapshot_changed.is_err() {
                         break Some(ShutdownState::Force);
                     }
+                    true
+                }
+                _ = sleep(PROCESS_CLEANUP_POLL_INTERVAL) => false,
+            };
+            if snapshot_changed && use_process_group {
+                known = related_processes(snapshots, identity, &known);
+                update_active_descendants(active_pids, info, &known);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    remove_active_pid(active_pids, info);
+                    report_child_status(status_prefix, status);
                     if use_process_group {
-                        known = related_processes(snapshots, identity, &known);
-                        update_active_descendants(active_pids, info, &known);
-                    }
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            remove_active_pid(active_pids, info);
-                            report_child_status(status_prefix, status);
-                            if use_process_group {
-                                let snapshot = refresh_process_snapshot(scanner_requests)
-                                    .await
-                                    .map_err(ProcessRunError::Fatal)?;
-                                known = snapshot.related_processes(identity, true, &known);
-                            }
-                            if let Err(error) =
-                                cleanup_after_natural_exit(status_prefix, opts, info, &known).await
-                            {
+                        let snapshot = match refresh_process_snapshot(scanner_requests).await {
+                            Ok(snapshot) => snapshot,
+                            Err(refresh_error) => {
+                                let cleanup_error =
+                                    cleanup_after_natural_exit(status_prefix, opts, info, &known)
+                                        .await
+                                        .err();
                                 drain_output_handlers([stdout_handle, stderr_handle]).await;
-                                return Err(ProcessRunError::Fatal(error));
+                                return Err(ProcessRunError::Fatal(
+                                    cleanup_error.unwrap_or(refresh_error),
+                                ));
                             }
-                            drain_output_handlers([stdout_handle, stderr_handle]).await;
-                            return Ok(false);
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            remove_active_pid(active_pids, info);
-                            let _ = child.start_kill();
-                            let _ = child.wait().await;
-                            drain_output_handlers([stdout_handle, stderr_handle]).await;
-                            return Err(ProcessRunError::Retry(error));
-                        }
+                        };
+                        known = snapshot.related_processes(identity, true, &known);
                     }
+                    if let Err(error) =
+                        cleanup_after_natural_exit(status_prefix, opts, info, &known).await
+                    {
+                        drain_output_handlers([stdout_handle, stderr_handle]).await;
+                        return Err(ProcessRunError::Fatal(error));
+                    }
+                    drain_output_handlers([stdout_handle, stderr_handle]).await;
+                    return Ok(false);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    remove_active_pid(active_pids, info);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    drain_output_handlers([stdout_handle, stderr_handle]).await;
+                    return Err(ProcessRunError::Retry(error));
                 }
             }
         }
@@ -1968,45 +1981,49 @@ where
     let mut scan_interval = initial_scan_interval;
     loop {
         match scanner_request_rx.recv_timeout(scan_interval) {
-            Ok(ProcessScannerRequest::Refresh(acknowledge)) => match capture_snapshot_with_retry(
-                &mut capture,
-                PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
-                PROCESS_SCAN_FAILURE_WINDOW,
-                &mut last_capture_failure_log,
-            ) {
-                Ok(snapshot) => {
-                    log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
-                    let snapshot = Arc::new(snapshot);
-                    let published = snapshot_tx.send(snapshot.clone()).is_ok();
-                    let mut acknowledgements = vec![acknowledge];
-                    let mut stop_requested = false;
-                    while let Ok(request) = scanner_request_rx.try_recv() {
-                        match request {
-                            ProcessScannerRequest::Refresh(acknowledge) => {
-                                acknowledgements.push(acknowledge);
-                            }
-                            ProcessScannerRequest::UseCleanupInterval => {
-                                scan_interval = PROCESS_CLEANUP_POLL_INTERVAL;
-                            }
-                            ProcessScannerRequest::Stop => {
-                                stop_requested = true;
-                                break;
-                            }
+            Ok(ProcessScannerRequest::Refresh(acknowledge)) => {
+                let mut acknowledgements = vec![acknowledge];
+                let mut stop_requested = false;
+                while let Ok(request) = scanner_request_rx.try_recv() {
+                    match request {
+                        ProcessScannerRequest::Refresh(acknowledge) => {
+                            acknowledgements.push(acknowledge);
+                        }
+                        ProcessScannerRequest::UseCleanupInterval => {
+                            scan_interval = PROCESS_CLEANUP_POLL_INTERVAL;
+                        }
+                        ProcessScannerRequest::Stop => stop_requested = true,
+                    }
+                }
+                match capture_snapshot_with_retry(
+                    &mut capture,
+                    PROCESS_SCAN_FAILURE_RETRY_INTERVAL,
+                    PROCESS_SCAN_FAILURE_WINDOW,
+                    &mut last_capture_failure_log,
+                ) {
+                    Ok(snapshot) => {
+                        log_process_scan_anomalies(&snapshot, &mut last_anomaly_log);
+                        let snapshot = Arc::new(snapshot);
+                        let published = snapshot_tx.send(snapshot.clone()).is_ok();
+                        for acknowledge in acknowledgements {
+                            let _ = acknowledge.send(Ok(snapshot.clone()));
+                        }
+                        if !published || stop_requested {
+                            return Ok(());
                         }
                     }
-                    for acknowledge in acknowledgements {
-                        let _ = acknowledge.send(Ok(snapshot.clone()));
-                    }
-                    if !published || stop_requested {
-                        return Ok(());
+                    Err(error) => {
+                        let kind = error.kind();
+                        let message = error.to_string();
+                        let scanner_error = std::io::Error::new(kind, message.clone());
+                        for acknowledge in acknowledgements {
+                            let _ =
+                                acknowledge.send(Err(std::io::Error::new(kind, message.clone())));
+                        }
+                        return Err(scanner_error);
                     }
                 }
-                Err(error) => {
-                    let scanner_error = std::io::Error::new(error.kind(), error.to_string());
-                    let _ = acknowledge.send(Err(error));
-                    return Err(scanner_error);
-                }
-            },
+            }
             Ok(ProcessScannerRequest::UseCleanupInterval) => {
                 scan_interval = PROCESS_CLEANUP_POLL_INTERVAL;
             }
@@ -3087,7 +3104,7 @@ mod tests {
                     refresh_process_snapshot(&request_tx),
                 )
                 .await
-                .expect("explicit refresh waited for the periodic scan interval")
+                .expect("explicit refresh did not complete before the timeout")
             })
             .unwrap();
         request_tx.send(ProcessScannerRequest::Stop).unwrap();
@@ -3095,9 +3112,28 @@ mod tests {
     }
 
     #[test]
-    fn background_process_scan_interval_limits_host_wide_sweeps() {
-        assert_eq!(PROCESS_SCAN_INTERVAL, Duration::from_millis(250));
-        assert_eq!(PROCESS_CLEANUP_POLL_INTERVAL, Duration::from_millis(50));
+    fn background_process_scanner_uses_the_normal_interval() {
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (capture_tx, capture_rx) = channel();
+        let scanner = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            run_process_scanner(snapshot_tx, request_rx, PROCESS_SCAN_INTERVAL, || {
+                let _ = capture_tx.send(());
+                Ok(ProcessSnapshot::empty())
+            })
+        });
+
+        ready_rx.recv().unwrap();
+        let early_capture = capture_rx.recv_timeout(PROCESS_CLEANUP_POLL_INTERVAL * 2);
+        let eventually_captured =
+            early_capture.is_ok() || capture_rx.recv_timeout(PROCESS_SCAN_INTERVAL * 4).is_ok();
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+
+        assert!(matches!(early_capture, Err(RecvTimeoutError::Timeout)));
+        assert!(eventually_captured, "background scanner did not run");
     }
 
     #[test]
@@ -3123,40 +3159,30 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_scanner_refreshes_share_one_capture() {
+    fn queued_scanner_refreshes_share_one_capture_before_stop() {
         use std::sync::atomic::AtomicUsize;
 
         let captures = Arc::new(AtomicUsize::new(0));
         let captures_for_scanner = captures.clone();
         let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
         let (request_tx, request_rx) = channel();
-        let (capture_started_tx, capture_started_rx) = sync_channel(1);
-        let (release_capture_tx, release_capture_rx) = sync_channel(1);
-        let scanner = std::thread::spawn(move || {
-            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
-                captures_for_scanner.fetch_add(1, Ordering::Relaxed);
-                let _ = capture_started_tx.send(());
-                release_capture_rx.recv().unwrap();
-                Ok(ProcessSnapshot::empty())
-            })
-        });
-
-        let (acknowledge, first_receiver) = oneshot::channel();
-        request_tx
-            .send(ProcessScannerRequest::Refresh(acknowledge))
-            .unwrap();
-        capture_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("scanner did not start the requested capture");
-        let mut receivers = vec![first_receiver];
-        for _ in 1..8 {
+        let mut receivers = Vec::new();
+        for index in 0..8 {
+            if index == 4 {
+                request_tx.send(ProcessScannerRequest::Stop).unwrap();
+            }
             let (acknowledge, receiver) = oneshot::channel();
             request_tx
                 .send(ProcessScannerRequest::Refresh(acknowledge))
                 .unwrap();
             receivers.push(receiver);
         }
-        release_capture_tx.send(()).unwrap();
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                captures_for_scanner.fetch_add(1, Ordering::Relaxed);
+                Ok(ProcessSnapshot::empty())
+            })
+        });
 
         let runtime = Builder::new_current_thread().enable_time().build().unwrap();
         runtime.block_on(async {
@@ -3168,9 +3194,101 @@ mod tests {
                     .unwrap();
             }
         });
-        request_tx.send(ProcessScannerRequest::Stop).unwrap();
         scanner.join().unwrap().unwrap();
         assert_eq!(captures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scanner_refresh_never_uses_a_capture_started_before_the_request() {
+        use std::sync::atomic::AtomicUsize;
+
+        let captures = Arc::new(AtomicUsize::new(0));
+        let captures_for_scanner = captures.clone();
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let (capture_started_tx, capture_started_rx) = sync_channel(1);
+        let (release_capture_tx, release_capture_rx) = sync_channel(1);
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                let capture_index = captures_for_scanner.fetch_add(1, Ordering::Relaxed);
+                let snapshot = ProcessSnapshot::empty();
+                if capture_index == 0 {
+                    capture_started_tx.send(()).unwrap();
+                    release_capture_rx.recv().unwrap();
+                }
+                Ok(snapshot)
+            })
+        });
+
+        let (first_acknowledge, first_receiver) = oneshot::channel();
+        request_tx
+            .send(ProcessScannerRequest::Refresh(first_acknowledge))
+            .unwrap();
+        capture_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scanner did not start the first capture");
+        let requested_at = std::time::Instant::now();
+        let (second_acknowledge, second_receiver) = oneshot::channel();
+        request_tx
+            .send(ProcessScannerRequest::Refresh(second_acknowledge))
+            .unwrap();
+        release_capture_tx.send(()).unwrap();
+
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        let second_snapshot = runtime.block_on(async {
+            timeout(Duration::from_secs(1), first_receiver)
+                .await
+                .expect("first refresh was not acknowledged")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(1), second_receiver)
+                .await
+                .expect("second refresh was not acknowledged")
+                .unwrap()
+                .unwrap()
+        });
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
+
+        assert!(second_snapshot.started_after(requested_at));
+        assert_eq!(captures.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn scanner_applies_cleanup_interval_queued_with_a_refresh() {
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (request_tx, request_rx) = channel();
+        let (capture_tx, capture_rx) = channel();
+        let (acknowledge, receiver) = oneshot::channel();
+        request_tx
+            .send(ProcessScannerRequest::Refresh(acknowledge))
+            .unwrap();
+        request_tx
+            .send(ProcessScannerRequest::UseCleanupInterval)
+            .unwrap();
+        let scanner = std::thread::spawn(move || {
+            run_process_scanner(snapshot_tx, request_rx, Duration::from_secs(60), || {
+                let _ = capture_tx.send(());
+                Ok(ProcessSnapshot::empty())
+            })
+        });
+
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            timeout(Duration::from_secs(1), receiver)
+                .await
+                .expect("refresh was not acknowledged")
+                .unwrap()
+                .unwrap();
+        });
+        capture_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued refresh did not capture a snapshot");
+        capture_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued cleanup interval was not applied");
+        request_tx.send(ProcessScannerRequest::Stop).unwrap();
+        scanner.join().unwrap().unwrap();
     }
 
     #[test]
@@ -3202,7 +3320,6 @@ mod tests {
         let captures_for_test = captures.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let request_tx_for_job = request_tx.clone();
-        let request_tx_for_trigger = request_tx.clone();
         let job_scanner = ProcessScannerHandle {
             snapshots: snapshot_rx,
             requests: request_tx_for_job,
@@ -3230,12 +3347,21 @@ mod tests {
             })
             .await
             .expect("job did not start");
-            sleep(Duration::from_millis(300)).await;
-            refresh_process_snapshot(&request_tx_for_trigger)
-                .await
-                .unwrap();
+            let root = lock_or_recover(&active_pids_for_test)
+                .values()
+                .next()
+                .unwrap()
+                .info
+                .identity;
+            timeout(Duration::from_secs(2), async {
+                while process_tree::is_running_checked(root).unwrap() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("job did not exit");
             timeout(Duration::from_secs(1), async {
-                while captures_for_test.load(Ordering::Relaxed) < 2 {
+                while captures_for_test.load(Ordering::Relaxed) == 0 {
                     sleep(Duration::from_millis(10)).await;
                 }
             })
@@ -3251,7 +3377,94 @@ mod tests {
 
         request_tx.send(ProcessScannerRequest::Stop).unwrap();
         scanner.join().unwrap().unwrap();
-        assert_eq!(captures.load(Ordering::Relaxed), 2);
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        assert!(lock_or_recover(&active_pids).is_empty());
+    }
+
+    #[test]
+    fn natural_exit_refresh_failure_cleans_known_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let child_pid = temp.path().join("child.pid");
+        let config: Config = serde_yaml::from_str(&format!(
+            "jobs:\n  failed_refresh:\n    command: |\n      sleep 30 &\n      echo $! > {}\n      touch {}\n      sleep 1\n      printf tail\n    restart_delay: 10000\n",
+            child_pid.display(),
+            ready.display()
+        ))
+        .unwrap();
+        let (_, mut job_config) = config.jobs.into_iter().next().unwrap();
+        job_config.cwd = temp.path().to_string_lossy().into_owned();
+
+        let active_pids = Arc::new(Mutex::new(HashMap::new()));
+        let active_pids_for_job = active_pids.clone();
+        let active_pids_for_test = active_pids.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
+        let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
+        let (scanner_tx, scanner_rx) = channel();
+        drop(scanner_rx);
+        let job_scanner = ProcessScannerHandle {
+            snapshots: snapshot_rx,
+            requests: scanner_tx,
+        };
+        let base_env = Arc::new(env::vars().collect());
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let error = runtime.block_on(async move {
+            let job = tokio::spawn(start_proc(
+                "failed_refresh".to_string(),
+                job_config,
+                active_pids_for_job,
+                shutdown_rx,
+                job_scanner,
+                base_env,
+            ));
+            timeout(Duration::from_secs(2), async {
+                while !ready.exists() || lock_or_recover(&active_pids_for_test).is_empty() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("job did not start");
+            let child_pid = std::fs::read_to_string(&child_pid)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let child = process_tree::identity(child_pid).unwrap();
+            snapshot_tx
+                .send(Arc::new(ProcessSnapshot::capture().unwrap()))
+                .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while lock_or_recover(&active_pids_for_test)
+                    .values()
+                    .all(|run| run.descendants.is_empty())
+                {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("descendant was not tracked before the job exited");
+            let error = timeout(Duration::from_secs(3), job)
+                .await
+                .expect("job did not report the scanner failure")
+                .unwrap()
+                .unwrap_err();
+            timeout(Duration::from_secs(2), async {
+                while process_tree::is_running_checked(child).unwrap() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("known descendant survived refresh failure cleanup");
+            let _ = shutdown_tx.send(ShutdownState::Graceful);
+            error
+        });
+
+        assert!(error.to_string().contains("process scanner is unavailable"));
         assert!(lock_or_recover(&active_pids).is_empty());
     }
 
