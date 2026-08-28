@@ -67,8 +67,13 @@ enum OutputMessage {
 
 enum ProcessScannerRequest {
     Refresh(oneshot::Sender<std::io::Result<Arc<ProcessSnapshot>>>),
-    SetInterval(Duration),
+    UseCleanupInterval,
     Stop,
+}
+
+struct ProcessScannerHandle {
+    snapshots: watch::Receiver<Arc<ProcessSnapshot>>,
+    requests: Sender<ProcessScannerRequest>,
 }
 
 struct BoundedOutput {
@@ -327,8 +332,7 @@ async fn start_proc(
     opts: JobConfig,
     active_pids: Arc<Mutex<HashMap<u32, TrackedRun>>>,
     mut shutdown: watch::Receiver<ShutdownState>,
-    mut snapshots: watch::Receiver<Arc<ProcessSnapshot>>,
-    scanner: Sender<ProcessScannerRequest>,
+    mut scanner: ProcessScannerHandle,
     base_env: Arc<HashMap<String, String>>,
 ) -> std::io::Result<()> {
     let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
@@ -374,8 +378,7 @@ async fn start_proc(
             &opts,
             &active_pids,
             &mut shutdown,
-            &mut snapshots,
-            &scanner,
+            &mut scanner,
             &base_env,
         )
         .await
@@ -395,20 +398,20 @@ async fn start_proc(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_proc_internal(
     status_prefix: &PrefixWriter<'_>,
     prefix: &str,
     opts: &JobConfig,
     active_pids: &Arc<Mutex<HashMap<u32, TrackedRun>>>,
     shutdown: &mut watch::Receiver<ShutdownState>,
-    snapshots: &mut watch::Receiver<Arc<ProcessSnapshot>>,
-    scanner: &Sender<ProcessScannerRequest>,
+    scanner: &mut ProcessScannerHandle,
     base_env: &Arc<HashMap<String, String>>,
 ) -> Result<bool, ProcessRunError> {
     if *shutdown.borrow() != ShutdownState::Running {
         return Ok(true);
     }
+    let snapshots = &mut scanner.snapshots;
+    let scanner_requests = &scanner.requests;
 
     let cwd_path = std::path::Path::new(&opts.cwd);
     if !cwd_path.is_dir() {
@@ -619,7 +622,7 @@ async fn start_proc_internal(
                             remove_active_pid(active_pids, info);
                             report_child_status(status_prefix, status);
                             if use_process_group {
-                                let snapshot = refresh_process_snapshot(scanner)
+                                let snapshot = refresh_process_snapshot(scanner_requests)
                                     .await
                                     .map_err(ProcessRunError::Fatal)?;
                                 known = snapshot.related_processes(identity, true, &known);
@@ -1791,8 +1794,10 @@ async fn run_supervisor(
             Entry::Vacant(entry) => entry.insert(Arc::new(Mutex::new(HashMap::new()))).clone(),
         };
         let job_shutdown = shutdown_rx.clone();
-        let job_snapshots = snapshot_rx.clone();
-        let job_scanner = scanner_request_tx.clone();
+        let job_scanner = ProcessScannerHandle {
+            snapshots: snapshot_rx.clone(),
+            requests: scanner_request_tx.clone(),
+        };
         let job_env = base_env.clone();
         job_handles.spawn(async move {
             start_proc(
@@ -1800,7 +1805,6 @@ async fn run_supervisor(
                 job_config,
                 pid_set,
                 job_shutdown,
-                job_snapshots,
                 job_scanner,
                 job_env,
             )
@@ -1895,9 +1899,7 @@ async fn run_supervisor(
         "\nReceived {} signal, shutting down active processes..",
         first_signal
     );
-    let _ = scanner_request_tx.send(ProcessScannerRequest::SetInterval(
-        PROCESS_CLEANUP_POLL_INTERVAL,
-    ));
+    let _ = scanner_request_tx.send(ProcessScannerRequest::UseCleanupInterval);
     let _ = shutdown_tx.send(ShutdownState::Graceful);
 
     let mut escalated = false;
@@ -1977,17 +1979,17 @@ where
                     let snapshot = Arc::new(snapshot);
                     let published = snapshot_tx.send(snapshot.clone()).is_ok();
                     let mut acknowledgements = vec![acknowledge];
-                    let mut stop = false;
+                    let mut stop_requested = false;
                     while let Ok(request) = scanner_request_rx.try_recv() {
                         match request {
                             ProcessScannerRequest::Refresh(acknowledge) => {
                                 acknowledgements.push(acknowledge);
                             }
-                            ProcessScannerRequest::SetInterval(interval) => {
-                                scan_interval = interval;
+                            ProcessScannerRequest::UseCleanupInterval => {
+                                scan_interval = PROCESS_CLEANUP_POLL_INTERVAL;
                             }
                             ProcessScannerRequest::Stop => {
-                                stop = true;
+                                stop_requested = true;
                                 break;
                             }
                         }
@@ -1995,7 +1997,7 @@ where
                     for acknowledge in acknowledgements {
                         let _ = acknowledge.send(Ok(snapshot.clone()));
                     }
-                    if !published || stop {
+                    if !published || stop_requested {
                         return Ok(());
                     }
                 }
@@ -2005,7 +2007,9 @@ where
                     return Err(scanner_error);
                 }
             },
-            Ok(ProcessScannerRequest::SetInterval(interval)) => scan_interval = interval,
+            Ok(ProcessScannerRequest::UseCleanupInterval) => {
+                scan_interval = PROCESS_CLEANUP_POLL_INTERVAL;
+            }
             Ok(ProcessScannerRequest::Stop) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
                 let snapshot = capture_snapshot_with_retry(
@@ -3109,7 +3113,7 @@ mod tests {
         });
 
         request_tx
-            .send(ProcessScannerRequest::SetInterval(Duration::ZERO))
+            .send(ProcessScannerRequest::UseCleanupInterval)
             .unwrap();
         capture_rx
             .recv_timeout(Duration::from_secs(1))
@@ -3199,6 +3203,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let request_tx_for_job = request_tx.clone();
         let request_tx_for_trigger = request_tx.clone();
+        let job_scanner = ProcessScannerHandle {
+            snapshots: snapshot_rx,
+            requests: request_tx_for_job,
+        };
         let base_env = Arc::new(env::vars().collect());
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -3212,8 +3220,7 @@ mod tests {
                 job_config,
                 active_pids_for_job,
                 shutdown_rx,
-                snapshot_rx,
-                request_tx_for_job,
+                job_scanner,
                 base_env,
             ));
             timeout(Duration::from_secs(2), async {
@@ -3353,6 +3360,10 @@ mod tests {
         let initial_snapshot = Arc::new(ProcessSnapshot::capture().unwrap());
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
         let (scanner_tx, _scanner_rx) = channel();
+        let job_scanner = ProcessScannerHandle {
+            snapshots: snapshot_rx,
+            requests: scanner_tx,
+        };
         let base_env = Arc::new(env::vars().collect());
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -3366,8 +3377,7 @@ mod tests {
                 job_config,
                 active_pids_for_job,
                 shutdown_rx,
-                snapshot_rx,
-                scanner_tx,
+                job_scanner,
                 base_env,
             ));
             timeout(Duration::from_secs(3), async {
@@ -3421,6 +3431,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
         let (scanner_tx, _scanner_rx) = channel();
+        let job_scanner = ProcessScannerHandle {
+            snapshots: snapshot_rx,
+            requests: scanner_tx,
+        };
         let base_env = Arc::new(env::vars().collect());
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -3434,8 +3448,7 @@ mod tests {
                 job_config,
                 active_pids_for_job,
                 shutdown_rx,
-                snapshot_rx,
-                scanner_tx,
+                job_scanner,
                 base_env,
             ));
             timeout(Duration::from_secs(3), async {
