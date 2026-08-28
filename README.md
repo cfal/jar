@@ -202,26 +202,30 @@ The reaper shim closes the ordinary daemonization gap without privileges, and a
 bounded post-`SIGKILL` sweep signals descendants first observed after the
 initial kill. It is still not kernel-enforced containment: PID validation has a
 check/signal race, an uninterruptible kernel task may remain after `SIGKILL`,
-and abruptly killing an unwrapped supervisor can leave jobs alive. Use a
-delegated cgroup v2 subtree and `cgroup.kill` when zero surviving descendants or
-strict isolation is required.
+and abruptly killing an unwrapped supervisor can leave jobs alive. An escaped
+descendant can also become unattributable if its shim is abruptly killed before
+the next reconciliation; wrapper mode only reclaims it when the inner runner
+itself exits. Use a delegated cgroup v2 subtree and `cgroup.kill` when zero
+surviving descendants or strict isolation is required.
 
-At startup, the supervisor verifies that it can parse its own `/proc` record. It
-exits with an error if it cannot enumerate `/proc` or if every process in a
-snapshot fails inspection for at least one second. A failed global capture is
-retried while the last successful snapshot remains published. The host-wide
-scan runs every 250 ms during normal supervision and every 50 ms during
-shutdown; startup, signal handling, and natural-exit cleanup request an
-immediate snapshot. Individual
-processes can exit while a snapshot is being captured, and Linux may expose a
-dead task briefly with incomplete process-group metadata; those entries are
-skipped. Other per-process inspection anomalies are skipped with a rate-limited
-warning so an unrelated host process cannot terminate every managed job. A
-tracked process remains associated with its job while its procfs record is
-unreadable, and all other verified targets are still signaled. Descendants
-behind a persistently unreadable intermediary cannot be attributed unless they
-remain in the managed process group. Inspection errors remain fatal when
-validating cleanup because successful containment cannot then be established.
+At startup, the supervisor immediately verifies that it can parse its own
+`/proc` record and enumerate the process table. After startup, a total capture
+failure is observed on the next capture and retried for up to one second while
+the last successful snapshot remains published. A capture that keeps failing
+past that window stops the scanner and exits the supervisor with an error. The
+host-wide reconciliation scan runs every 30 seconds during normal supervision
+and every 50 ms during shutdown; startup, signal handling, and natural-exit
+cleanup request an immediate snapshot. Healthy child exits are event-driven and
+do not wait for a scan. Individual processes can exit while a snapshot is being
+captured, and Linux may expose a dead task briefly with incomplete process-group
+metadata; those entries are skipped. Other per-process inspection anomalies are
+skipped with a rate-limited warning so an unrelated host process cannot
+terminate every managed job. A tracked process remains associated with its job
+while its procfs record is unreadable, and all other verified targets are still
+signaled. Descendants behind a persistently unreadable intermediary cannot be
+attributed unless they remain in the managed process group. Inspection errors
+remain fatal when validating cleanup because successful containment cannot then
+be established.
 
 ## Output Format
 

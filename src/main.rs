@@ -29,7 +29,7 @@ const OUTPUT_CHANNEL_CAPACITY: usize = OUTPUT_QUEUE_BYTES_PER_STREAM / MAX_OUTPU
 const MIN_RESTART_DELAY: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
-const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const PROCESS_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const PROCESS_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_SCAN_FAILURE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_SCAN_FAILURE_WINDOW: Duration = Duration::from_secs(1);
@@ -40,6 +40,8 @@ const RECONCILE_CONVERGENCE_RESERVE: Duration = Duration::from_millis(250);
 const SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_RETRY_LIMIT: usize = 3;
 const SUDO_SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+// Black-box tests execute the production binary, so this cannot be gated on cfg(test).
+const TEST_PROCESS_RECONCILE_INTERVAL_MS: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
 
 static OUTPUT_SINKS: OnceLock<OutputSinks> = OnceLock::new();
 
@@ -169,6 +171,20 @@ fn is_valid_username(user: &str) -> bool {
 
 fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && !key.contains(['=', '\0'])
+}
+
+fn process_reconcile_interval(base_env: &HashMap<String, String>) -> Duration {
+    let maximum_millis = PROCESS_RECONCILE_INTERVAL.as_millis() as u64;
+    base_env
+        .get(TEST_PROCESS_RECONCILE_INTERVAL_MS)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|millis| {
+            Duration::from_millis(millis.clamp(
+                PROCESS_CLEANUP_POLL_INTERVAL.as_millis() as u64,
+                maximum_millis,
+            ))
+        })
+        .unwrap_or(PROCESS_RECONCILE_INTERVAL)
 }
 
 fn strip_json_comments(data: &str) -> String {
@@ -492,6 +508,7 @@ async fn start_proc_internal(
 
     cmd.current_dir(opts.cwd.clone())
         .envs(base_env.iter())
+        .env_remove(TEST_PROCESS_RECONCILE_INTERVAL_MS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -594,11 +611,12 @@ async fn start_proc_internal(
 
     eprintln!("{} > Started (pid {})", status_prefix, pid);
 
+    let mut child_wait = Box::pin(child.wait());
     let shutdown_state = if shutdown_at_registration != ShutdownState::Running {
         Some(shutdown_at_registration)
     } else {
         loop {
-            let snapshot_changed = tokio::select! {
+            tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() {
@@ -614,26 +632,36 @@ async fn start_proc_internal(
                     if snapshot_changed.is_err() {
                         break Some(ShutdownState::Force);
                     }
-                    true
+                    if use_process_group {
+                        known = related_processes(snapshots, identity, &known);
+                        update_active_descendants(active_pids, info, &known);
+                    }
                 }
-                _ = sleep(PROCESS_CLEANUP_POLL_INTERVAL) => false,
-            };
-            if snapshot_changed && use_process_group {
-                known = related_processes(snapshots, identity, &known);
-                update_active_descendants(active_pids, info, &known);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
+                status = &mut child_wait => {
                     remove_active_pid(active_pids, info);
+                    let status = match status {
+                        Ok(status) => status,
+                        Err(error) => {
+                            drop(child_wait);
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            drain_output_handlers([stdout_handle, stderr_handle]).await;
+                            return Err(ProcessRunError::Retry(error));
+                        }
+                    };
                     report_child_status(status_prefix, status);
                     if use_process_group {
                         let snapshot = match refresh_process_snapshot(scanner_requests).await {
                             Ok(snapshot) => snapshot,
                             Err(refresh_error) => {
-                                let cleanup_error =
-                                    cleanup_after_natural_exit(status_prefix, opts, info, &known)
-                                        .await
-                                        .err();
+                                let cleanup_error = cleanup_after_natural_exit(
+                                    status_prefix,
+                                    opts,
+                                    info,
+                                    &known,
+                                )
+                                .await
+                                .err();
                                 drain_output_handlers([stdout_handle, stderr_handle]).await;
                                 return Err(ProcessRunError::Fatal(
                                     cleanup_error.unwrap_or(refresh_error),
@@ -651,14 +679,6 @@ async fn start_proc_internal(
                     drain_output_handlers([stdout_handle, stderr_handle]).await;
                     return Ok(false);
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    remove_active_pid(active_pids, info);
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    drain_output_handlers([stdout_handle, stderr_handle]).await;
-                    return Err(ProcessRunError::Retry(error));
-                }
             }
         }
     };
@@ -667,7 +687,6 @@ async fn start_proc_internal(
         known = related_processes(snapshots, identity, &known);
         update_active_descendants(active_pids, info, &known);
     }
-    let mut child_wait = Box::pin(child.wait());
     let mut child_status = None;
     let mut child_exit_observed_at = None;
     let mut child_wait_error = None;
@@ -1773,11 +1792,22 @@ async fn run_supervisor(
     let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
     let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
     let (scanner_request_tx, scanner_request_rx) = channel();
+    let reconcile_interval = process_reconcile_interval(&base_env);
+    if let Some(value) = base_env.get(TEST_PROCESS_RECONCILE_INTERVAL_MS) {
+        if value.parse::<u64>().is_ok() {
+            eprintln!(
+                "Process reconciliation test override requested {value} ms; using {} ms",
+                reconcile_interval.as_millis()
+            );
+        } else {
+            eprintln!("Ignoring invalid process reconciliation test override: {value:?}");
+        }
+    }
     let mut scanner_handle = spawn_blocking(move || {
         run_process_scanner(
             snapshot_tx,
             scanner_request_rx,
-            PROCESS_SCAN_INTERVAL,
+            reconcile_interval,
             ProcessSnapshot::capture,
         )
     });
@@ -1912,6 +1942,7 @@ async fn run_supervisor(
         "\nReceived {} signal, shutting down active processes..",
         first_signal
     );
+    let _ = refresh_process_snapshot(&scanner_request_tx).await;
     let _ = scanner_request_tx.send(ProcessScannerRequest::UseCleanupInterval);
     let _ = shutdown_tx.send(ShutdownState::Graceful);
 
@@ -3006,6 +3037,33 @@ mod tests {
     }
 
     #[test]
+    fn test_reconcile_interval_override_is_bounded() {
+        let mut environment = HashMap::new();
+        assert_eq!(
+            process_reconcile_interval(&environment),
+            PROCESS_RECONCILE_INTERVAL
+        );
+
+        environment.insert(
+            TEST_PROCESS_RECONCILE_INTERVAL_MS.to_string(),
+            "1".to_string(),
+        );
+        assert_eq!(
+            process_reconcile_interval(&environment),
+            PROCESS_CLEANUP_POLL_INTERVAL
+        );
+
+        environment.insert(
+            TEST_PROCESS_RECONCILE_INTERVAL_MS.to_string(),
+            u64::MAX.to_string(),
+        );
+        assert_eq!(
+            process_reconcile_interval(&environment),
+            PROCESS_RECONCILE_INTERVAL
+        );
+    }
+
+    #[test]
     fn maps_supported_signal_numbers_to_names() {
         assert_eq!(signal_number_to_name(libc::SIGTERM), "TERM");
         assert_eq!(signal_number_to_name(libc::SIGKILL), "KILL");
@@ -3112,23 +3170,23 @@ mod tests {
     }
 
     #[test]
-    fn background_process_scanner_uses_the_normal_interval() {
+    fn background_process_scanner_honors_its_configured_interval() {
+        const TEST_INTERVAL: Duration = Duration::from_secs(1);
+
+        assert_eq!(PROCESS_RECONCILE_INTERVAL, Duration::from_secs(30));
         let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
         let (request_tx, request_rx) = channel();
-        let (ready_tx, ready_rx) = sync_channel(1);
         let (capture_tx, capture_rx) = channel();
         let scanner = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            run_process_scanner(snapshot_tx, request_rx, PROCESS_SCAN_INTERVAL, || {
+            run_process_scanner(snapshot_tx, request_rx, TEST_INTERVAL, || {
                 let _ = capture_tx.send(());
                 Ok(ProcessSnapshot::empty())
             })
         });
 
-        ready_rx.recv().unwrap();
         let early_capture = capture_rx.recv_timeout(PROCESS_CLEANUP_POLL_INTERVAL * 2);
         let eventually_captured =
-            early_capture.is_ok() || capture_rx.recv_timeout(PROCESS_SCAN_INTERVAL * 4).is_ok();
+            early_capture.is_ok() || capture_rx.recv_timeout(TEST_INTERVAL * 4).is_ok();
         request_tx.send(ProcessScannerRequest::Stop).unwrap();
         scanner.join().unwrap().unwrap();
 

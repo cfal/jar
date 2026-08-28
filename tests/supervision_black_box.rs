@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const TEST_RECONCILE_INTERVAL_ENV: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
 static CONTAINER_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static RESOURCE_INTENSIVE_TEST: Mutex<()> = Mutex::new(());
 
@@ -27,11 +28,21 @@ struct Runner {
 
 impl Runner {
     fn start(config: &Path, log_path: PathBuf, extra_args: &[&str]) -> Self {
+        Self::start_with_env(config, log_path, extra_args, &[])
+    }
+
+    fn start_with_env(
+        config: &Path,
+        log_path: PathBuf,
+        extra_args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Self {
         let log = File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
         command
             .args(extra_args)
             .arg(config)
+            .envs(environment.iter().copied())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
         unsafe {
@@ -310,6 +321,43 @@ fn resident_set_kib(pid: u32) -> Option<u64> {
         .ok()
 }
 
+fn process_read_syscalls(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("syscr:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let user = fields.nth(11)?.parse::<u64>().ok()?;
+    let system = fields.next()?.parse::<u64>().ok()?;
+    Some(user + system)
+}
+
+fn process_voluntary_context_switches(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn cpu_time_for_ticks(ticks: u64) -> Duration {
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    assert!(
+        ticks_per_second > 0,
+        "could not read the system clock tick rate"
+    );
+    Duration::from_secs_f64(ticks as f64 / ticks_per_second as f64)
+}
+
 fn current_username() -> Option<String> {
     let output = Command::new("id").arg("-un").output().ok()?;
     output
@@ -565,6 +613,112 @@ fn very_short_jobs_restart_reliably() {
     assert!(runner.is_running(), "short job stopped supervisor");
     runner.signal(libc::SIGTERM);
     assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
+fn job_restart_does_not_wait_for_periodic_reconciliation() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs = temp.path().join("runs");
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let leaked_override = temp.path().join("leaked-override");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  restart:\n    command: |\n      env | grep -q '^{override}=' && touch {leaked_override}\n      echo $$ >> {runs}\n      if [ \"$(wc -l < {runs})\" -eq 1 ]; then\n        touch {ready}\n        while [ ! -e {release} ]; do sleep 0.01; done\n      fi\n    restart_delay: 100\n",
+            override = TEST_RECONCILE_INTERVAL_ENV,
+            leaked_override = leaked_override.display(),
+            runs = runs.display(),
+            ready = ready.display(),
+            release = release.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut runner =
+        Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "30000")]);
+    assert!(wait_until(Duration::from_secs(3), || ready.exists()));
+    assert!(!leaked_override.exists());
+    File::create(&release).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            read_pids(std::slice::from_ref(&runs)).len() >= 2
+        }),
+        "job restart waited for process reconciliation: {}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(3)).success());
+}
+
+#[test]
+fn idle_supervision_has_a_bounded_syscall_and_cpu_cost() {
+    let _resource_guard = serialize_resource_intensive_test();
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let shim_paths: Vec<_> = (0..4)
+        .map(|job| temp.path().join(format!("shim-{job}.pid")))
+        .collect();
+    let mut contents = String::from("jobs:\n");
+    for (job, shim_path) in shim_paths.iter().enumerate() {
+        contents.push_str(&format!(
+            "  idle_{job}:\n    command: \"echo $PPID > {}; exec sleep 300\"\n    shutdown_timeout: 1\n",
+            shim_path.display()
+        ));
+    }
+    fs::write(&config, contents).unwrap();
+    let _cleanup = ProcessCleanup(shim_paths.clone());
+
+    // /proc/<pid>/status reports this counter for the main thread only.
+    let mut runner = Runner::start_with_env(
+        &config,
+        log,
+        &["-t", "1"],
+        &[(TEST_RECONCILE_INTERVAL_ENV, "30000")],
+    );
+    assert!(wait_until(Duration::from_secs(4), || {
+        read_pids(&shim_paths).len() == shim_paths.len()
+    }));
+    thread::sleep(Duration::from_millis(250));
+
+    let runner_pid = runner.child.id();
+    let mut supervised_pids = read_pids(&shim_paths);
+    supervised_pids.push(runner_pid);
+    let initial_reads = process_read_syscalls(runner_pid).unwrap();
+    let initial_context_switches = process_voluntary_context_switches(runner_pid).unwrap();
+    let initial_ticks: u64 = supervised_pids
+        .iter()
+        .map(|pid| process_cpu_ticks(*pid).unwrap())
+        .sum();
+
+    thread::sleep(Duration::from_secs(5));
+
+    let read_delta = process_read_syscalls(runner_pid).unwrap() - initial_reads;
+    let context_switch_delta =
+        process_voluntary_context_switches(runner_pid).unwrap() - initial_context_switches;
+    let final_ticks: u64 = supervised_pids
+        .iter()
+        .map(|pid| process_cpu_ticks(*pid).unwrap())
+        .sum();
+    let cpu_time = cpu_time_for_ticks(final_ticks - initial_ticks);
+    assert!(
+        read_delta <= 500,
+        "idle runner issued {read_delta} read syscalls in five seconds"
+    );
+    assert!(
+        context_switch_delta <= 50,
+        "idle runner made {context_switch_delta} voluntary context switches in five seconds"
+    );
+    assert!(
+        cpu_time <= Duration::from_millis(100),
+        "possible runner or shim spin consumed {cpu_time:?} of CPU in five seconds"
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
 }
 
 #[test]
@@ -969,6 +1123,86 @@ fn natural_exit_cleans_daemon_reparented_before_the_first_scan() {
     assert!(
         descendant_pids.iter().all(|pid| !process_is_running(*pid)),
         "daemonized descendants remained after shutdown"
+    );
+}
+
+#[test]
+fn reconciled_escapee_is_contained_after_abnormal_shim_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let descendant_pid = temp.path().join("descendant.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  observed_escapee:\n    command: |\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      echo $PPID > {shim_pid}\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            descendant_pid = descendant_pid.display(),
+            shim_pid = shim_pid.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![descendant_pid.clone()]);
+
+    let mut runner =
+        Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "100")]);
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&descendant_pid)).is_empty()
+    }));
+    thread::sleep(Duration::from_millis(500));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    let descendant = read_pids(std::slice::from_ref(&descendant_pid))[0];
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+    assert!(
+        wait_until(Duration::from_secs(4), || !process_is_running(descendant)),
+        "previously reconciled escapee survived abnormal shim exit: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
+fn new_escapee_can_outlive_abnormal_shim_exit_without_wrapper() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let descendant_pid = temp.path().join("descendant.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  new_escapee:\n    command: |\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      echo $PPID > {shim_pid}\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            descendant_pid = descendant_pid.display(),
+            shim_pid = shim_pid.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![descendant_pid.clone()]);
+
+    let mut runner =
+        Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "30000")]);
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&descendant_pid)).is_empty()
+    }));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    let descendant = read_pids(std::slice::from_ref(&descendant_pid))[0];
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        process_is_running(descendant),
+        "unreconciled escapee was unexpectedly attributed after abnormal shim exit: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+    assert!(
+        process_is_running(descendant),
+        "non-wrapper runner claimed containment of an unattributed escapee"
     );
 }
 
@@ -1563,6 +1797,51 @@ fn wrapper_reconciles_jobs_left_by_a_killed_inner_runner_before_restart() {
 }
 
 #[test]
+fn wrapper_contains_new_escapee_after_inner_and_shim_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let descendant_pid = temp.path().join("descendant.pid");
+    let script = temp.path().join("escape-and-kill-supervisors.sh");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("wrapper.log");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/bash\n( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\nwhile [ ! -s {descendant_pid} ]; do sleep 0.01; done\npid=$PPID\nshim=\ninner=\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n    if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nkill -KILL \"$shim\" \"$inner\"\n",
+            descendant_pid = descendant_pid.display(),
+        ),
+    );
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  new_escapee:\n    command: \"{}\"\n    restart_delay: 10000\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![descendant_pid.clone()]);
+
+    let mut wrapper = Runner::start_with_env(
+        &config,
+        log,
+        &["--wrap"],
+        &[(TEST_RECONCILE_INTERVAL_ENV, "30000")],
+    );
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&descendant_pid)).is_empty()
+    }));
+    let descendant = read_pids(std::slice::from_ref(&descendant_pid))[0];
+    assert!(
+        wait_until(Duration::from_secs(5), || !process_is_running(descendant)),
+        "wrapper did not reconcile a newly escaped process: {}",
+        wrapper.log()
+    );
+    assert!(wrapper.is_running(), "wrapper exited during reconciliation");
+
+    wrapper.signal(libc::SIGTERM);
+    assert!(wrapper.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
 fn wrapper_reconciles_cross_uid_jobs_before_restart() {
     let username = "root";
     if !sudo_available_for(username) {
@@ -2055,6 +2334,7 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     let temp = tempfile::tempdir().unwrap();
     let path = install_failing_signal_sudo(temp.path());
     let pid_file = temp.path().join("escaped.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.yaml");
     let log = temp.path().join("runner.log");
     File::create(&pid_file).unwrap();
@@ -2067,10 +2347,10 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     fs::write(
         &config,
         format!(
-            "jobs:\n  failed_signal:\n    command: |\n      setsid sh -c 'echo $$ > {}; while :; do sleep 1; done' &\n      while [ ! -s {} ]; do sleep 0.01; done\n      sleep 0.2\n      exit 0\n    sudo_user: {}\n    restart_delay: 10000\n",
-            pid_file.display(),
-            pid_file.display(),
-            username
+            "jobs:\n  failed_signal:\n    command: |\n      setsid sh -c 'echo $$ > {pid_file}; while :; do sleep 1; done' &\n      while [ ! -s {pid_file} ]; do sleep 0.01; done\n      while [ ! -e {release} ]; do sleep 0.01; done\n      exit 0\n    sudo_user: {username}\n    restart_delay: 10000\n",
+            pid_file = pid_file.display(),
+            release = release.display(),
+            username = username,
         ),
     )
     .unwrap();
@@ -2082,6 +2362,12 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     assert!(wait_until(Duration::from_secs(4), || {
         !read_pids(std::slice::from_ref(&pid_file)).is_empty()
     }));
+    // The signal-time refresh records the escapee before the shim loses its ancestry.
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(3), || runner
+        .log()
+        .contains("Signal forwarding failed")));
+    File::create(&release).unwrap();
     let status = runner.wait(Duration::from_secs(8));
     assert!(!status.success(), "signal helper failure returned success");
     let escaped_pid = read_pids(std::slice::from_ref(&pid_file))[0];
