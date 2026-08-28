@@ -3573,6 +3573,7 @@ mod tests {
         let initial_snapshot = Arc::new(ProcessSnapshot::capture().unwrap());
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
         let (scanner_tx, scanner_rx) = channel();
+        // No scanner thread is running, so unexpected refreshes must fail fast.
         drop(scanner_rx);
         let job_scanner = ProcessScannerHandle {
             snapshots: snapshot_rx,
@@ -3645,6 +3646,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownState::Running);
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(ProcessSnapshot::empty()));
         let (scanner_tx, scanner_rx) = channel();
+        // No scanner thread is running, so unexpected refreshes must fail fast.
         drop(scanner_rx);
         let job_scanner = ProcessScannerHandle {
             snapshots: snapshot_rx,
