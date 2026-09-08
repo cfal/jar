@@ -134,8 +134,9 @@ JSON config files may contain full-line comments beginning with `//`:
 | `#runner_cwd#` | Directory where job-runner was started |
 
 Jobs also receive `CWD` and `RUNNER_CWD` environment variables, plus the inherited
-`HOME`. The shell expands `$CWD`, `$RUNNER_CWD`, and `$HOME` in commands. An exact
-`cwd` value of `$CWD`, `$RUNNER_CWD`, or `$HOME` is also supported.
+`HOME`. The shell expands `$CWD`, `$RUNNER_CWD`, and `$HOME` in commands. A `cwd`
+value may be one of those variables or begin with one followed by `/`, such as
+`$HOME/work`.
 
 Commands already run through `sh -c`; do not add another `sh -c` unless nested
 shell semantics are intentional. Each completed command is restarted after

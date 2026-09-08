@@ -1113,6 +1113,50 @@ fn dollar_placeholder_substitution() {
 }
 
 #[test]
+fn dollar_cwd_prefix_substitution() {
+    use std::io::Write;
+
+    let home_dir = tempfile::tempdir().expect("Failed to create home dir");
+    let runner_dir = tempfile::tempdir().expect("Failed to create runner dir");
+    let config_dir = tempfile::tempdir().expect("Failed to create config dir");
+    let config_path = config_dir.path().join("config.yaml");
+    for root in [home_dir.path(), runner_dir.path(), config_dir.path()] {
+        std::fs::create_dir(root.join("work")).unwrap();
+    }
+
+    let config = r#"jobs:
+  home:
+    command: "touch home-marker"
+    cwd: "$HOME/work"
+  config:
+    command: "touch config-marker"
+    cwd: "$CWD/work"
+  runner:
+    command: "touch runner-marker"
+    cwd: "$RUNNER_CWD/work"
+"#;
+    let mut file = std::fs::File::create(&config_path).expect("Failed to create config");
+    file.write_all(config.as_bytes()).unwrap();
+
+    let mut child = Command::new(binary_path())
+        .arg(&config_path)
+        .current_dir(runner_dir.path())
+        .env("HOME", home_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start job-runner");
+
+    thread::sleep(Duration::from_secs(2));
+    send_signal(child.id(), libc::SIGTERM);
+    let _ = child.wait();
+
+    assert!(home_dir.path().join("work/home-marker").exists());
+    assert!(config_dir.path().join("work/config-marker").exists());
+    assert!(runner_dir.path().join("work/runner-marker").exists());
+}
+
+#[test]
 fn home_placeholder_substitution() {
     let config =
         "jobs:\n  home_test:\n    command: \"sh -c 'echo HOME_DIR=$PWD'\"\n    cwd: \"#home#\"\n";

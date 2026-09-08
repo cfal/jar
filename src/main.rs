@@ -173,6 +173,31 @@ fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && !key.contains(['=', '\0'])
 }
 
+fn expand_cwd(
+    cwd: &str,
+    config_parent_path: &str,
+    home_path: &str,
+    runner_cwd_path: &str,
+) -> String {
+    let cwd = cwd
+        .replace("#cwd#", config_parent_path)
+        .replace("#home#", home_path)
+        .replace("#runner_cwd#", runner_cwd_path);
+
+    for (variable, value) in [
+        ("$CWD", config_parent_path),
+        ("$HOME", home_path),
+        ("$RUNNER_CWD", runner_cwd_path),
+    ] {
+        if let Some(suffix) = cwd.strip_prefix(variable)
+            && (suffix.is_empty() || suffix.starts_with('/'))
+        {
+            return format!("{value}{suffix}");
+        }
+    }
+    cwd
+}
+
 fn process_reconcile_interval(base_env: &HashMap<String, String>) -> Duration {
     let maximum_millis = PROCESS_RECONCILE_INTERVAL.as_millis() as u64;
     base_env
@@ -1720,17 +1745,12 @@ fn main() -> ExitCode {
                 }
             };
         }
-        job_config.cwd = job_config
-            .cwd
-            .replace("#cwd#", &config_parent_path)
-            .replace("#home#", &home_path)
-            .replace("#runner_cwd#", &runner_cwd_path);
-        job_config.cwd = match job_config.cwd.as_str() {
-            "$CWD" => config_parent_path.clone(),
-            "$HOME" => home_path.clone(),
-            "$RUNNER_CWD" => runner_cwd_path.clone(),
-            _ => job_config.cwd.clone(),
-        };
+        job_config.cwd = expand_cwd(
+            &job_config.cwd,
+            &config_parent_path,
+            &home_path,
+            &runner_cwd_path,
+        );
 
         job_config.command = job_config
             .command
@@ -3034,6 +3054,30 @@ mod tests {
         assert!(!is_valid_env_key(""));
         assert!(!is_valid_env_key("A=B"));
         assert!(!is_valid_env_key("A\0B"));
+    }
+
+    #[test]
+    fn expands_cwd_variables_only_at_a_leading_path_boundary() {
+        assert_eq!(
+            expand_cwd("$HOME/work", "/config", "/home/user", "/runner"),
+            "/home/user/work"
+        );
+        assert_eq!(
+            expand_cwd("$CWD/work", "/config", "/home/user", "/runner"),
+            "/config/work"
+        );
+        assert_eq!(
+            expand_cwd("$RUNNER_CWD/work", "/config", "/home/user", "/runner"),
+            "/runner/work"
+        );
+        assert_eq!(
+            expand_cwd("$HOMELESS/work", "/config", "/home/user", "/runner"),
+            "$HOMELESS/work"
+        );
+        assert_eq!(
+            expand_cwd("prefix/$HOME", "/config", "/home/user", "/runner"),
+            "prefix/$HOME"
+        );
     }
 
     #[test]
