@@ -4,6 +4,24 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug)]
+struct TestProcess {
+    pid: u32,
+    start_time: u64,
+}
+
+struct TestProcessCleanup(Vec<TestProcess>);
+
+impl Drop for TestProcessCleanup {
+    fn drop(&mut self) {
+        for process in &self.0 {
+            if is_process_alive(*process) {
+                unsafe { libc::kill(process.pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 fn binary_path() -> String {
     env!("CARGO_BIN_EXE_job-runner-rs").to_string()
 }
@@ -47,13 +65,37 @@ fn send_signal(pid: u32, signal: libc::c_int) {
     unsafe { libc::kill(pid as libc::pid_t, signal) };
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return true;
+fn read_process(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some((state, start_time))
+}
+
+fn is_process_alive(process: TestProcess) -> bool {
+    read_process(process.pid)
+        .is_some_and(|(state, start_time)| start_time == process.start_time && state != 'Z')
+}
+
+fn read_test_processes(path: &std::path::Path) -> Vec<TestProcess> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter_map(|pid| read_process(pid).map(|(_, start_time)| TestProcess { pid, start_time }))
+        .collect()
+}
+
+fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    errno == libc::EPERM
+    condition()
 }
 
 #[test]
@@ -182,14 +224,13 @@ jobs:
 
 #[test]
 fn process_group_kills_children() {
-    let config = r#"
-jobs:
-  parent_with_children:
-    command: "bash -c 'bash -c \"sleep 300\" & bash -c \"sleep 300\" & wait'"
-    process_group: true
-"#;
-
-    let config_file = create_temp_config(config);
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("children.pids");
+    let config = format!(
+        "jobs:\n  parent_with_children:\n    command: |\n      sleep 300 &\n      echo $! >> {0}\n      sleep 300 &\n      echo $! >> {0}\n      wait\n    process_group: true\n",
+        pid_file.display()
+    );
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -198,37 +239,25 @@ jobs:
         .spawn()
         .expect("Failed to start job-runner");
 
-    thread::sleep(Duration::from_secs(2));
-
-    let pgrep_output = Command::new("pgrep")
-        .args(["-f", "sleep 300"])
-        .output()
-        .expect("Failed to run pgrep");
-
-    let sleep_pids_before: Vec<u32> = String::from_utf8_lossy(&pgrep_output.stdout)
-        .lines()
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-
     assert!(
-        sleep_pids_before.len() >= 2,
-        "Expected at least 2 sleep processes, found: {:?}",
-        sleep_pids_before
+        wait_until(Duration::from_secs(3), || read_test_processes(&pid_file)
+            .len()
+            == 2),
+        "expected two recorded child processes"
     );
+    let sleep_processes = read_test_processes(&pid_file);
+    let _cleanup = TestProcessCleanup(sleep_processes.clone());
 
     send_signal(child.id(), libc::SIGTERM);
+    let _ = child.wait();
 
-    thread::sleep(Duration::from_secs(7));
-
-    for pid in &sleep_pids_before {
+    for process in sleep_processes {
         assert!(
-            !is_process_alive(*pid),
+            !is_process_alive(process),
             "Sleep process {} should have been killed with process group",
-            pid
+            process.pid
         );
     }
-
-    let _ = child.wait();
 }
 
 #[test]
@@ -270,15 +299,13 @@ jobs:
 
 #[test]
 fn process_group_all_children_killed() {
-    let config = r#"
-jobs:
-  spawner:
-    command: "bash -c 'for i in 1 2 3 4 5; do bash -c \"sleep 302\" & done; wait'"
-    process_group: true
-    shutdown_timeout: 3
-"#;
-
-    let config_file = create_temp_config(config);
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("children.pids");
+    let config = format!(
+        "jobs:\n  spawner:\n    command: |\n      for i in 1 2 3 4 5; do\n        sleep 302 &\n        echo $! >> {0}\n      done\n      wait\n    process_group: true\n    shutdown_timeout: 3\n",
+        pid_file.display()
+    );
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -287,57 +314,38 @@ jobs:
         .spawn()
         .expect("Failed to start job-runner");
 
-    thread::sleep(Duration::from_secs(2));
+    assert!(
+        wait_until(Duration::from_secs(3), || read_test_processes(&pid_file)
+            .len()
+            == 5),
+        "expected five recorded child processes"
+    );
+    let sleep_processes = read_test_processes(&pid_file);
+    let _cleanup = TestProcessCleanup(sleep_processes.clone());
 
-    let pgrep_output = Command::new("pgrep")
-        .args(["-f", "sleep 302"])
-        .output()
-        .expect("Failed to run pgrep");
+    send_signal(child.id(), libc::SIGTERM);
+    let _ = child.wait();
 
-    let sleep_pids_before: Vec<u32> = String::from_utf8_lossy(&pgrep_output.stdout)
-        .lines()
-        .filter_map(|s| s.trim().parse().ok())
+    let surviving: Vec<_> = sleep_processes
+        .iter()
+        .filter(|process| is_process_alive(**process))
         .collect();
 
     assert!(
-        sleep_pids_before.len() >= 4,
-        "Expected at least 4 sleep processes, found: {:?}",
-        sleep_pids_before
+        surviving.is_empty(),
+        "recorded child processes remained alive: {surviving:?}"
     );
-
-    send_signal(child.id(), libc::SIGTERM);
-
-    thread::sleep(Duration::from_secs(5));
-
-    let mut alive_count = 0;
-    for pid in &sleep_pids_before {
-        if is_process_alive(*pid) {
-            alive_count += 1;
-        }
-    }
-
-    assert_eq!(
-        alive_count,
-        0,
-        "All {} sleep processes should be killed, but {} are still alive. PIDs: {:?}",
-        sleep_pids_before.len(),
-        alive_count,
-        sleep_pids_before
-    );
-
-    let _ = child.wait();
 }
 
 #[test]
 fn process_group_enabled_by_default() {
-    let config = r#"
-jobs:
-  parent:
-    command: "bash -c 'bash -c \"sleep 301\" & wait'"
-    # process_group not set, defaults to true
-"#;
-
-    let config_file = create_temp_config(config);
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("child.pid");
+    let config = format!(
+        "jobs:\n  parent:\n    command: |\n      sleep 301 &\n      echo $! > {}\n      wait\n",
+        pid_file.display()
+    );
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -346,17 +354,11 @@ jobs:
         .spawn()
         .expect("Failed to start job-runner");
 
-    thread::sleep(Duration::from_secs(2));
-
-    let pgrep_output = Command::new("pgrep")
-        .args(["-f", "sleep 301"])
-        .output()
-        .expect("Failed to run pgrep");
-
-    let sleep_pids: Vec<u32> = String::from_utf8_lossy(&pgrep_output.stdout)
-        .lines()
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
+    assert!(wait_until(Duration::from_secs(3), || {
+        read_test_processes(&pid_file).len() == 1
+    }));
+    let sleep_processes = read_test_processes(&pid_file);
+    let _cleanup = TestProcessCleanup(sleep_processes.clone());
 
     send_signal(child.id(), libc::SIGTERM);
 
@@ -365,23 +367,18 @@ jobs:
         thread::sleep(Duration::from_millis(50));
     }
 
-    let surviving_pids: Vec<u32> = sleep_pids
+    let surviving: Vec<_> = sleep_processes
         .iter()
-        .copied()
-        .filter(|pid| is_process_alive(*pid))
+        .filter(|process| is_process_alive(**process))
         .collect();
-
-    for pid in &surviving_pids {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-    }
 
     assert!(
         child.try_wait().unwrap().is_some(),
         "job-runner did not shut down"
     );
     assert!(
-        surviving_pids.is_empty(),
-        "default process-group shutdown left children alive: {surviving_pids:?}"
+        surviving.is_empty(),
+        "default process-group shutdown left children alive: {surviving:?}"
     );
 }
 

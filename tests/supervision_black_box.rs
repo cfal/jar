@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,22 @@ struct Runner {
 }
 
 impl Runner {
+    fn spawn_in_session(mut command: Command, log_path: PathBuf) -> Self {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        Self {
+            child: command.spawn().unwrap(),
+            log_path,
+        }
+    }
+
     fn start(config: &Path, log_path: PathBuf, extra_args: &[&str]) -> Self {
         Self::start_with_env(config, log_path, extra_args, &[])
     }
@@ -45,80 +61,46 @@ impl Runner {
             .envs(environment.iter().copied())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        Self::spawn_in_session(command, log_path)
     }
 
     fn start_with_unread_stdout(config: &Path, log_path: PathBuf) -> Self {
         let log = File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
         command.arg(config).stdout(Stdio::piped()).stderr(log);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        Self::spawn_in_session(command, log_path)
     }
 
-    fn start_with_unread_stderr(config: &Path, log_path: PathBuf) -> Self {
+    fn start_with_unread_stderr(config: &Path, log_path: PathBuf, extra_args: &[&str]) -> Self {
         let log = File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
-        command.arg(config).stdout(log).stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        command
+            .args(extra_args)
+            .arg(config)
+            .stdout(log)
+            .stderr(Stdio::piped());
+        Self::spawn_in_session(command, log_path)
     }
 
     fn start_with_path(config: &Path, log_path: PathBuf, path: &str) -> Self {
+        Self::start_with_path_and_env(config, log_path, path, &[])
+    }
+
+    fn start_with_path_and_env(
+        config: &Path,
+        log_path: PathBuf,
+        path: &str,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let log = File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
         command
             .arg(config)
             .env("PATH", path)
+            .envs(environment.iter().copied())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        Self::spawn_in_session(command, log_path)
     }
 
     fn signal(&self, signal: libc::c_int) {
@@ -186,6 +168,64 @@ impl Drop for ProcessCleanup {
     }
 }
 
+struct ChurnGuard {
+    keep_running: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl ChurnGuard {
+    fn start(worker_count: usize, fork_count: Arc<AtomicUsize>) -> Self {
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let handles = (0..worker_count)
+            .map(|_| {
+                let keep_running = keep_running.clone();
+                let fork_count = fork_count.clone();
+                thread::spawn(move || {
+                    while keep_running.load(Ordering::Relaxed) {
+                        let pid = fork_with_retry();
+                        if pid == 0 {
+                            unsafe { libc::_exit(0) };
+                        }
+                        let mut status = 0;
+                        loop {
+                            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                            if waited == pid {
+                                break;
+                            }
+                            assert_eq!(
+                                std::io::Error::last_os_error().raw_os_error(),
+                                Some(libc::EINTR),
+                                "waitpid failed"
+                            );
+                        }
+                        fork_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        Self {
+            keep_running,
+            handles,
+        }
+    }
+
+    fn stop(mut self) {
+        self.keep_running.store(false, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            handle.join().unwrap();
+        }
+    }
+}
+
+impl Drop for ChurnGuard {
+    fn drop(&mut self) {
+        self.keep_running.store(false, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct SudoProcessCleanup {
     username: String,
     pid_path: PathBuf,
@@ -217,11 +257,525 @@ impl Drop for SudoProcessCleanup {
     }
 }
 
+struct IdentityScopedSudoProcessCleanup {
+    username: String,
+    identity_path: PathBuf,
+}
+
+impl Drop for IdentityScopedSudoProcessCleanup {
+    fn drop(&mut self) {
+        let Some((pid, start_time)) = read_recorded_process_identity(&self.identity_path) else {
+            return;
+        };
+        let Some(process_group) = process_group_for_identity(pid, start_time) else {
+            return;
+        };
+        let _ = Command::new("sudo")
+            .args([
+                "-n",
+                "-u",
+                &self.username,
+                "--",
+                "kill",
+                "-KILL",
+                "--",
+                &format!("-{process_group}"),
+                &pid.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn write_executable(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn build_identity_fault_library(root: &Path) -> PathBuf {
+    let source = root.join("identity-fault.c");
+    let library = root.join("identity-fault.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void initialize(void) {
+    if (!getenv("JOB_RUNNER_IDENTITY_FAULT_ROOT")) {
+        char pid[32];
+        snprintf(pid, sizeof(pid), "%d", getpid());
+        setenv("JOB_RUNNER_IDENTITY_FAULT_ROOT", pid, 1);
+    }
+}
+
+int open64(const char *path, int flags, ...) {
+    static int (*original)(const char *, int, ...) = 0;
+    static int failures = 0;
+    if (!original) original = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = va_arg(arguments, int);
+        va_end(arguments);
+    }
+    int target = 0;
+    char tail = 0;
+    const char *root = getenv("JOB_RUNNER_IDENTITY_FAULT_ROOT");
+    const char *ready = getenv("JOB_RUNNER_IDENTITY_FAULT_READY");
+    if (failures < 3 && root && atoi(root) == getpid()
+        && syscall(SYS_gettid) == getpid()
+        && sscanf(path, "/proc/%d/stat%c", &target, &tail) == 1
+        && target != getpid()) {
+        if (failures == 0) {
+            for (int attempt = 0; ready && access(ready, F_OK) != 0 && attempt < 500; attempt++) {
+                usleep(10000);
+            }
+        }
+        failures++;
+        errno = EIO;
+        return -1;
+    }
+    return original(path, flags, mode);
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not build identity fault library");
+    library
+}
+
+fn build_proc_capture_fault_library(root: &Path) -> PathBuf {
+    let source = root.join("proc-capture-fault.c");
+    let library = root.join("proc-capture-fault.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void initialize(void) {
+    if (!getenv("JOB_RUNNER_PROC_FAULT_ROOT")) {
+        char pid[32];
+        snprintf(pid, sizeof(pid), "%d", getpid());
+        setenv("JOB_RUNNER_PROC_FAULT_ROOT", pid, 1);
+    }
+}
+
+DIR *opendir(const char *path) {
+    static DIR *(*original)(const char *) = 0;
+    if (!original) original = dlsym(RTLD_NEXT, "opendir");
+    const char *root = getenv("JOB_RUNNER_PROC_FAULT_ROOT");
+    const char *marker = getenv("JOB_RUNNER_PROC_FAULT_MARKER");
+    if (root && atoi(root) == getpid() && marker && !strcmp(path, "/proc")
+        && access(marker, F_OK) == 0) {
+        errno = EIO;
+        return 0;
+    }
+    return original(path);
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "could not build proc capture fault library"
+    );
+    library
+}
+
+fn build_shim_startup_probe_library(root: &Path) -> PathBuf {
+    let source = root.join("shim-startup-probe.c");
+    let library = root.join("shim-startup-probe.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int readiness_fd = -1;
+
+ssize_t write(int descriptor, const void *buffer, size_t length) {
+    static ssize_t (*original)(int, const void *, size_t) = 0;
+    if (!original) original = dlsym(RTLD_NEXT, "write");
+    const char *marker = getenv("JOB_RUNNER_STOP_READY_WRITE_FOR");
+    if (descriptor == readiness_fd && marker) {
+        for (int attempt = 0; access(marker, F_OK) != 0 && attempt < 500; attempt++) {
+            usleep(10000);
+        }
+        raise(SIGSTOP);
+    }
+    return original(descriptor, buffer, length);
+}
+
+__attribute__((constructor)) static void initialize(void) {
+    const char *marker = getenv("JOB_RUNNER_SHIM_STARTUP_PID");
+    if (!marker) return;
+    int command_line = open("/proc/self/cmdline", O_RDONLY);
+    if (command_line < 0) return;
+    char contents[8192];
+    ssize_t length = read(command_line, contents, sizeof(contents));
+    close(command_line);
+    if (length <= 0) return;
+    int is_shim = 0;
+    const char *previous = 0;
+    for (ssize_t offset = 0; offset < length;) {
+        const char *argument = contents + offset;
+        size_t size = strnlen(argument, length - offset);
+        if (!strcmp(argument, "--job-shim")) is_shim = 1;
+        if (previous && !strcmp(previous, "--ready-fd")) readiness_fd = atoi(argument);
+        previous = argument;
+        offset += size + 1;
+    }
+    if (!is_shim) return;
+    int output = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output >= 0) {
+        dprintf(output, "%d\n", getpid());
+        close(output);
+    }
+    const char *holder_marker = getenv("JOB_RUNNER_COMPLETION_HOLDER_PID");
+    if (holder_marker) {
+        pid_t first = fork();
+        if (first == 0) {
+            pid_t holder = fork();
+            if (holder > 0) _exit(0);
+            if (holder < 0) _exit(2);
+            setsid();
+            int holder_output = open(holder_marker, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (holder_output >= 0) {
+                dprintf(holder_output, "%d\n", getpid());
+                close(holder_output);
+            }
+            sleep(30);
+            _exit(0);
+        }
+        if (first > 0) waitpid(first, 0, 0);
+    }
+    if (getenv("JOB_RUNNER_STOP_SHIM_STARTUP")) raise(SIGSTOP);
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "could not build shim startup probe library"
+    );
+    library
+}
+
+fn build_helper_root_fault_library(root: &Path, helper_pid: &Path, helper_kind: &str) -> PathBuf {
+    let source = root.join("signal-helper-root-fault.c");
+    let library = root.join("signal-helper-root-fault.so");
+    fs::write(
+        &source,
+        format!(
+            r#"#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static int is_target_helper(int pid) {{
+    char path[64];
+    char command_line[8192];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    int descriptor = open(path, O_RDONLY);
+    if (descriptor < 0) return 0;
+    ssize_t length = read(descriptor, command_line, sizeof(command_line));
+    close(descriptor);
+    int is_shim = 0;
+    int has_ready_fd = 0;
+    int matches_kind = 0;
+    for (ssize_t offset = 0; offset < length;) {{
+        if (!strcmp(command_line + offset, "--job-shim")) is_shim = 1;
+        if (!strcmp(command_line + offset, "--ready-fd")) has_ready_fd = 1;
+        if (strstr(command_line + offset, "{helper_kind}")) matches_kind = 1;
+        offset += strlen(command_line + offset) + 1;
+    }}
+    return is_shim && !has_ready_fd && matches_kind;
+}}
+
+__attribute__((constructor)) static void initialize(void) {{
+    if (!is_target_helper(getpid())) return;
+    int output = open("{}", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output >= 0) {{
+        dprintf(output, "%d\n", getpid());
+        close(output);
+    }}
+    raise(SIGSTOP);
+}}
+
+int kill(pid_t pid, int signal) {{
+    static int (*original)(pid_t, int);
+    if (!original) original = dlsym(RTLD_NEXT, "kill");
+    if (pid > 0 && signal == SIGKILL && is_target_helper(pid)) {{
+        errno = EPERM;
+        return -1;
+    }}
+    return original(pid, signal);
+}}
+"#,
+            helper_pid.display()
+        ),
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "could not build signal-helper fault library"
+    );
+    library
+}
+
+fn build_partial_helper_capture_fault_library(root: &Path) -> PathBuf {
+    let source = root.join("partial-helper-capture-fault.c");
+    let library = root.join("partial-helper-capture-fault.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static __thread DIR *active_scan;
+static int is_owner;
+static int faults_supervisor;
+static int faults_own_root;
+
+static int is_target_helper(int pid);
+
+__attribute__((constructor)) static void initialize(void) {
+    const char *root = getenv("JOB_RUNNER_PARTIAL_CAPTURE_ROOT");
+    if (!root) {
+        char pid[32];
+        snprintf(pid, sizeof(pid), "%d", getpid());
+        setenv("JOB_RUNNER_PARTIAL_CAPTURE_ROOT", pid, 1);
+        is_owner = 1;
+    } else {
+        is_owner = atoi(root) == getpid();
+    }
+    faults_supervisor = is_owner && !getenv("JOB_RUNNER_PARTIAL_CAPTURE_OWN_ROOT");
+    faults_own_root = getenv("JOB_RUNNER_PARTIAL_CAPTURE_OWN_ROOT")
+        && is_target_helper(getpid());
+}
+
+DIR *opendir(const char *path) {
+    static DIR *(*original)(const char *);
+    if (!original) original = dlsym(RTLD_NEXT, "opendir");
+    DIR *directory = original(path);
+    if ((faults_supervisor || faults_own_root) && !strcmp(path, "/proc")) {
+        active_scan = directory;
+    }
+    return directory;
+}
+
+int closedir(DIR *directory) {
+    static int (*original)(DIR *);
+    if (!original) original = dlsym(RTLD_NEXT, "closedir");
+    if (directory == active_scan) active_scan = 0;
+    return original(directory);
+}
+
+static int is_target_helper(int pid) {
+    char path[64];
+    char command_line[8192];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    int descriptor = open(path, O_RDONLY);
+    if (descriptor < 0) return 0;
+    ssize_t length = read(descriptor, command_line, sizeof(command_line));
+    close(descriptor);
+    if (length <= 0) return 0;
+    const char *helper_kind = getenv("JOB_RUNNER_PARTIAL_CAPTURE_HELPER");
+    int is_shim = 0;
+    int has_ready_fd = 0;
+    int matches_kind = 0;
+    for (ssize_t offset = 0; offset < length;) {
+        const char *argument = command_line + offset;
+        size_t argument_length = strnlen(argument, length - offset);
+        if (!strcmp(argument, "--job-shim")) is_shim = 1;
+        if (!strcmp(argument, "--ready-fd")) has_ready_fd = 1;
+        if (helper_kind && strstr(argument, helper_kind)) matches_kind = 1;
+        offset += argument_length + 1;
+    }
+    int include_ready = getenv("JOB_RUNNER_PARTIAL_CAPTURE_INCLUDE_READY") != 0;
+    return is_shim && (include_ready || !has_ready_fd) && matches_kind;
+}
+
+int open64(const char *path, int flags, ...) {
+    static int (*original)(const char *, int, ...);
+    if (!original) original = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = va_arg(arguments, int);
+        va_end(arguments);
+    }
+    int pid;
+    char tail;
+    if (active_scan && sscanf(path, "/proc/%d/stat%c", &pid, &tail) == 1
+        && (faults_own_root ? pid == getpid() : is_target_helper(pid))) {
+        const char *marker = getenv("JOB_RUNNER_PARTIAL_CAPTURE_FAULT_MARKER");
+        if (marker) {
+            int output = open(marker, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            if (output >= 0) {
+                dprintf(output, "%d\n", getpid());
+                close(output);
+            }
+        }
+        errno = EIO;
+        return -1;
+    }
+    return original(path, flags, mode);
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .args(["-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "could not build partial helper capture fault library"
+    );
+    library
+}
+
+fn build_signal_probe_named_sudo(root: &Path) -> PathBuf {
+    let source = root.join("signal-probe.c");
+    let executable = root.join("sudo");
+    fs::write(
+        &source,
+        r#"#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static unsigned long long process_start_time(void) {
+    char stat[4096];
+    int input = open("/proc/self/stat", O_RDONLY);
+    if (input < 0) return 0;
+    ssize_t length = read(input, stat, sizeof(stat) - 1);
+    close(input);
+    if (length <= 0) return 0;
+    stat[length] = 0;
+    char *field = strrchr(stat, ')');
+    if (!field) return 0;
+    field += 2;
+    for (int index = 0; index < 19; index++) {
+        field = strchr(field, ' ');
+        if (!field) return 0;
+        field++;
+    }
+    return strtoull(field, 0, 10);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &signals, 0) != 0) return 3;
+    pid_t child = fork();
+    if (child < 0) return 4;
+    if (child == 0) {
+        execlp("sleep", "sleep", "30", NULL);
+        _exit(6);
+    }
+    int output = open(argv[1], O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (output < 0) return 7;
+    unsigned long long start_time = process_start_time();
+    if (!start_time) return 9;
+    dprintf(output, "%d %llu\nready\n", getpid(), start_time);
+    int received = 0;
+    if (sigwait(&signals, &received) != 0) return 8;
+    dprintf(output, "received %d\n", received);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(output);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let status = Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not build signal probe");
+    executable
 }
 
 fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -264,24 +818,58 @@ fn read_pids(paths: &[PathBuf]) -> Vec<u32> {
         .collect()
 }
 
-fn process_is_running(pid: u32) -> bool {
+fn read_recorded_process_identity(path: &Path) -> Option<(u32, u64)> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut fields = contents.lines().next()?.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
+fn first_started_pid(log: &str) -> Option<u32> {
+    log.split_once("Started (pid ")?
+        .1
+        .split_once(')')?
+        .0
+        .parse()
+        .ok()
+}
+
+fn process_state(pid: u32) -> Option<char> {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
+        return None;
     };
-    let Some(close) = stat.rfind(')') else {
-        return false;
-    };
+    let close = stat.rfind(')')?;
     stat[close + 1..]
         .split_whitespace()
         .next()
-        .is_some_and(|state| state != "Z")
+        .and_then(|state| state.chars().next())
+}
+
+fn process_is_running(pid: u32) -> bool {
+    process_state(pid).is_some_and(|state| state != 'Z')
 }
 
 fn process_group_id(pid: u32) -> Option<u32> {
+    process_group_and_start_time(pid).map(|(process_group, _)| process_group)
+}
+
+fn process_group_and_start_time(pid: u32) -> Option<(u32, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let process_group = fields.nth(2)?.parse().ok()?;
+    let start_time = fields.nth(16)?.parse().ok()?;
+    Some((process_group, start_time))
+}
+
+fn process_group_for_identity(pid: u32, start_time: u64) -> Option<u32> {
+    let (process_group, current_start_time) = process_group_and_start_time(pid)?;
+    (current_start_time == start_time).then_some(process_group)
+}
+
+fn parent_process_id(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat[stat.rfind(')')? + 1..]
         .split_whitespace()
-        .nth(2)?
+        .nth(1)?
         .parse()
         .ok()
 }
@@ -375,21 +963,18 @@ fn sudo_available_for(username: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn install_failing_signal_sudo(root: &Path) -> String {
+fn real_sudo_path() -> String {
     let sudo_output = Command::new("which").arg("sudo").output().unwrap();
     assert!(sudo_output.status.success());
-    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
+    String::from_utf8_lossy(&sudo_output.stdout)
         .trim()
-        .to_string();
+        .to_string()
+}
+
+fn install_fake_sudo(root: &Path, script: &str) -> String {
     let fake_bin = root.join("bin");
     fs::create_dir(&fake_bin).unwrap();
-    write_executable(
-        &fake_bin.join("sudo"),
-        &format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    job-runner-signal|job-runner-reconcile) exit 77 ;;\n  esac\ndone\nexec {} \"$@\"\n",
-            real_sudo
-        ),
-    );
+    write_executable(&fake_bin.join("sudo"), script);
     format!(
         "{}:{}",
         fake_bin.display(),
@@ -397,71 +982,228 @@ fn install_failing_signal_sudo(root: &Path) -> String {
     )
 }
 
+fn install_failing_signal_sudo(root: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    job-runner-signal|job-runner-reconcile) exit 77 ;;\n  esac\ndone\nexec {} \"$@\"\n",
+            real_sudo
+        ),
+    )
+}
+
+fn install_unready_cleanup_leaking_sudo(root: &Path, escapee_pid: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    {real_sudo} \"$@\"\n    setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n    while [ ! -s {escapee_pid} ]; do sleep 0.01; done\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
+            escapee_pid = escapee_pid.display(),
+        ),
+    )
+}
+
 fn install_counting_signal_sudo(root: &Path, invocations: &Path) -> String {
-    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
-    assert!(sudo_output.status.success());
-    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
-        .trim()
-        .to_string();
-    let fake_bin = root.join("bin");
-    fs::create_dir(&fake_bin).unwrap();
-    write_executable(
-        &fake_bin.join("sudo"),
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
         &format!(
             "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    echo invocation >> {}\n    break\n  fi\ndone\nexec {} \"$@\"\n",
             invocations.display(),
             real_sudo
         ),
-    );
-    format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
     )
 }
 
-fn install_hanging_reconcile_sudo(root: &Path) -> String {
-    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
-    assert!(sudo_output.status.success());
-    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
-        .trim()
-        .to_string();
-    let fake_bin = root.join("bin");
-    fs::create_dir(&fake_bin).unwrap();
-    write_executable(
-        &fake_bin.join("sudo"),
+fn install_hanging_reconcile_sudo(
+    root: &Path,
+    helper_pid: &Path,
+    helper_descendant_pid: &Path,
+) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
         &format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-reconcile ]; then exec sleep 30; fi\ndone\nexec {} \"$@\"\n",
-            real_sudo
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-reconcile ]; then\n    echo $$ > {helper_pid}\n    setsid sh -c 'echo $$ > {helper_descendant_pid}; exec sleep 30' &\n    wait\n    exit 0\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
+            helper_pid = helper_pid.display(),
+            helper_descendant_pid = helper_descendant_pid.display(),
         ),
-    );
-    format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn install_cross_uid_helper_escape_sudo(
+    root: &Path,
+    privileged_descendant: &Path,
+    reconcile_escapee: &Path,
+    invocations: &Path,
+) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {invocations}\nsignal=0\nusr1=0\nreconcile=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -USR1 ] && usr1=1\n  [ \"$argument\" = job-runner-reconcile ] && reconcile=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  exec {real_sudo} -n -u root -- sh -c 'setsid sleep 30 & echo $! > {privileged_descendant}; wait'\nfi\nif [ \"$reconcile\" -eq 1 ]; then\n  setsid sh -c 'echo $$ > {reconcile_escapee}; exec sleep 30' &\n  while [ ! -s {reconcile_escapee} ]; do sleep 0.01; done\nfi\nexec {real_sudo} \"$@\"\n",
+            privileged_descendant = privileged_descendant.display(),
+            reconcile_escapee = reconcile_escapee.display(),
+            invocations = invocations.display(),
+        ),
+    )
+}
+
+fn install_expiring_privileged_helper_sudo(root: &Path, privileged_pid: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nsignal=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  exec {real_sudo} -n -u root -- sh -c 'setsid sleep 1.8 & echo $! > {privileged_pid}; wait'\nfi\nexec {real_sudo} \"$@\"\n",
+            privileged_pid = privileged_pid.display(),
+        ),
+    )
+}
+
+fn install_partial_capture_signal_sudo(
+    root: &Path,
+    escapee_pid: &Path,
+    wait_for_escapee_exit: bool,
+) -> String {
+    let real_sudo = real_sudo_path();
+    let helper_exit_command = if wait_for_escapee_exit {
+        "wait".to_string()
+    } else {
+        format!(
+            "while [ ! -s {} ]; do sleep 0.01; done",
+            escapee_pid.display()
+        )
+    };
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n  {helper_exit_command}\n  exit 0\nfi\nexec {real_sudo} \"$@\"\n",
+            escapee_pid = escapee_pid.display(),
+        ),
+    )
+}
+
+fn install_partial_capture_reconcile_sudo(
+    root: &Path,
+    privileged_pid: &Path,
+    escapee_pid: &Path,
+) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nsignal=0\nusr1=0\nreconcile=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -USR1 ] && usr1=1\n  [ \"$argument\" = job-runner-reconcile ] && reconcile=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  exec {real_sudo} -n -u root -- sh -c 'setsid sleep 1.8 & echo $! > {privileged_pid}; wait'\nfi\nif [ \"$reconcile\" -eq 1 ]; then\n  setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n  wait\n  exit 0\nfi\nexec {real_sudo} \"$@\"\n",
+            privileged_pid = privileged_pid.display(),
+            escapee_pid = escapee_pid.display(),
+        ),
+    )
+}
+
+fn install_killing_reconcile_sudo(root: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-reconcile ]; then\n    {real_sudo} \"$@\"\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
+        ),
+    )
+}
+
+fn install_leaking_cross_uid_reconcile_sudo(
+    root: &Path,
+    privileged_descendant: &Path,
+    reconcile_escapee: &Path,
+    reconcile_marker: &Path,
+) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nsignal=0\nusr1=0\nreconcile=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -USR1 ] && usr1=1\n  [ \"$argument\" = job-runner-reconcile ] && reconcile=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  exec {real_sudo} -n -u root -- sh -c 'setsid sleep 30 & echo $! > {privileged_descendant}; wait'\nfi\nif [ \"$reconcile\" -eq 1 ]; then\n  touch {reconcile_marker}\n  {real_sudo} \"$@\"\n  exec {real_sudo} -n -u root -- sh -c 'setsid sleep 30 & echo $! >> {reconcile_escapee}; wait'\nfi\nexec {real_sudo} \"$@\"\n",
+            privileged_descendant = privileged_descendant.display(),
+            reconcile_escapee = reconcile_escapee.display(),
+            reconcile_marker = reconcile_marker.display(),
+        ),
+    )
+}
+
+fn install_hanging_term_signal_sudo(root: &Path, marker: Option<&Path>) -> String {
+    let real_sudo = real_sudo_path();
+    let mark_started = marker
+        .map(|path| format!("echo $$ > {}", path.display()))
+        .unwrap_or_else(|| ":".to_string());
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nterm=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -TERM ] && term=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$term\" -eq 1 ]; then {mark_started}; exec sleep 30; fi\nexec {real_sudo} \"$@\"\n",
+        ),
+    )
+}
+
+fn install_hanging_usr1_signal_sudo(root: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then exec sleep 30; fi\nexec {real_sudo} \"$@\"\n",
+        ),
+    )
+}
+
+fn install_counting_hanging_usr1_signal_sudo(root: &Path, invocations: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  echo $$ >> {invocations}\n  exec sleep 30\nfi\nexec {real_sudo} \"$@\"\n",
+            invocations = invocations.display(),
+        ),
+    )
+}
+
+fn install_forking_usr1_signal_sudo(root: &Path, helper_pid: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  sleep 30 &\n  echo $! > {helper_pid}\n  wait\n  exit 0\nfi\nexec {real_sudo} \"$@\"\n",
+            helper_pid = helper_pid.display(),
+        ),
+    )
+}
+
+fn install_exiting_forking_usr1_signal_sudo(root: &Path, helper_pid: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nusr1=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  [ \"$argument\" = -USR1 ] && usr1=1\ndone\nif [ \"$helper\" -eq 1 ] && [ \"$usr1\" -eq 1 ]; then\n  setsid sleep 30 &\n  echo $! > {helper_pid}\n  kill -KILL $$\nfi\nexec {real_sudo} \"$@\"\n",
+            helper_pid = helper_pid.display(),
+        ),
+    )
+}
+
+fn install_slow_signal_sudo(root: &Path, invocations: &Path) -> String {
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
+        &format!(
+            "#!/bin/sh\nhelper=0\nsignal=\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && helper=1\n  case \"$argument\" in -USR1|-USR2) signal=$argument ;; esac\ndone\nif [ \"$helper\" -eq 1 ] && [ -n \"$signal\" ]; then\n  echo \"$signal\" >> {invocations}\n  sleep 0.15\n  exit 0\nfi\nexec {real_sudo} \"$@\"\n",
+            invocations = invocations.display(),
+        ),
     )
 }
 
 fn install_fail_first_kill_sudo(root: &Path, invocations: &Path) -> String {
-    let sudo_output = Command::new("which").arg("sudo").output().unwrap();
-    assert!(sudo_output.status.success());
-    let real_sudo = String::from_utf8_lossy(&sudo_output.stdout)
-        .trim()
-        .to_string();
-    let fake_bin = root.join("bin");
-    fs::create_dir(&fake_bin).unwrap();
-    write_executable(
-        &fake_bin.join("sudo"),
+    let real_sudo = real_sudo_path();
+    install_fake_sudo(
+        root,
         &format!(
             "#!/bin/sh\nsignal=0\nkill=0\nfor argument in \"$@\"; do\n  [ \"$argument\" = job-runner-signal ] && signal=1\n  [ \"$argument\" = -KILL ] && kill=1\ndone\nif [ \"$signal\" -eq 1 ] && [ \"$kill\" -eq 1 ]; then\n  echo invocation >> {invocations}\n  [ \"$(wc -l < {invocations})\" -eq 1 ] && exit 77\nfi\nexec {real_sudo} \"$@\"\n",
             invocations = invocations.display(),
             real_sudo = real_sudo,
         ),
-    );
-    format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
     )
 }
 
@@ -500,7 +1242,6 @@ fn exercise_sudo_signal_route(username: &str) {
     let mut runner = Runner::start(&config, log, &[]);
     assert!(wait_until(Duration::from_secs(5), || {
         fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0)
-            || fs::read_to_string(&pid_file).is_ok_and(|contents| !contents.trim().is_empty())
     }));
     let process_tree = Command::new("pstree")
         .args(["-ap", &runner.child.id().to_string()])
@@ -654,6 +1395,218 @@ fn job_restart_does_not_wait_for_periodic_reconciliation() {
 }
 
 #[test]
+fn child_identity_failure_does_not_overlap_job_generations() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs = temp.path().join("runs");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let fault_library = build_identity_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  identity_failure:\n    command: \"echo $$ >> {}; exec sleep 30\"\n    restart_delay: 100\n",
+            runs.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![runs.clone()]);
+
+    let mut runner = Runner::start_with_env(
+        &config,
+        log,
+        &[],
+        &[
+            ("LD_PRELOAD", fault_library.to_str().unwrap()),
+            ("JOB_RUNNER_IDENTITY_FAULT_READY", runs.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            read_pids(std::slice::from_ref(&runs)).len() >= 2
+        }),
+        "job did not restart after confirmed cleanup: {}",
+        runner.log()
+    );
+    let pids = read_pids(std::slice::from_ref(&runs));
+    assert!(
+        !process_is_running(pids[0]),
+        "identity-read failure overlapped job generations: {}",
+        runner.log()
+    );
+    assert!(process_is_running(pids[1]));
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn forced_shutdown_interrupts_post_spawn_error_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let fault_library = build_identity_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  identity_failure:\n    command: \"trap '' TERM; echo $$ > {}; exec sleep 30\"\n    shutdown_timeout: 30\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone()]);
+
+    let mut runner = Runner::start_with_env(
+        &config,
+        log,
+        &[],
+        &[
+            ("LD_PRELOAD", fault_library.to_str().unwrap()),
+            ("JOB_RUNNER_IDENTITY_FAULT_READY", job_pid.to_str().unwrap()),
+        ],
+    );
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    let pid = read_pids(std::slice::from_ref(&job_pid))[0];
+    let started = Instant::now();
+    runner.signal(libc::SIGTERM);
+    thread::sleep(Duration::from_millis(100));
+    runner.signal(libc::SIGTERM);
+
+    assert!(!runner.wait(Duration::from_secs(4)).success());
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(!process_is_running(pid));
+}
+
+#[test]
+fn post_spawn_error_respects_direct_process_signal_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell_pid = temp.path().join("shell.pid");
+    let child_pid = temp.path().join("child.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let fault_library = build_identity_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  direct:\n    command: \"sleep 30 & echo $! > {child}; echo $$ > {shell}; wait\"\n    process_group: false\n    restart_delay: 30000\n",
+            child = child_pid.display(),
+            shell = shell_pid.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![child_pid.clone()]);
+
+    let mut runner = Runner::start_with_env(
+        &config,
+        log,
+        &[],
+        &[
+            ("LD_PRELOAD", fault_library.to_str().unwrap()),
+            (
+                "JOB_RUNNER_IDENTITY_FAULT_READY",
+                child_pid.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&shell_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&child_pid)).is_empty()
+    }));
+    let shell = read_pids(std::slice::from_ref(&shell_pid))[0];
+    let child = read_pids(std::slice::from_ref(&child_pid))[0];
+    assert!(wait_until(Duration::from_secs(3), || !process_is_running(
+        shell
+    )));
+    assert!(
+        process_is_running(child),
+        "direct-process recovery killed an unmanaged background child: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
+fn atomic_binary_replacement_does_not_break_job_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("job-runner-rs");
+    let replacement = temp.path().join("job-runner-rs.new");
+    let runs = temp.path().join("runs");
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let config = temp.path().join("jobs.yaml");
+    let log_path = temp.path().join("runner.log");
+    fs::copy(env!("CARGO_BIN_EXE_job-runner-rs"), &executable).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  restart:\n    command: |\n      echo $$ >> {runs}\n      if [ \"$(wc -l < {runs})\" -eq 1 ]; then\n        touch {ready}\n        while [ ! -e {release} ]; do sleep 0.01; done\n      fi\n    restart_delay: 100\n",
+            runs = runs.display(),
+            ready = ready.display(),
+            release = release.display(),
+        ),
+    )
+    .unwrap();
+    let log = File::create(&log_path).unwrap();
+    let mut command = Command::new(&executable);
+    command
+        .arg(&config)
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut runner = Runner::spawn_in_session(command, log_path);
+    assert!(wait_until(Duration::from_secs(3), || ready.exists()));
+
+    fs::copy(env!("CARGO_BIN_EXE_job-runner-rs"), &replacement).unwrap();
+    fs::rename(&replacement, &executable).unwrap();
+    File::create(&release).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            fs::read_to_string(&runs).is_ok_and(|contents| contents.lines().count() >= 2)
+        }),
+        "job did not restart after executable replacement: {}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+}
+
+#[test]
+fn invalid_datetime_format_is_rejected_before_jobs_start() {
+    for (index, format) in ["%Q", "%#z"].into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("started");
+        let config = temp.path().join("jobs.yaml");
+        let log = temp.path().join(format!("runner-{index}.log"));
+        fs::write(
+            &config,
+            format!(
+                "jobs:\n  invalid_datetime:\n    command: \"touch {}\"\n    datetime:\n      enabled: true\n      format: \"{}\"\n",
+                marker.display(),
+                format
+            ),
+        )
+        .unwrap();
+
+        let mut runner = Runner::start(&config, log, &[]);
+        let status = runner.wait(Duration::from_secs(3));
+        assert!(!status.success());
+        assert!(
+            !marker.exists(),
+            "job started with invalid datetime format {format:?}"
+        );
+        assert!(
+            runner.log().contains("invalid datetime format"),
+            "invalid format {format:?} was not diagnosed: {}",
+            runner.log()
+        );
+    }
+}
+
+#[test]
 fn idle_supervision_has_a_bounded_syscall_and_cpu_cost() {
     let _resource_guard = serialize_resource_intensive_test();
     let temp = tempfile::tempdir().unwrap();
@@ -799,36 +1752,22 @@ fn proc_churn_does_not_stop_scanner() {
     )
     .unwrap();
 
-    let mut runner = Runner::start(&config, log, &[]);
+    let mut runner =
+        Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "50")]);
     assert!(wait_until(Duration::from_secs(3), || ready.exists()));
-    let churn: Vec<_> = (0..4)
-        .map(|_| {
-            thread::spawn(|| {
-                // The parser unit test is the deterministic dead-task regression; this is a soak.
-                for _ in 0..1000 {
-                    let pid = fork_with_retry();
-                    if pid == 0 {
-                        unsafe { libc::_exit(0) };
-                    }
-                    let mut status = 0;
-                    loop {
-                        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-                        if waited == pid {
-                            break;
-                        }
-                        assert_eq!(
-                            std::io::Error::last_os_error().raw_os_error(),
-                            Some(libc::EINTR),
-                            "waitpid failed"
-                        );
-                    }
-                }
-            })
-        })
-        .collect();
-    for handle in churn {
-        handle.join().unwrap();
-    }
+    let fork_count = Arc::new(AtomicUsize::new(0));
+    let churn = ChurnGuard::start(2, fork_count.clone());
+    assert!(wait_until(Duration::from_secs(3), || {
+        fork_count.load(Ordering::Relaxed) >= 20
+    }));
+    let reads_before = process_read_syscalls(runner.child.id()).unwrap();
+    thread::sleep(Duration::from_millis(250));
+    let reads_after = process_read_syscalls(runner.child.id()).unwrap();
+    churn.stop();
+    assert!(
+        reads_after > reads_before,
+        "process scanner did not capture while process churn was active"
+    );
     assert!(runner.is_running(), "process churn stopped the supervisor");
     assert!(
         !runner.log().contains("Process scanner failed"),
@@ -840,7 +1779,7 @@ fn proc_churn_does_not_stop_scanner() {
 }
 
 #[test]
-fn job_group_signal_cannot_kill_the_supervisor() {
+fn job_group_signal_cannot_directly_signal_the_supervisor() {
     let temp = tempfile::tempdir().unwrap();
     let runs = temp.path().join("runs");
     let script = temp.path().join("self-kill.sh");
@@ -861,18 +1800,17 @@ fn job_group_signal_cannot_kill_the_supervisor() {
     let _cleanup = ProcessCleanup(vec![runs.clone()]);
 
     let mut runner = Runner::start(&config, log, &[]);
-    assert!(wait_until(Duration::from_secs(3), || {
-        fs::read_to_string(&runs)
-            .map(|contents| contents.lines().count() >= 2)
-            .unwrap_or(false)
-    }));
+    let status = runner.wait(Duration::from_secs(3));
     assert!(
-        runner.is_running(),
-        "job killed supervisor: {}",
+        !status.success() && status.code() == Some(1),
+        "lost shim did not stop supervision safely: {}",
         runner.log()
     );
-    runner.signal(libc::SIGTERM);
-    assert!(runner.wait(Duration::from_secs(3)).success());
+    assert_eq!(
+        fs::read_to_string(&runs).unwrap().lines().count(),
+        1,
+        "job restarted without shim cleanup confirmation"
+    );
 }
 
 #[test]
@@ -1130,19 +2068,21 @@ fn natural_exit_cleans_daemon_reparented_before_the_first_scan() {
 fn reconciled_escapee_is_contained_after_abnormal_shim_exit() {
     let temp = tempfile::tempdir().unwrap();
     let shim_pid = temp.path().join("shim.pid");
+    let workload_pid = temp.path().join("workload.pid");
     let descendant_pid = temp.path().join("descendant.pid");
     let config = temp.path().join("jobs.yaml");
     let log = temp.path().join("runner.log");
     fs::write(
         &config,
         format!(
-            "jobs:\n  observed_escapee:\n    command: |\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      echo $PPID > {shim_pid}\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            "jobs:\n  observed_escapee:\n    command: |\n      echo $$ > {workload_pid}\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      echo $PPID > {shim_pid}\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            workload_pid = workload_pid.display(),
             descendant_pid = descendant_pid.display(),
             shim_pid = shim_pid.display(),
         ),
     )
     .unwrap();
-    let _cleanup = ProcessCleanup(vec![descendant_pid.clone()]);
+    let _cleanup = ProcessCleanup(vec![workload_pid, descendant_pid.clone()]);
 
     let mut runner =
         Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "100")]);
@@ -1159,50 +2099,60 @@ fn reconciled_escapee_is_contained_after_abnormal_shim_exit() {
         "previously reconciled escapee survived abnormal shim exit: {}",
         runner.log()
     );
-
-    runner.signal(libc::SIGTERM);
-    assert!(runner.wait(Duration::from_secs(4)).success());
+    assert!(
+        !runner.wait(Duration::from_secs(4)).success(),
+        "abnormal shim exit did not fail supervision"
+    );
 }
 
 #[test]
-fn new_escapee_can_outlive_abnormal_shim_exit_without_wrapper() {
+fn unreconciled_escapee_stops_restart_after_abnormal_shim_exit() {
     let temp = tempfile::tempdir().unwrap();
     let shim_pid = temp.path().join("shim.pid");
+    let workload_pid = temp.path().join("workload.pid");
     let descendant_pid = temp.path().join("descendant.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.yaml");
     let log = temp.path().join("runner.log");
     fs::write(
         &config,
         format!(
-            "jobs:\n  new_escapee:\n    command: |\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      echo $PPID > {shim_pid}\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            "jobs:\n  new_escapee:\n    command: |\n      echo $$ > {workload_pid}\n      echo $PPID > {shim_pid}\n      while [ ! -e {release} ]; do sleep 0.01; done\n      ( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\n      while [ ! -s {descendant_pid} ]; do sleep 0.01; done\n      while :; do sleep 1; done\n    restart_delay: 10000\n",
+            workload_pid = workload_pid.display(),
             descendant_pid = descendant_pid.display(),
             shim_pid = shim_pid.display(),
+            release = release.display(),
         ),
     )
     .unwrap();
-    let _cleanup = ProcessCleanup(vec![descendant_pid.clone()]);
+    let _cleanup = ProcessCleanup(vec![workload_pid, descendant_pid.clone()]);
 
     let mut runner =
         Runner::start_with_env(&config, log, &[], &[(TEST_RECONCILE_INTERVAL_ENV, "30000")]);
     assert!(wait_until(Duration::from_secs(3), || {
         !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
-            && !read_pids(std::slice::from_ref(&descendant_pid)).is_empty()
+            && runner.log().contains("Started (pid")
+    }));
+    File::create(&release).unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&descendant_pid)).is_empty()
     }));
     let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
     let descendant = read_pids(std::slice::from_ref(&descendant_pid))[0];
     assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
-    thread::sleep(Duration::from_millis(500));
+    let status = runner.wait(Duration::from_secs(4));
+    assert!(!status.success(), "abnormal shim exit returned success");
     assert!(
         process_is_running(descendant),
         "unreconciled escapee was unexpectedly attributed after abnormal shim exit: {}",
         runner.log()
     );
-
-    runner.signal(libc::SIGTERM);
-    assert!(runner.wait(Duration::from_secs(4)).success());
     assert!(
-        process_is_running(descendant),
-        "non-wrapper runner claimed containment of an unattributed escapee"
+        runner
+            .log()
+            .contains("without confirming descendant cleanup"),
+        "missing shim completion was not reported: {}",
+        runner.log()
     );
 }
 
@@ -1605,13 +2555,86 @@ fn blocked_runner_stderr_does_not_delay_shutdown() {
     .unwrap();
     let _cleanup = ProcessCleanup(vec![pid_file.clone()]);
 
-    let mut runner = Runner::start_with_unread_stderr(&config, log);
+    let mut runner = Runner::start_with_unread_stderr(&config, log, &[]);
     assert!(wait_until(Duration::from_secs(3), || pid_file.exists()));
     thread::sleep(Duration::from_millis(300));
     runner.signal(libc::SIGTERM);
     assert!(
         runner.wait(Duration::from_secs(4)).success(),
         "blocked stderr stalled shutdown"
+    );
+}
+
+#[test]
+fn blocked_wrapper_stderr_does_not_block_reconciliation() {
+    let _resource_guard = serialize_resource_intensive_test();
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("job.pids");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("wrapper.stdout");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  blocked:\n    command: \"echo $$ > {0}; echo $PPID >> {0}; head -c 8000000 /dev/zero >&2; exec sleep 30\"\n    restart_delay: 10000\n    shutdown_timeout: 0\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![pid_file.clone()]);
+
+    let mut wrapper = Runner::start_with_unread_stderr(&config, log, &["--wrap"]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        read_pids(std::slice::from_ref(&pid_file)).len() == 2
+    }));
+    let job_pids = read_pids(std::slice::from_ref(&pid_file));
+    let shim = job_pids[1];
+    let inner = parent_process_id(shim).expect("inner runner PID unavailable");
+    assert_eq!(
+        unsafe { libc::kill(inner as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    wrapper.signal(libc::SIGTERM);
+
+    assert!(
+        wrapper.wait(Duration::from_secs(6)).success(),
+        "blocked stderr stalled wrapper reconciliation"
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || job_pids
+            .iter()
+            .all(|pid| !process_is_running(*pid))),
+        "wrapper left descendants alive"
+    );
+}
+
+#[test]
+fn blocked_stderr_does_not_block_final_supervision_error() {
+    let _resource_guard = serialize_resource_intensive_test();
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("job.pids");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.stdout");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  blocked:\n    command: \"echo $$ > {0}; echo $PPID >> {0}; head -c 8000000 /dev/zero >&2; exec sleep 30\"\n    restart_delay: 10000\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![pid_file.clone()]);
+
+    let mut runner = Runner::start_with_unread_stderr(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        read_pids(std::slice::from_ref(&pid_file)).len() == 2
+    }));
+    let job_pids = read_pids(std::slice::from_ref(&pid_file));
+    let shim = job_pids[1];
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+
+    assert!(
+        !runner.wait(Duration::from_secs(6)).success(),
+        "blocked stderr stalled final supervisor failure reporting"
     );
 }
 
@@ -1647,6 +2670,252 @@ fn second_termination_signal_forces_shutdown() {
     runner.signal(libc::SIGTERM);
     assert!(runner.wait(Duration::from_secs(4)).success());
     assert!(!process_is_running(pid));
+}
+
+#[test]
+fn shim_startup_output_is_drained_before_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let shim_pid = temp.path().join("shim.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    let probe = build_shim_startup_probe_library(temp.path());
+    let command = format!("echo $$ > {}; exec sleep 30", job_pid.display());
+    let config_data = serde_json::json!({
+        "jobs": {
+            "job": {
+                "command": command,
+                "shutdown_timeout": 1,
+                "env": {
+                    "LD_DEBUG": "all",
+                    "LD_PRELOAD": probe,
+                    "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
+                }
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_data).unwrap()).unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone(), shim_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+        }),
+        "loader diagnostics blocked shim readiness: {}",
+        runner.log()
+    );
+    assert!(!read_pids(std::slice::from_ref(&shim_pid)).is_empty());
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn shutdown_interrupts_a_stopped_unready_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    let probe = build_shim_startup_probe_library(temp.path());
+    let config_data = serde_json::json!({
+        "jobs": {
+            "job": {
+                "command": "exec sleep 30",
+                "shutdown_timeout": 1,
+                "env": {
+                    "LD_PRELOAD": probe,
+                    "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
+                    "JOB_RUNNER_STOP_SHIM_STARTUP": "1",
+                }
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_data).unwrap()).unwrap();
+    let _cleanup = ProcessCleanup(vec![shim_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+    }));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    assert_eq!(process_state(shim), Some('T'));
+    runner.signal(libc::SIGTERM);
+    assert!(
+        runner.wait(Duration::from_secs(5)).success(),
+        "stopped unready shim disabled shutdown: {}",
+        runner.log()
+    );
+    assert!(!process_is_running(shim));
+}
+
+#[test]
+fn unready_shim_cleanup_kills_an_already_started_escapee() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let escapee_pid = temp.path().join("escapee.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    let probe = build_shim_startup_probe_library(temp.path());
+    let command = format!(
+        "setsid sh -c 'echo $$ > {}; exec sleep 30' & wait",
+        escapee_pid.display()
+    );
+    let config_data = serde_json::json!({
+        "jobs": {
+            "job": {
+                "command": command,
+                "shutdown_timeout": 1,
+                "env": {
+                    "LD_PRELOAD": probe,
+                    "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
+                    "JOB_RUNNER_STOP_READY_WRITE_FOR": escapee_pid,
+                }
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_data).unwrap()).unwrap();
+    let _cleanup = ProcessCleanup(vec![shim_pid.clone(), escapee_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&escapee_pid)).is_empty()
+    }));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    let escapee = read_pids(std::slice::from_ref(&escapee_pid))[0];
+    assert!(wait_until(Duration::from_secs(1), || {
+        process_state(shim) == Some('T')
+    }));
+    runner.signal(libc::SIGTERM);
+
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert!(
+        wait_until(Duration::from_secs(2), || !process_is_running(escapee)),
+        "unready shim cleanup left an escaped workload alive"
+    );
+}
+
+#[test]
+fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let holder_pid = temp.path().join("holder.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    let probe = build_shim_startup_probe_library(temp.path());
+    let config_data = serde_json::json!({
+        "jobs": {
+            "job": {
+                "command": "exec sleep 30",
+                "shutdown_timeout": 1,
+                "env": {
+                    "LD_PRELOAD": probe,
+                    "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
+                    "JOB_RUNNER_COMPLETION_HOLDER_PID": holder_pid,
+                    "JOB_RUNNER_STOP_SHIM_STARTUP": "1",
+                }
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_data).unwrap()).unwrap();
+    let _cleanup = ProcessCleanup(vec![shim_pid.clone(), holder_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&holder_pid)).is_empty()
+    }));
+    let holder = read_pids(std::slice::from_ref(&holder_pid))[0];
+    assert!(process_is_running(holder));
+    runner.signal(libc::SIGTERM);
+
+    let started = Instant::now();
+    let status = runner.wait(Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        !status.success(),
+        "inherited completion writer was accepted as confirmed cleanup"
+    );
+    assert!(
+        process_is_running(holder),
+        "test did not retain the inherited completion writer"
+    );
+}
+
+#[test]
+fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let shim_pid = temp.path().join("shim.pid");
+    let workload_pid = temp.path().join("workload.pid");
+    let helper_escapee_pid = temp.path().join("helper-escapee.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    for path in [&workload_pid, &helper_escapee_pid] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let probe = build_shim_startup_probe_library(temp.path());
+    let path = install_unready_cleanup_leaking_sudo(temp.path(), &helper_escapee_pid);
+    let config_data = serde_json::json!({
+        "jobs": {
+            "job": {
+                "command": format!(
+                    "exec setsid sh -c 'echo $$ > {}; exec sleep 30'",
+                    workload_pid.display()
+                ),
+                "sudo_user": username,
+                "shutdown_timeout": 1,
+            }
+        }
+    });
+    fs::write(&config, serde_json::to_vec(&config_data).unwrap()).unwrap();
+    let _workload_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: workload_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_escapee_pid.clone()]);
+
+    let environment = [
+        ("LD_PRELOAD", probe.to_str().unwrap()),
+        ("JOB_RUNNER_SHIM_STARTUP_PID", shim_pid.to_str().unwrap()),
+        (
+            "JOB_RUNNER_STOP_READY_WRITE_FOR",
+            workload_pid.to_str().unwrap(),
+        ),
+    ];
+    let mut runner = Runner::start_with_path_and_env(&config, log, &path, &environment);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&shim_pid)).is_empty()
+                && !read_pids(std::slice::from_ref(&workload_pid)).is_empty()
+        }),
+        "unready sudo workload did not start: {}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "unready cleanup ignored signal-helper containment failure: {}",
+        runner.log()
+    );
+    assert!(
+        read_pids(std::slice::from_ref(&helper_escapee_pid))
+            .into_iter()
+            .any(process_is_running),
+        "test did not exercise a surviving signal-helper descendant"
+    );
 }
 
 #[test]
@@ -1745,6 +3014,47 @@ fn wrapper_restarts_a_killed_inner_runner_and_stops_during_backoff() {
         start.elapsed() < Duration::from_secs(4),
         "wrapper backoff was not interruptible"
     );
+}
+
+#[test]
+fn wrapper_identity_failure_reconciles_started_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("wrapper.log");
+    let fault_library = build_identity_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  identity_failure:\n    command: \"echo $$ > {}; exec sleep 30\"\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone()]);
+    let environment = [
+        ("LD_PRELOAD", fault_library.to_str().unwrap()),
+        ("JOB_RUNNER_IDENTITY_FAULT_READY", job_pid.to_str().unwrap()),
+    ];
+
+    let mut wrapper = Runner::start_with_env(&config, log, &["--wrap"], &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    let job = read_pids(std::slice::from_ref(&job_pid))[0];
+    assert!(
+        wait_until(Duration::from_secs(5), || !process_is_running(job)),
+        "wrapper identity failure left a started job alive: {}",
+        wrapper.log()
+    );
+    assert!(
+        wrapper.is_running(),
+        "wrapper stopped after successful reconciliation: {}",
+        wrapper.log()
+    );
+
+    wrapper.signal(libc::SIGTERM);
+    assert!(wrapper.wait(Duration::from_secs(5)).success());
 }
 
 #[test]
@@ -2018,6 +3328,1221 @@ fn cross_uid_sudo_signals_and_stops_job() {
 }
 
 #[test]
+fn stalled_sudo_term_helper_respects_zero_shutdown_timeout() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = install_hanging_term_signal_sudo(temp.path(), None);
+    let pid_file = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  deadline:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            pid_file.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: pid_file.clone(),
+    };
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&pid_file)).is_empty()
+    }));
+    let started = Instant::now();
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "zero shutdown timeout waited for stalled TERM helper"
+    );
+}
+
+#[test]
+fn second_termination_signal_interrupts_stalled_sudo_delivery() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = install_hanging_term_signal_sudo(temp.path(), None);
+    let pid_file = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  escalation:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 30\n",
+            pid_file.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: pid_file.clone(),
+    };
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&pid_file)).is_empty()
+    }));
+    let started = Instant::now();
+    runner.signal(libc::SIGTERM);
+    thread::sleep(Duration::from_millis(100));
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "second termination signal did not interrupt stalled delivery"
+    );
+}
+
+#[test]
+fn shutdown_interrupts_stalled_user_signal_delivery_across_jobs() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = install_hanging_usr1_signal_sudo(temp.path());
+    let pid_file = temp.path().join("jobs.pids");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    File::create(&pid_file).unwrap();
+    let mut permissions = fs::metadata(&pid_file).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&pid_file, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  first:\n    command: \"echo $$ >> {0}; exec sleep 30\"\n    sudo_user: {1}\n    shutdown_timeout: 0\n  second:\n    command: \"echo $$ >> {0}; exec sleep 30\"\n    sudo_user: {1}\n    shutdown_timeout: 0\n",
+            pid_file.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: pid_file.clone(),
+    };
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        read_pids(std::slice::from_ref(&pid_file)).len() == 2
+    }));
+    let started = Instant::now();
+    runner.signal(libc::SIGUSR1);
+    thread::sleep(Duration::from_millis(100));
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(4)).success());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "stalled user-signal delivery delayed shutdown"
+    );
+}
+
+#[test]
+fn stalled_user_signal_forwarding_is_coalesced() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let invocations = temp.path().join("helpers.pids");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let path = install_counting_hanging_usr1_signal_sudo(temp.path(), &invocations);
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  bounded_forwarding:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: job_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![invocations.clone()]);
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    for _ in 0..12 {
+        runner.signal(libc::SIGUSR1);
+        thread::sleep(Duration::from_millis(35));
+    }
+    assert!(wait_until(Duration::from_secs(2), || {
+        !read_pids(std::slice::from_ref(&invocations)).is_empty()
+    }));
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        read_pids(std::slice::from_ref(&invocations)).len(),
+        1,
+        "stalled forwarding spawned concurrent helpers: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert!(
+        read_pids(std::slice::from_ref(&invocations))
+            .iter()
+            .all(|pid| !process_is_running(*pid))
+    );
+}
+
+#[test]
+fn coalesced_user_signal_forwarding_preserves_signal_order() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let invocations = temp.path().join("signals");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let path = install_slow_signal_sudo(temp.path(), &invocations);
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  ordered_forwarding:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username,
+        pid_path: job_pid.clone(),
+    };
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    thread::sleep(Duration::from_millis(20));
+    runner.signal(libc::SIGUSR2);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !fs::read_to_string(&invocations)
+            .is_ok_and(|contents| contents.lines().any(|signal| signal == "-USR2"))
+    {
+        runner.signal(libc::SIGUSR1);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fs::read_to_string(&invocations)
+            .is_ok_and(|contents| contents.lines().any(|signal| signal == "-USR2")),
+        "pending USR2 was starved by USR1 traffic: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    let status = runner.wait(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "runner exited with {status}: {}",
+        runner.log()
+    );
+}
+
+#[test]
+fn shutdown_cleans_forked_signal_helper_descendants() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let helper_pid = temp.path().join("helper.pid");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.clone(),
+        pid_path: job_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone()]);
+    let path = install_forking_usr1_signal_sudo(temp.path(), &helper_pid);
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+    }));
+    let helper = read_pids(std::slice::from_ref(&helper_pid))[0];
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert!(
+        wait_until(Duration::from_secs(2), || !process_is_running(helper)),
+        "signal helper descendant survived shutdown: {}",
+        runner.log()
+    );
+}
+
+#[test]
+fn completed_failing_signal_helper_cleans_its_descendants() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let helper_pid = temp.path().join("helper.pid");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.clone(),
+        pid_path: job_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone()]);
+    let path = install_exiting_forking_usr1_signal_sudo(temp.path(), &helper_pid);
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+    }));
+    let helper = read_pids(std::slice::from_ref(&helper_pid))[0];
+    assert!(
+        wait_until(Duration::from_secs(3), || !process_is_running(helper)),
+        "completed signal helper left a child alive: {}",
+        runner.log()
+    );
+    assert!(
+        runner.is_running(),
+        "signal-helper failure stopped supervision"
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn surviving_signal_helper_root_stops_supervision() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let helper_pid = temp.path().join("helper.pid");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let fault_library =
+        build_helper_root_fault_library(temp.path(), &helper_pid, "job-runner-signal");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username,
+        pid_path: job_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone()]);
+    let environment = [("LD_PRELOAD", fault_library.to_str().unwrap())];
+
+    let mut runner = Runner::start_with_env(&config, log, &[], &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+    }));
+    let helper = read_pids(std::slice::from_ref(&helper_pid))[0];
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "surviving signal-helper root did not stop supervision: {}",
+        runner.log()
+    );
+    assert!(
+        process_is_running(helper),
+        "test did not retain the signal-helper root"
+    );
+}
+
+#[test]
+fn unresolved_signal_helper_root_stops_supervision() {
+    exercise_unresolved_signal_helper_root(false);
+}
+
+#[test]
+fn unresolved_own_root_prevents_shim_cleanup_confirmation() {
+    exercise_unresolved_signal_helper_root(true);
+}
+
+fn exercise_unresolved_signal_helper_root(fault_shim_own_root: bool) {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let escapee_pid = temp.path().join("signal-helper-escapee.pid");
+    let fault_marker = temp.path().join("partial-capture-faults");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let fault_library = build_partial_helper_capture_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 0\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username,
+        pid_path: job_pid.clone(),
+    };
+    let _escapee_cleanup = ProcessCleanup(vec![escapee_pid.clone()]);
+    let path = install_partial_capture_signal_sudo(temp.path(), &escapee_pid, !fault_shim_own_root);
+    let mut environment = vec![
+        ("LD_PRELOAD", fault_library.to_str().unwrap()),
+        ("JOB_RUNNER_PARTIAL_CAPTURE_HELPER", "job-runner-signal"),
+    ];
+    if fault_shim_own_root {
+        environment.push(("JOB_RUNNER_PARTIAL_CAPTURE_OWN_ROOT", "1"));
+        environment.push((
+            "JOB_RUNNER_PARTIAL_CAPTURE_FAULT_MARKER",
+            fault_marker.to_str().unwrap(),
+        ));
+    }
+
+    let mut runner = Runner::start_with_path_and_env(&config, log, &path, &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&escapee_pid)).is_empty()
+    }));
+    let escapee = read_pids(std::slice::from_ref(&escapee_pid))[0];
+    if fault_shim_own_root {
+        assert!(
+            wait_until(Duration::from_secs(5), || !process_is_running(escapee)),
+            "helper shim falsely confirmed cleanup after its root was unresolved: {}",
+            runner.log()
+        );
+        assert!(
+            fs::metadata(&fault_marker).is_ok_and(|metadata| metadata.len() > 0),
+            "own-root fault was not exercised"
+        );
+        assert!(runner.is_running());
+        runner.signal(libc::SIGTERM);
+        assert!(runner.wait(Duration::from_secs(5)).success());
+    } else {
+        let status = runner.wait(Duration::from_secs(8));
+        assert!(
+            !status.success(),
+            "unresolved signal-helper root did not stop supervision: {}",
+            runner.log()
+        );
+        assert!(
+            process_is_running(escapee),
+            "test did not retain the unattributable helper escapee"
+        );
+    }
+}
+
+#[test]
+fn cross_uid_helper_cleanup_contains_reconciliation_escapees() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let privileged_descendant = temp.path().join("privileged-helper.pid");
+    let reconcile_escapee = temp.path().join("reconcile-escapee.pid");
+    let invocations = temp.path().join("sudo-invocations");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&privileged_descendant, &reconcile_escapee, &invocations] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let _privileged_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: privileged_descendant.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![reconcile_escapee.clone()]);
+    let path = install_cross_uid_helper_escape_sudo(
+        temp.path(),
+        &privileged_descendant,
+        &reconcile_escapee,
+        &invocations,
+    );
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&privileged_descendant)).is_empty()
+        }),
+        "privileged signal-helper descendant did not start: {}",
+        runner.log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&reconcile_escapee)).is_empty()
+        }),
+        "privileged reconciliation helper did not run: {}; sudo invocations: {}",
+        runner.log(),
+        fs::read_to_string(&invocations).unwrap_or_default()
+    );
+    let helper_pids = read_pids(&[privileged_descendant.clone(), reconcile_escapee.clone()]);
+    assert_eq!(helper_pids.len(), 2);
+    assert!(
+        wait_until(Duration::from_secs(5), || helper_pids
+            .iter()
+            .all(|pid| !process_is_running(*pid))),
+        "helper cleanup left a privileged or escaped descendant alive: {}",
+        runner.log()
+    );
+    assert!(
+        runner.is_running(),
+        "signal-helper failure stopped supervision"
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn surviving_reconciliation_helper_root_stops_supervision() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let privileged_pid = temp.path().join("privileged.pid");
+    let helper_pid = temp.path().join("reconcile-helper.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&job_pid, &privileged_pid] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let _privileged_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: privileged_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone()]);
+    let fault_library =
+        build_helper_root_fault_library(temp.path(), &helper_pid, "job-runner-reconcile");
+    let path = install_expiring_privileged_helper_sudo(temp.path(), &privileged_pid);
+    let environment = [("LD_PRELOAD", fault_library.to_str().unwrap())];
+
+    let mut runner = Runner::start_with_path_and_env(&config, log, &path, &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+    }));
+    let helper = read_pids(std::slice::from_ref(&helper_pid))[0];
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "surviving reconciliation-helper root did not stop supervision: {}",
+        runner.log()
+    );
+    assert!(
+        process_is_running(helper),
+        "test did not retain the reconciliation-helper root"
+    );
+}
+
+#[test]
+fn unresolved_reconciliation_helper_root_stops_supervision() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let privileged_pid = temp.path().join("privileged.pid");
+    let escapee_pid = temp.path().join("reconcile-helper-escapee.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&job_pid, &privileged_pid] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let fault_library = build_partial_helper_capture_fault_library(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let _privileged_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: privileged_pid.clone(),
+    };
+    let _escapee_cleanup = ProcessCleanup(vec![escapee_pid.clone()]);
+    let path = install_partial_capture_reconcile_sudo(temp.path(), &privileged_pid, &escapee_pid);
+    let environment = [
+        ("LD_PRELOAD", fault_library.to_str().unwrap()),
+        ("JOB_RUNNER_PARTIAL_CAPTURE_HELPER", "job-runner-reconcile"),
+    ];
+
+    let mut runner = Runner::start_with_path_and_env(&config, log, &path, &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&escapee_pid)).is_empty()
+    }));
+    let escapee = read_pids(std::slice::from_ref(&escapee_pid))[0];
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "unresolved reconciliation-helper root did not stop supervision: {}",
+        runner.log()
+    );
+    assert!(
+        process_is_running(escapee),
+        "test did not retain the unattributable reconciliation escapee"
+    );
+}
+
+#[test]
+fn reconciliation_completion_failure_is_not_erased_after_targets_exit() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let runs = temp.path().join("runs");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&job_pid, &runs] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let command = format!(
+        "echo run >> {runs}; (setsid sh -c 'echo $$ > {job_pid}; exec sleep 30' &); while [ ! -s {job_pid} ]; do sleep 0.01; done",
+        runs = runs.display(),
+        job_pid = job_pid.display(),
+    );
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  cleanup_confirmation:\n    command: {}\n    sudo_user: {username}\n    restart_delay: 100\n    shutdown_timeout: 0\n",
+            serde_json::to_string(&command).unwrap()
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let path = install_killing_reconcile_sudo(temp.path());
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "reconciliation-helper containment failure allowed a restart: {}",
+        runner.log()
+    );
+    assert_eq!(
+        fs::read_to_string(&runs).unwrap().lines().count(),
+        1,
+        "job restarted after unconfirmed reconciliation-helper cleanup"
+    );
+}
+
+#[test]
+fn reconciliation_helper_containment_failure_stops_supervision() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let privileged_descendant = temp.path().join("privileged-helper.pid");
+    let reconcile_escapee = temp.path().join("reconcile-escapee.pid");
+    let reconcile_marker = temp.path().join("reconcile-started");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&privileged_descendant, &reconcile_escapee] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let _privileged_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: privileged_descendant.clone(),
+    };
+    let _escapee_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: reconcile_escapee.clone(),
+    };
+    let path = install_leaking_cross_uid_reconcile_sudo(
+        temp.path(),
+        &privileged_descendant,
+        &reconcile_escapee,
+        &reconcile_marker,
+    );
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&privileged_descendant)).is_empty()
+    }));
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&reconcile_escapee)).is_empty()
+    }));
+
+    let status = runner.wait(Duration::from_secs(8));
+    assert!(
+        !status.success(),
+        "runner ignored helper containment failure"
+    );
+    assert!(
+        runner.log().contains("Signal helper containment failed"),
+        "{}",
+        runner.log()
+    );
+    let privileged = read_pids(std::slice::from_ref(&privileged_descendant))[0];
+    assert!(
+        !process_is_running(privileged),
+        "original privileged helper target survived"
+    );
+    assert!(
+        read_pids(std::slice::from_ref(&reconcile_escapee))
+            .into_iter()
+            .any(process_is_running),
+        "test did not exercise a surviving reconciliation-helper escapee"
+    );
+}
+
+#[test]
+fn reconciliation_scan_failure_stops_supervision() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let privileged_descendant = temp.path().join("privileged-helper.pid");
+    let reconcile_escapee = temp.path().join("reconcile-escapee.pid");
+    let reconcile_marker = temp.path().join("reconcile-started");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    for path in [&privileged_descendant, &reconcile_escapee] {
+        File::create(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  helper_cleanup:\n    command: \"echo $$ > {}; exec sleep 30\"\n    sudo_user: {username}\n    shutdown_timeout: 0\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: job_pid.clone(),
+    };
+    let _privileged_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: privileged_descendant.clone(),
+    };
+    let _escapee_cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: reconcile_escapee.clone(),
+    };
+    let fault_library = build_proc_capture_fault_library(temp.path());
+    let path = install_leaking_cross_uid_reconcile_sudo(
+        temp.path(),
+        &privileged_descendant,
+        &reconcile_escapee,
+        &reconcile_marker,
+    );
+    let environment = [
+        ("LD_PRELOAD", fault_library.to_str().unwrap()),
+        (
+            "JOB_RUNNER_PROC_FAULT_MARKER",
+            reconcile_marker.to_str().unwrap(),
+        ),
+    ];
+
+    let mut runner = Runner::start_with_path_and_env(&config, log, &path, &environment);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&privileged_descendant)).is_empty()
+    }));
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&reconcile_escapee)).is_empty()
+    }));
+
+    let status = runner.wait(Duration::from_secs(8));
+    assert!(
+        !status.success(),
+        "runner ignored an unconfirmed reconciliation-helper scan"
+    );
+    assert!(
+        runner
+            .log()
+            .contains("could not verify sudo cleanup helper descendants"),
+        "{}",
+        runner.log()
+    );
+    let privileged = read_pids(std::slice::from_ref(&privileged_descendant))[0];
+    assert!(
+        !process_is_running(privileged),
+        "original privileged helper target survived"
+    );
+    assert!(
+        read_pids(std::slice::from_ref(&reconcile_escapee))
+            .into_iter()
+            .any(process_is_running),
+        "test did not exercise the descendant hidden by the failed scan"
+    );
+}
+
+#[test]
+fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let escapee = temp.path().join("escapee.pid");
+    let config = temp.path().join("jobs.json");
+    let log = temp.path().join("runner.log");
+    let fault_library = build_partial_helper_capture_fault_library(temp.path());
+    let command = format!(
+        "trap 'setsid sh -c \"echo \\$\\$ > {}; exec sleep 30\" & while [ ! -s {} ]; do sleep 0.001; done; exit 0' TERM; touch {}; while :; do sleep 1; done",
+        escapee.display(),
+        escapee.display(),
+        ready.display()
+    );
+    fs::write(
+        &config,
+        format!(
+            "{{\"jobs\":{{\"job\":{{\"command\":{},\"shutdown_timeout\":5}}}}}}",
+            serde_json::to_string(&command).unwrap()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![escapee.clone()]);
+    let environment = [
+        ("LD_PRELOAD", fault_library.to_str().unwrap()),
+        ("JOB_RUNNER_PARTIAL_CAPTURE_HELPER", ready.to_str().unwrap()),
+        ("JOB_RUNNER_PARTIAL_CAPTURE_OWN_ROOT", "1"),
+        ("JOB_RUNNER_PARTIAL_CAPTURE_INCLUDE_READY", "1"),
+    ];
+
+    let mut runner = Runner::start_with_env(&config, log, &[], &environment);
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    runner.signal(libc::SIGTERM);
+    let status = runner.wait(Duration::from_secs(8));
+
+    assert!(
+        !status.success(),
+        "runner ignored the shim's graceful-shutdown cleanup failure"
+    );
+    assert!(
+        runner
+            .log()
+            .contains("job shim reported a descendant supervision failure"),
+        "{}",
+        runner.log()
+    );
+    assert!(
+        !read_pids(std::slice::from_ref(&escapee)).is_empty(),
+        "TERM handler did not create the escaped descendant"
+    );
+}
+
+#[test]
+fn abrupt_shim_exit_cleans_startup_observed_group_member() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  job:\n    command: \"echo $$ > {}; exec sleep 30\"\n    shutdown_timeout: 1\n",
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+            && first_started_pid(&runner.log()).is_some()
+    }));
+    let job = read_pids(std::slice::from_ref(&job_pid))[0];
+    let shim = first_started_pid(&runner.log()).unwrap();
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+
+    let status = runner.wait(Duration::from_secs(6));
+    assert!(!status.success(), "abrupt shim exit was not fatal");
+    assert!(
+        wait_until(Duration::from_secs(2), || !process_is_running(job)),
+        "startup-observed same-group workload survived: {}",
+        runner.log()
+    );
+}
+
+#[test]
+fn externally_killed_shim_is_not_mistaken_for_later_escalation() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let shim_pid = temp.path().join("shim.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  job:\n    command: \"trap '' TERM; echo $$ > {}; echo $PPID > {}; exec sleep 30\"\n    shutdown_timeout: 2\n",
+            job_pid.display(),
+            shim_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        read_pids(&[job_pid.clone(), shim_pid.clone()]).len() == 2
+    }));
+    runner.signal(libc::SIGTERM);
+    assert!(wait_until(Duration::from_secs(3), || runner
+        .log()
+        .contains("shutting down active processes")));
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+    assert!(wait_until(Duration::from_secs(1), || !process_is_running(
+        shim
+    )));
+
+    let status = runner.wait(Duration::from_secs(6));
+    assert!(
+        !status.success(),
+        "runner treated an earlier external shim kill as its own escalation"
+    );
+    assert!(
+        runner
+            .log()
+            .contains("job shim exited without confirming descendant cleanup"),
+        "{}",
+        runner.log()
+    );
+}
+
+#[test]
+fn stalled_delivery_does_not_hide_a_pre_escalation_shim_exit() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let helper_pid = temp.path().join("term-helper.pid");
+    let job_pid = temp.path().join("job.pid");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    let path = install_hanging_term_signal_sudo(temp.path(), Some(&helper_pid));
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  job:\n    command: \"trap '' TERM; echo $$ > {}; exec sleep 30\"\n    sudo_user: {}\n    shutdown_timeout: 30\n",
+            job_pid.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _job_cleanup = SudoProcessCleanup {
+        username,
+        pid_path: job_pid.clone(),
+    };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone()]);
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+            && first_started_pid(&runner.log()).is_some()
+    }));
+    let shim = first_started_pid(&runner.log()).unwrap();
+    runner.signal(libc::SIGTERM);
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+    }));
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+    assert!(wait_until(Duration::from_secs(1), || !process_is_running(
+        shim
+    )));
+    runner.signal(libc::SIGTERM);
+
+    let status = runner.wait(Duration::from_secs(6));
+    assert!(
+        !status.success(),
+        "stalled signal delivery hid a pre-escalation shim exit"
+    );
+    assert!(
+        runner
+            .log()
+            .contains("job shim exited without confirming descendant cleanup"),
+        "{}",
+        runner.log()
+    );
+}
+
+#[test]
+fn queued_deadline_does_not_hide_a_pre_escalation_shim_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let job_pid = temp.path().join("job.pid");
+    let term_seen = temp.path().join("term-seen");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  job:\n    command: \"trap 'touch {}' TERM; echo $$ > {}; while :; do sleep 1; done\"\n    shutdown_timeout: 1\n",
+            term_seen.display(),
+            job_pid.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![job_pid.clone()]);
+
+    let mut runner = Runner::start(&config, log, &["-t", "1"]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        !read_pids(std::slice::from_ref(&job_pid)).is_empty()
+            && first_started_pid(&runner.log()).is_some()
+    }));
+    let runner_pid = runner.child.id();
+    let shim = first_started_pid(&runner.log()).unwrap();
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(3), || term_seen.exists()),
+        "graceful delivery did not complete: {}",
+        runner.log()
+    );
+
+    assert_eq!(
+        unsafe { libc::kill(runner_pid as libc::pid_t, libc::SIGSTOP) },
+        0
+    );
+    assert!(wait_until(Duration::from_secs(1), || {
+        process_state(runner_pid) == Some('T')
+    }));
+    assert_eq!(unsafe { libc::kill(shim as libc::pid_t, libc::SIGKILL) }, 0);
+    assert!(wait_until(Duration::from_secs(1), || {
+        process_state(shim).is_none_or(|state| state == 'Z')
+    }));
+    thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        unsafe { libc::kill(runner_pid as libc::pid_t, libc::SIGCONT) },
+        0
+    );
+
+    let status = runner.wait(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "runner treated a queued pre-escalation shim exit as its own SIGKILL: {}",
+        runner.log()
+    );
+    assert!(
+        runner
+            .log()
+            .contains("job shim exited without confirming descendant cleanup"),
+        "{}",
+        runner.log()
+    );
+}
+
+#[test]
 fn sudo_signals_nested_and_escaped_workloads_once() {
     let username = "root";
     if !sudo_available_for(username) {
@@ -2094,6 +4619,74 @@ fn sudo_signals_nested_and_escaped_workloads_once() {
     assert!(wait_until(Duration::from_secs(2), || process_ids
         .iter()
         .all(|pid| !process_is_running(*pid))));
+}
+
+#[test]
+fn sudo_named_workload_still_receives_forwarded_signals() {
+    let Some(username) = current_username() else {
+        eprintln!("skipped: current username unavailable");
+        return;
+    };
+    if !sudo_available_for(&username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let received = temp.path().join("received");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    File::create(&received).unwrap();
+    let mut permissions = fs::metadata(&received).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&received, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    let probe = build_signal_probe_named_sudo(temp.path());
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  named_sudo:\n    command: \"exec {} {}\"\n    sudo_user: {}\n    shutdown_timeout: 1\n",
+            probe.display(),
+            received.display(),
+            username
+        ),
+    )
+    .unwrap();
+    let _cleanup = IdentityScopedSudoProcessCleanup {
+        username: username.clone(),
+        identity_path: received.clone(),
+    };
+
+    let mut runner = Runner::start(&config, log, &[]);
+    assert!(wait_until(Duration::from_secs(5), || {
+        fs::read_to_string(&received)
+            .is_ok_and(|contents| contents.lines().any(|line| line == "ready"))
+    }));
+    runner.signal(libc::SIGUSR1);
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            fs::read_to_string(&received)
+                .is_ok_and(|contents| contents.lines().any(|line| line.starts_with("received ")))
+        }),
+        "workload named sudo did not receive USR1: {}",
+        runner.log()
+    );
+
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+}
+
+#[test]
+fn identity_scoped_cleanup_rejects_a_reused_pid() {
+    let pid = std::process::id();
+    let (process_group, start_time) = process_group_and_start_time(pid).unwrap();
+
+    assert_eq!(
+        process_group_for_identity(pid, start_time),
+        Some(process_group)
+    );
+    assert_eq!(process_group_for_identity(pid, start_time + 1), None);
 }
 
 #[test]
@@ -2208,17 +4801,16 @@ fn sudo_job_shim_kills_escaped_descendant_before_exiting() {
 
 #[test]
 fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
-    let Some(username) = current_username() else {
-        eprintln!("skipped: current username unavailable");
-        return;
-    };
-    if !sudo_available_for(&username) {
+    let username = "root";
+    if !sudo_available_for(username) {
         eprintln!("skipped: noninteractive sudo unavailable for {username}");
         return;
     }
 
     let temp = tempfile::tempdir().unwrap();
     let descendant = temp.path().join("descendant.pid");
+    let helper_pid = temp.path().join("helper.pid");
+    let helper_descendant_pid = temp.path().join("helper-descendant.pid");
     let log = temp.path().join("shim.log");
     File::create(&descendant).unwrap();
     let mut permissions = fs::metadata(&descendant).unwrap().permissions();
@@ -2233,14 +4825,14 @@ fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
         descendant.display()
     );
     let output = File::create(&log).unwrap();
-    let path = install_hanging_reconcile_sudo(temp.path());
+    let path = install_hanging_reconcile_sudo(temp.path(), &helper_pid, &helper_descendant_pid);
     let child = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"))
         .args([
             "--job-shim",
             "--shutdown-timeout",
             "1",
             "--sudo-user",
-            &username,
+            username,
             "--",
             &command,
         ])
@@ -2250,24 +4842,34 @@ fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
         .spawn()
         .unwrap();
     let _cleanup = SudoProcessCleanup {
-        username,
+        username: username.to_string(),
         pid_path: descendant.clone(),
     };
+    let _helper_cleanup = ProcessCleanup(vec![helper_pid.clone(), helper_descendant_pid.clone()]);
     let mut shim = Runner {
         child,
         log_path: log,
     };
 
     let started = Instant::now();
+    assert!(wait_until(Duration::from_secs(3), || {
+        !read_pids(std::slice::from_ref(&helper_pid)).is_empty()
+            && !read_pids(std::slice::from_ref(&helper_descendant_pid)).is_empty()
+    }));
     let status = shim.wait(Duration::from_secs(5));
-    assert!(status.success(), "{}", shim.log());
+    assert!(!status.success(), "stalled privileged cleanup was accepted");
     assert!(started.elapsed() < Duration::from_secs(3));
-    let descendant_pid = read_pids(std::slice::from_ref(&descendant))[0];
-    assert!(
-        !process_is_running(descendant_pid),
-        "successfully killed descendant was reported as alive: {}",
-        shim.log()
-    );
+    for pid_path in [&helper_pid, &helper_descendant_pid] {
+        let pid = read_pids(std::slice::from_ref(pid_path))[0];
+        assert!(
+            wait_until(Duration::from_secs(1), || !Path::new(&format!(
+                "/proc/{pid}"
+            ))
+            .exists()),
+            "sudo cleanup helper process {pid} was not reaped: {}",
+            shim.log()
+        );
+    }
 }
 
 #[test]
@@ -2380,6 +4982,56 @@ fn sudo_signal_helper_failure_fails_the_supervisor() {
     assert!(
         !output.contains("Starting in 10.000s"),
         "job restarted: {output}"
+    );
+}
+
+#[test]
+fn sudo_shim_cleanup_failure_stops_restart_without_prior_discovery() {
+    let username = "root";
+    if !sudo_available_for(username) {
+        eprintln!("skipped: noninteractive sudo unavailable for {username}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = install_failing_signal_sudo(temp.path());
+    let escaped_pids = temp.path().join("escaped.pids");
+    let config = temp.path().join("jobs.yaml");
+    let log = temp.path().join("runner.log");
+    File::create(&escaped_pids).unwrap();
+    let mut permissions = fs::metadata(&escaped_pids).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&escaped_pids, permissions).unwrap();
+    let mut permissions = fs::metadata(temp.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(temp.path(), permissions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  failed_cleanup:\n    command: |\n      ( setsid sh -c 'echo $$ >> {escaped_pids}; exec sleep 30' & )\n      while [ ! -s {escaped_pids} ]; do sleep 0.01; done\n      exit 0\n    sudo_user: {username}\n    restart_delay: 100\n",
+            escaped_pids = escaped_pids.display(),
+        ),
+    )
+    .unwrap();
+    let _cleanup = SudoProcessCleanup {
+        username: username.to_string(),
+        pid_path: escaped_pids.clone(),
+    };
+
+    let mut runner = Runner::start_with_path(&config, log, &path);
+    let status = runner.wait(Duration::from_secs(8));
+    assert!(!status.success(), "shim cleanup failure returned success");
+    assert_eq!(
+        read_pids(std::slice::from_ref(&escaped_pids)).len(),
+        1,
+        "job restarted after shim cleanup failure: {}",
+        runner.log()
+    );
+    assert!(
+        runner
+            .log()
+            .contains("job shim reported a descendant supervision failure"),
+        "shim cleanup failure was not propagated: {}",
+        runner.log()
     );
 }
 

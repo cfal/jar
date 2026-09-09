@@ -1,7 +1,8 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use rand::Rng;
 use serde::Deserialize;
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::runtime::Builder;
@@ -37,13 +39,20 @@ const PROCESS_SCAN_WARNING_CHANGE_FLOOR: Duration = Duration::from_secs(1);
 const PROCESS_SCAN_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 const RECONCILE_CONVERGENCE_RESERVE: Duration = Duration::from_millis(250);
+const SIGNAL_HELPER_CLEANUP_RESERVE: Duration = Duration::from_millis(500);
 const SIGNAL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_RETRY_LIMIT: usize = 3;
 const SUDO_SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+const JOB_SHIM_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const JOB_SHIM_COMPLETION_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 // Black-box tests execute the production binary, so this cannot be gated on cfg(test).
 const TEST_PROCESS_RECONCILE_INTERVAL_MS: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
+const JOB_SHIM_READY: u8 = 1;
+const JOB_SHIM_COMPLETED: u8 = 1;
+const JOB_SHIM_FAILED: u8 = 2;
 
 static OUTPUT_SINKS: OnceLock<OutputSinks> = OnceLock::new();
+static CHILD_REAPER: OnceLock<Result<ChildReaper, String>> = OnceLock::new();
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -65,6 +74,137 @@ struct OutputSinks {
 enum OutputMessage {
     Frame(Vec<u8>),
     Flush(SyncSender<()>),
+}
+
+struct ChildReaper {
+    children: Sender<std::process::Child>,
+    wake: OwnedFd,
+}
+
+fn hand_off_child_reaping(child: std::process::Child) -> std::io::Result<()> {
+    let reaper = CHILD_REAPER.get_or_init(|| {
+        let mut descriptors = [-1; 2];
+        if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }
+            == -1
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let wake_reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let wake = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let (children, receiver) = channel::<std::process::Child>();
+        std::thread::Builder::new()
+            .name("job-runner-child-reaper".to_string())
+            .spawn(move || run_child_reaper(receiver, wake_reader))
+            .map(|_| ChildReaper { children, wake })
+            .map_err(|error| error.to_string())
+    });
+    match reaper {
+        Ok(reaper) => {
+            reaper.children.send(child).map_err(|_| {
+                std::io::Error::other("child reaper stopped before accepting a helper process")
+            })?;
+            let wake = [1_u8];
+            let written =
+                unsafe { libc::write(reaper.wake.as_raw_fd(), wake.as_ptr().cast(), wake.len()) };
+            if written == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "could not start child reaper: {error}"
+        ))),
+    }
+}
+
+fn run_child_reaper(receiver: std::sync::mpsc::Receiver<std::process::Child>, wake: OwnedFd) {
+    let mut children: Vec<(std::process::Child, OwnedFd)> = Vec::new();
+    loop {
+        let mut poll_descriptors = Vec::with_capacity(children.len() + 1);
+        poll_descriptors.push(libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        poll_descriptors.extend(children.iter().map(|(_, pidfd)| libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+
+        let ready = unsafe {
+            libc::poll(
+                poll_descriptors.as_mut_ptr(),
+                poll_descriptors.len() as libc::nfds_t,
+                -1,
+            )
+        };
+        if ready == -1 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+
+        if poll_descriptors[0].revents != 0 {
+            drain_child_reaper_wake(&wake);
+            while let Ok(child) = receiver.try_recv() {
+                add_reaper_child(&mut children, child);
+            }
+        }
+        for index in (0..children.len()).rev() {
+            let revents = poll_descriptors
+                .get(index + 1)
+                .map_or(0, |descriptor| descriptor.revents);
+            if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                let (mut child, _) = children.swap_remove(index);
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+fn drain_child_reaper_wake(wake: &OwnedFd) {
+    let mut buffer = [0_u8; 64];
+    loop {
+        let read =
+            unsafe { libc::read(wake.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read > 0 {
+            continue;
+        }
+        if read == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return;
+    }
+}
+
+fn add_reaper_child(
+    children: &mut Vec<(std::process::Child, OwnedFd)>,
+    child: std::process::Child,
+) {
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as libc::c_int };
+    if pidfd >= 0 {
+        children.push((child, unsafe { OwnedFd::from_raw_fd(pidfd) }));
+        return;
+    }
+    let child = Arc::new(Mutex::new(Some(child)));
+    let fallback_child = child.clone();
+    let fallback = std::thread::Builder::new()
+        .name("job-runner-child-reaper-fallback".to_string())
+        .spawn(move || {
+            if let Some(mut child) = lock_or_recover(&fallback_child).take() {
+                let _ = child.wait();
+            }
+        });
+    if fallback.is_err()
+        && let Some(mut child) = lock_or_recover(&child).take()
+    {
+        let _ = child.wait();
+    }
 }
 
 enum ProcessScannerRequest {
@@ -173,6 +313,55 @@ fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && !key.contains(['=', '\0'])
 }
 
+fn datetime_format_is_valid(config: &DateTimeConfig) -> bool {
+    let items: Vec<_> = chrono::format::StrftimeItems::new(&config.format).collect();
+    if items
+        .iter()
+        .any(|item| matches!(item, chrono::format::Item::Error))
+    {
+        return false;
+    }
+
+    let mut rendered = String::new();
+    if config.local {
+        chrono::offset::Local::now()
+            .format_with_items(items.iter())
+            .write_to(&mut rendered)
+            .is_ok()
+    } else {
+        chrono::offset::Utc::now()
+            .format_with_items(items.iter())
+            .write_to(&mut rendered)
+            .is_ok()
+    }
+}
+
+fn validate_job_config(name: &str, config: &JobConfig) -> Result<(), String> {
+    if config.datetime.enabled && !datetime_format_is_valid(&config.datetime) {
+        return Err(format!(
+            "job {name:?} has an invalid datetime format: {:?}",
+            config.datetime.format
+        ));
+    }
+
+    let durations = [
+        ("delay", Duration::from_millis(config.delay)),
+        ("restart_delay", Duration::from_millis(config.restart_delay)),
+        (
+            "shutdown_timeout",
+            Duration::from_secs(config.shutdown_timeout),
+        ),
+    ];
+    for (field, duration) in durations {
+        if std::time::Instant::now().checked_add(duration).is_none() {
+            return Err(format!(
+                "job {name:?} has a {field} value outside the supported duration range"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expand_cwd(
     cwd: &str,
     config_parent_path: &str,
@@ -210,6 +399,70 @@ fn process_reconcile_interval(base_env: &HashMap<String, String>) -> Duration {
             ))
         })
         .unwrap_or(PROCESS_RECONCILE_INTERVAL)
+}
+
+fn post_kill_delivery_deadline(kill_sent_at: Instant) -> Instant {
+    kill_sent_at + POST_KILL_WAIT - RECONCILE_CONVERGENCE_RESERVE
+}
+
+async fn observe_child_wait_before_escalation<F>(
+    mut child_wait: std::pin::Pin<&mut F>,
+    child_status: &mut Option<ExitStatus>,
+    child_exit_observed_at: &mut Option<std::time::Instant>,
+    child_wait_error: &mut Option<std::io::Error>,
+    active_pids: &Mutex<HashMap<u32, TrackedRun>>,
+    info: PidInfo,
+) where
+    F: std::future::Future<Output = std::io::Result<ExitStatus>>,
+{
+    if child_status.is_some() || child_wait_error.is_some() {
+        return;
+    }
+    let result = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(match child_wait.as_mut().poll(context) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await;
+    if let Some(result) = result {
+        match result {
+            Ok(status) => {
+                *child_status = Some(status);
+                child_exit_observed_at.get_or_insert_with(std::time::Instant::now);
+            }
+            Err(error) => *child_wait_error = Some(error),
+        }
+        remove_active_pid(active_pids, info);
+    } else if child_exit_observed_at.is_none() {
+        match child_exit_is_waitable(info.identity.pid) {
+            Ok(true) => *child_exit_observed_at = Some(std::time::Instant::now()),
+            Ok(false) => {}
+            Err(error) => *child_wait_error = Some(error),
+        }
+    }
+}
+
+fn child_exit_is_waitable(pid: u32) -> std::io::Result<bool> {
+    loop {
+        let mut child_info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                child_info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            let child_info = unsafe { child_info.assume_init() };
+            return Ok(unsafe { child_info.si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn strip_json_comments(data: &str) -> String {
@@ -325,6 +578,375 @@ enum ProcessRunError {
     Fatal(std::io::Error),
 }
 
+fn job_shim_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut descriptors = [-1; 2];
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    Ok((reader, writer))
+}
+
+fn job_shim_completion_pipe() -> std::io::Result<(std::fs::File, OwnedFd)> {
+    let (reader, writer) = job_shim_pipe()?;
+    Ok((std::fs::File::from(reader), writer))
+}
+
+fn job_shim_readiness_pipe() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
+    let (reader, writer) = job_shim_pipe()?;
+    Ok((AsyncFd::new(reader)?, writer))
+}
+
+enum JobShimReadiness {
+    Ready,
+    Shutdown,
+}
+
+async fn wait_for_job_shim_readiness(
+    reader: &mut Option<AsyncFd<OwnedFd>>,
+    shutdown: &mut watch::Receiver<ShutdownState>,
+    startup_timeout: Duration,
+) -> std::io::Result<JobShimReadiness> {
+    let Some(reader) = reader.take() else {
+        return Ok(JobShimReadiness::Ready);
+    };
+    if *shutdown.borrow() != ShutdownState::Running {
+        return Ok(JobShimReadiness::Shutdown);
+    }
+    let mut deadline = Box::pin(sleep(startup_timeout));
+    tokio::select! {
+        biased;
+        result = read_job_shim_readiness(&reader) => {
+            result.map(|()| JobShimReadiness::Ready)
+        }
+        changed = shutdown.changed() => {
+            let _ = changed;
+            Ok(JobShimReadiness::Shutdown)
+        }
+        _ = &mut deadline => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("job shim did not become ready within {startup_timeout:?}"),
+        )),
+    }
+}
+
+async fn read_job_shim_readiness(reader: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
+    loop {
+        let mut readable = reader.readable().await?;
+        match readable.try_io(|descriptor| read_job_shim_readiness_byte(descriptor.as_raw_fd())) {
+            Ok(result) => return result,
+            Err(_) => continue,
+        }
+    }
+}
+
+fn read_job_shim_readiness_byte(descriptor: RawFd) -> std::io::Result<()> {
+    loop {
+        let mut readiness = [0];
+        let read =
+            unsafe { libc::read(descriptor, readiness.as_mut_ptr().cast(), readiness.len()) };
+        if read == readiness.len() as isize {
+            return if readiness[0] == JOB_SHIM_READY {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "job shim reported an invalid readiness status: {}",
+                    readiness[0]
+                )))
+            };
+        }
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "job shim exited before becoming ready",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn take_job_shim_completion(reader: &mut Option<std::fs::File>) -> std::io::Result<Option<u8>> {
+    let Some(mut reader) = reader.take() else {
+        return Ok(None);
+    };
+    let mut completion = [0];
+    let deadline = std::time::Instant::now() + JOB_SHIM_COMPLETION_SETTLE_TIMEOUT;
+    loop {
+        match reader.read_exact(&mut completion) {
+            Ok(()) => return Ok(Some(completion[0])),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && wait_for_completion_pipe(&reader, deadline)? => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("job shim exited without confirming descendant cleanup: {error}"),
+                ));
+            }
+        }
+    }
+}
+
+fn wait_for_completion_pipe(
+    reader: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let timeout = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result > 0 {
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn read_job_shim_completion(reader: &mut Option<std::fs::File>) -> std::io::Result<()> {
+    validate_job_shim_completion(take_job_shim_completion(reader)?)
+}
+
+fn validate_job_shim_completion(completion: Option<u8>) -> std::io::Result<()> {
+    match completion {
+        None | Some(JOB_SHIM_COMPLETED) => Ok(()),
+        Some(JOB_SHIM_FAILED) => Err(std::io::Error::other(
+            "job shim reported a descendant supervision failure",
+        )),
+        Some(status) => Err(std::io::Error::other(format!(
+            "job shim reported an invalid completion status: {status}"
+        ))),
+    }
+}
+
+async fn take_job_shim_completion_async(
+    reader: &mut Option<std::fs::File>,
+) -> std::io::Result<Option<u8>> {
+    let Some(reader) = reader.take() else {
+        return Ok(None);
+    };
+    let reader = AsyncFd::new(reader)?;
+    let completion = timeout(JOB_SHIM_COMPLETION_SETTLE_TIMEOUT, async {
+        loop {
+            let mut readable = reader.readable().await?;
+            match readable.try_io(|descriptor| {
+                read_job_shim_completion_byte(descriptor.as_raw_fd())
+            }) {
+                Ok(result) => return result,
+                Err(_) => continue,
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "job shim exited without confirming descendant cleanup before the confirmation deadline",
+        )
+    })?
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("job shim exited without confirming descendant cleanup: {error}"),
+        )
+    })?;
+    Ok(Some(completion))
+}
+
+fn read_job_shim_completion_byte(descriptor: RawFd) -> std::io::Result<u8> {
+    loop {
+        let mut completion = [0];
+        let read =
+            unsafe { libc::read(descriptor, completion.as_mut_ptr().cast(), completion.len()) };
+        if read == completion.len() as isize {
+            return Ok(completion[0]);
+        }
+        if read == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+async fn read_job_shim_completion_async(reader: &mut Option<std::fs::File>) -> std::io::Result<()> {
+    validate_job_shim_completion(take_job_shim_completion_async(reader).await?)
+}
+
+async fn read_job_shim_shutdown_completion_async(
+    reader: &mut Option<std::fs::File>,
+    expected_sigkill: bool,
+) -> std::io::Result<()> {
+    match take_job_shim_completion_async(reader).await {
+        Err(error) if expected_sigkill && error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+        Ok(completion) => validate_job_shim_completion(completion),
+    }
+}
+
+async fn inspect_spawned_child_identity(pid: u32) -> std::io::Result<ProcessIdentity> {
+    let mut last_error = None;
+    for attempt in 0..SIGNAL_RETRY_LIMIT {
+        match process_tree::identity(pid) {
+            Ok(identity) => return Ok(identity),
+            Err(error) => {
+                let departed = error.kind() == std::io::ErrorKind::NotFound;
+                last_error = Some(error);
+                if departed {
+                    break;
+                }
+            }
+        }
+        if attempt + 1 < SIGNAL_RETRY_LIMIT {
+            sleep(PROCESS_SCAN_FAILURE_RETRY_INTERVAL).await;
+        }
+    }
+    Err(last_error.expect("identity inspection must run at least once"))
+}
+
+async fn stop_spawned_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    use_process_group: bool,
+    use_job_shim: bool,
+    completion_reader: &mut Option<std::fs::File>,
+    graceful_wait: Duration,
+    shutdown: &mut watch::Receiver<ShutdownState>,
+) -> std::io::Result<ExitStatus> {
+    let mut status = child.try_wait().ok().flatten();
+    let mut force = *shutdown.borrow_and_update() == ShutdownState::Force;
+    if status.is_none() && !force {
+        signal_spawned_child(pid, use_process_group, libc::SIGTERM);
+        let mut child_wait = Box::pin(child.wait());
+        let mut grace = Box::pin(sleep(graceful_wait));
+        loop {
+            tokio::select! {
+                result = &mut child_wait => {
+                    match result {
+                        Ok(exit_status) => status = Some(exit_status),
+                        Err(_) => force = true,
+                    }
+                    break;
+                }
+                _ = &mut grace => {
+                    force = true;
+                    break;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() == ShutdownState::Force {
+                        force = true;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(child_wait);
+    }
+    if status.is_none() && force {
+        signal_spawned_child(pid, use_process_group, libc::SIGKILL);
+        let _ = child.start_kill();
+        if let Ok(Ok(exit_status)) = timeout(POST_KILL_WAIT, child.wait()).await {
+            status = Some(exit_status);
+        }
+    }
+
+    if status.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "spawned process did not exit during supervision-error cleanup",
+        ));
+    }
+    if use_job_shim {
+        read_job_shim_completion_async(completion_reader).await?;
+    }
+    Ok(status.expect("spawned child status was checked above"))
+}
+
+async fn stop_unready_job_shim(
+    status_prefix: &PrefixWriter<'_>,
+    opts: &JobConfig,
+    child: &mut tokio::process::Child,
+    pid: u32,
+    completion_reader: &mut Option<std::fs::File>,
+) -> std::io::Result<ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tracked_descendants = process_tree::identity(pid).and_then(|identity| {
+        ProcessSnapshot::capture().map(|snapshot| {
+            let info = PidInfo {
+                is_process_group: true,
+                identity,
+            };
+            let known = snapshot.related_processes(identity, true, &HashSet::new());
+            (info, known)
+        })
+    });
+    let mut status = child.try_wait()?;
+    let mut sent_sigkill = false;
+    if status.is_none() {
+        signal_spawned_child(Some(pid), true, libc::SIGKILL);
+        let _ = child.start_kill();
+        sent_sigkill = true;
+        if let Ok(result) = timeout(POST_KILL_WAIT, child.wait()).await {
+            status = Some(result?);
+        }
+    }
+    let Some(status) = status else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "unready job shim did not exit after SIGKILL",
+        ));
+    };
+    let (info, known) = tracked_descendants.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not capture unready job shim descendants: {error}"),
+        )
+    })?;
+    cleanup_after_natural_exit(status_prefix, opts, info, &known)
+        .await
+        .map_err(|error| error.error)?;
+    read_job_shim_shutdown_completion_async(
+        completion_reader,
+        sent_sigkill && status.signal() == Some(libc::SIGKILL),
+    )
+    .await?;
+    Ok(status)
+}
+
+fn signal_spawned_child(pid: Option<u32>, use_process_group: bool, signal: libc::c_int) {
+    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+    if !use_process_group || send_signal_target(-pid, signal).is_err() {
+        let _ = send_signal_target(pid, signal);
+    }
+}
+
 impl From<std::io::Error> for ProcessRunError {
     fn from(error: std::io::Error) -> Self {
         Self::Retry(error)
@@ -359,11 +981,19 @@ impl<'a> std::fmt::Display for PrefixWriter<'a> {
             return write!(f, "{}", self.prefix);
         }
 
-        let timestamp = if self.datetime_local {
-            chrono::offset::Local::now().format_with_items(self.datetime_items.iter())
+        let mut timestamp = String::new();
+        let result = if self.datetime_local {
+            chrono::offset::Local::now()
+                .format_with_items(self.datetime_items.iter())
+                .write_to(&mut timestamp)
         } else {
-            chrono::offset::Utc::now().format_with_items(self.datetime_items.iter())
+            chrono::offset::Utc::now()
+                .format_with_items(self.datetime_items.iter())
+                .write_to(&mut timestamp)
         };
+        if result.is_err() {
+            return write!(f, "{}", self.prefix);
+        }
         write!(f, "{} > {}", self.prefix, timestamp)
     }
 }
@@ -488,10 +1118,34 @@ async fn start_proc_internal(
     let use_process_group = opts.process_group || opts.sudo_user.is_some();
     // In-process tests execute through the libtest binary, which cannot enter this hidden mode.
     let use_job_shim = use_process_group && !cfg!(test);
+    let (mut shim_completion_reader, shim_completion_writer) = if use_job_shim {
+        let (reader, writer) = job_shim_completion_pipe()?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
+    let (mut shim_readiness_reader, shim_readiness_writer) = if use_job_shim {
+        let (reader, writer) = job_shim_readiness_pipe()?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
     let mut cmd = if use_job_shim {
-        let mut cmd = Command::new(env::current_exe()?);
+        let mut cmd = Command::new("/proc/self/exe");
         cmd.args([
             "--job-shim",
+            "--completion-fd",
+            &shim_completion_writer
+                .as_ref()
+                .expect("job shim completion writer is missing")
+                .as_raw_fd()
+                .to_string(),
+            "--ready-fd",
+            &shim_readiness_writer
+                .as_ref()
+                .expect("job shim readiness writer is missing")
+                .as_raw_fd()
+                .to_string(),
             "--shutdown-timeout",
             &opts.shutdown_timeout.to_string(),
         ]);
@@ -543,7 +1197,23 @@ async fn start_proc_internal(
         cmd.envs(additional_env);
     }
 
-    if !use_job_shim {
+    if let Some(writer) = &shim_completion_writer {
+        let completion_fd = writer.as_raw_fd();
+        let readiness_fd = shim_readiness_writer
+            .as_ref()
+            .expect("job shim readiness writer is missing")
+            .as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || {
+                for descriptor in [completion_fd, readiness_fd] {
+                    if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    } else {
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -555,17 +1225,61 @@ async fn start_proc_internal(
     }
 
     let mut child = cmd.spawn()?;
-    let pid = child
-        .id()
-        .ok_or_else(|| std::io::Error::other("Could not get child pid"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("Could not get stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| std::io::Error::other("Could not get stderr"))?;
+    drop(shim_completion_writer);
+    drop(shim_readiness_writer);
+    let supervision_error_grace = Duration::from_secs(opts.shutdown_timeout);
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            let error = std::io::Error::other("Could not get child pid");
+            let cleanup = stop_spawned_child(
+                &mut child,
+                None,
+                use_process_group,
+                use_job_shim,
+                &mut shim_completion_reader,
+                supervision_error_grace,
+                shutdown,
+            )
+            .await;
+            return Err(ProcessRunError::Fatal(cleanup.err().unwrap_or(error)));
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let error = std::io::Error::other("Could not get stdout");
+            let cleanup = stop_spawned_child(
+                &mut child,
+                Some(pid),
+                use_process_group,
+                use_job_shim,
+                &mut shim_completion_reader,
+                supervision_error_grace,
+                shutdown,
+            )
+            .await;
+            return Err(ProcessRunError::Fatal(cleanup.err().unwrap_or(error)));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let error = std::io::Error::other("Could not get stderr");
+            let cleanup = stop_spawned_child(
+                &mut child,
+                Some(pid),
+                use_process_group,
+                use_job_shim,
+                &mut shim_completion_reader,
+                supervision_error_grace,
+                shutdown,
+            )
+            .await;
+            return Err(ProcessRunError::Fatal(cleanup.err().unwrap_or(error)));
+        }
+    };
     let stdout_handle = spawn_output_handler(
         stdout,
         format!("{} (1)", prefix),
@@ -579,83 +1293,130 @@ async fn start_proc_internal(
         OutputStream::Stderr,
     );
 
-    let identity = match process_tree::identity(pid) {
+    match wait_for_job_shim_readiness(
+        &mut shim_readiness_reader,
+        shutdown,
+        JOB_SHIM_STARTUP_TIMEOUT,
+    )
+    .await
+    {
+        Ok(JobShimReadiness::Ready) => {}
+        Ok(JobShimReadiness::Shutdown) => {
+            let cleanup = stop_unready_job_shim(
+                status_prefix,
+                opts,
+                &mut child,
+                pid,
+                &mut shim_completion_reader,
+            )
+            .await;
+            drain_output_handlers([stdout_handle, stderr_handle]).await;
+            return match cleanup {
+                Ok(status) => {
+                    report_child_status(status_prefix, status);
+                    Ok(true)
+                }
+                Err(error) => Err(ProcessRunError::Fatal(error)),
+            };
+        }
+        Err(readiness_error) => {
+            let cleanup = stop_unready_job_shim(
+                status_prefix,
+                opts,
+                &mut child,
+                pid,
+                &mut shim_completion_reader,
+            )
+            .await;
+            drain_output_handlers([stdout_handle, stderr_handle]).await;
+            return Err(ProcessRunError::Fatal(
+                cleanup.err().unwrap_or(readiness_error),
+            ));
+        }
+    }
+
+    let identity = match inspect_spawned_child_identity(pid).await {
         Ok(identity) => identity,
         Err(identity_error) => {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    report_child_status(status_prefix, status);
-                    drain_output_handlers([stdout_handle, stderr_handle]).await;
-                    return Ok(false);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    drain_output_handlers([stdout_handle, stderr_handle]).await;
-                    return Err(ProcessRunError::Retry(error));
-                }
-            }
-
-            let _ = child.start_kill();
-            let status = child.wait().await;
+            let cleanup = stop_spawned_child(
+                &mut child,
+                Some(pid),
+                use_process_group,
+                use_job_shim,
+                &mut shim_completion_reader,
+                supervision_error_grace,
+                shutdown,
+            )
+            .await;
             drain_output_handlers([stdout_handle, stderr_handle]).await;
-            let status = status?;
-            report_child_status(status_prefix, status);
-            return Err(std::io::Error::new(
+            let inspection_error = std::io::Error::new(
                 identity_error.kind(),
                 format!("Could not inspect child process {pid}: {identity_error}"),
-            )
-            .into());
+            );
+            return match cleanup {
+                Ok(status) => {
+                    report_child_status(status_prefix, status);
+                    Err(ProcessRunError::Retry(inspection_error))
+                }
+                Err(error) => Err(ProcessRunError::Fatal(error)),
+            };
         }
     };
     let info = PidInfo {
         is_process_group: use_process_group,
         identity,
     };
-    let mut known = if use_process_group {
+    let mut known = if use_job_shim {
+        let snapshot = match refresh_process_snapshot(scanner_requests).await {
+            Ok(snapshot) => snapshot,
+            Err(refresh_error) => {
+                let cleanup = stop_spawned_child(
+                    &mut child,
+                    Some(pid),
+                    use_process_group,
+                    use_job_shim,
+                    &mut shim_completion_reader,
+                    supervision_error_grace,
+                    shutdown,
+                )
+                .await;
+                drain_output_handlers([stdout_handle, stderr_handle]).await;
+                return Err(ProcessRunError::Fatal(
+                    cleanup.err().unwrap_or(refresh_error),
+                ));
+            }
+        };
+        snapshot.related_processes(identity, true, &HashSet::new())
+    } else if use_process_group {
         related_processes(snapshots, identity, &HashSet::new())
     } else {
         HashSet::new()
     };
 
-    let shutdown_at_registration = {
-        let mut pids = lock_or_recover(active_pids);
-        let state = *shutdown.borrow();
-        if state == ShutdownState::Running {
-            pids.insert(
-                pid,
-                TrackedRun {
-                    info,
-                    descendants: known.clone(),
-                },
-            );
-        }
-        state
-    };
+    let shutdown_at_registration = register_active_pid(active_pids, shutdown, info, known.clone());
 
     eprintln!("{} > Started (pid {})", status_prefix, pid);
 
     let mut child_wait = Box::pin(child.wait());
     let shutdown_state = if shutdown_at_registration != ShutdownState::Running {
-        Some(shutdown_at_registration)
+        shutdown_at_registration
     } else {
         loop {
             tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() {
-                        break Some(ShutdownState::Force);
+                        break ShutdownState::Force;
                     }
                     let state = *shutdown.borrow();
                     if state != ShutdownState::Running {
-                        break Some(state);
+                        break state;
                     }
                     continue;
                 }
                 snapshot_changed = snapshots.changed() => {
                     if snapshot_changed.is_err() {
-                        break Some(ShutdownState::Force);
+                        break ShutdownState::Force;
                     }
                     if use_process_group {
                         known = related_processes(snapshots, identity, &known);
@@ -668,12 +1429,33 @@ async fn start_proc_internal(
                         Ok(status) => status,
                         Err(error) => {
                             drop(child_wait);
-                            let _ = child.start_kill();
-                            let _ = child.wait().await;
+                            if use_process_group {
+                                let _ = signal_run_with_retry(
+                                    &status_prefix.to_string(),
+                                    opts,
+                                    info,
+                                    &known,
+                                    libc::SIGKILL,
+                                    Instant::now() + POST_KILL_WAIT,
+                                )
+                                .await;
+                            }
+                            let cleanup = stop_spawned_child(
+                                &mut child,
+                                Some(pid),
+                                use_process_group,
+                                use_job_shim,
+                                &mut shim_completion_reader,
+                                Duration::ZERO,
+                                shutdown,
+                            )
+                            .await;
                             drain_output_handlers([stdout_handle, stderr_handle]).await;
-                            return Err(ProcessRunError::Retry(error));
+                            return Err(ProcessRunError::Fatal(cleanup.err().unwrap_or(error)));
                         }
                     };
+                    let shim_completion =
+                        read_job_shim_completion_async(&mut shim_completion_reader).await;
                     report_child_status(status_prefix, status);
                     if use_process_group {
                         let snapshot = match refresh_process_snapshot(scanner_requests).await {
@@ -686,7 +1468,8 @@ async fn start_proc_internal(
                                     &known,
                                 )
                                 .await
-                                .err();
+                                .err()
+                                .map(|error| error.error);
                                 drain_output_handlers([stdout_handle, stderr_handle]).await;
                                 return Err(ProcessRunError::Fatal(
                                     cleanup_error.unwrap_or(refresh_error),
@@ -698,6 +1481,10 @@ async fn start_proc_internal(
                     if let Err(error) =
                         cleanup_after_natural_exit(status_prefix, opts, info, &known).await
                     {
+                        drain_output_handlers([stdout_handle, stderr_handle]).await;
+                        return Err(ProcessRunError::Fatal(error.error));
+                    }
+                    if let Err(error) = shim_completion {
                         drain_output_handlers([stdout_handle, stderr_handle]).await;
                         return Err(ProcessRunError::Fatal(error));
                     }
@@ -726,24 +1513,78 @@ async fn start_proc_internal(
     let mut deadline_sleep = Box::pin(sleep_until(deadline));
     let mut post_kill_sleep = Box::pin(sleep_until(deadline));
 
-    if shutdown_state == Some(ShutdownState::Graceful) {
-        if let Err(error) =
-            signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGTERM).await
-        {
-            log_signal_error(status_prefix, libc::SIGTERM, &error);
-            signal_delivery_error = Some(error.error);
+    let mut kill_immediately = shutdown_state != ShutdownState::Graceful;
+    if !kill_immediately {
+        let mut graceful_signal = Box::pin(signal_run_and_log(
+            status_prefix,
+            &signal_log_prefix,
+            opts,
+            info,
+            &known,
+            libc::SIGTERM,
+            deadline,
+        ));
+        loop {
+            tokio::select! {
+                biased;
+                status = &mut child_wait, if child_status.is_none() && child_wait_error.is_none() => {
+                    match status {
+                        Ok(status) => {
+                            child_status = Some(status);
+                            child_exit_observed_at.get_or_insert_with(std::time::Instant::now);
+                            remove_active_pid(active_pids, info);
+                        }
+                        Err(error) => {
+                            child_wait_error = Some(error);
+                            remove_active_pid(active_pids, info);
+                        }
+                    }
+                }
+                result = &mut graceful_signal => {
+                    signal_delivery_error = result;
+                    break;
+                }
+                _ = &mut deadline_sleep, if !kill_immediately => {
+                    kill_immediately = true;
+                }
+                changed = shutdown.changed(), if !kill_immediately => {
+                    if changed.is_err() || *shutdown.borrow() == ShutdownState::Force {
+                        kill_immediately = true;
+                    }
+                }
+            }
         }
-    } else {
-        if let Err(error) =
-            signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
-        {
-            log_signal_error(status_prefix, libc::SIGKILL, &error);
-            signal_delivery_error = Some(error.error);
-        }
+    }
+    if child_wait_error.is_some() {
+        kill_immediately = true;
+    }
+    if kill_immediately {
+        observe_child_wait_before_escalation(
+            child_wait.as_mut(),
+            &mut child_status,
+            &mut child_exit_observed_at,
+            &mut child_wait_error,
+            active_pids,
+            info,
+        )
+        .await;
         let sent_at = Instant::now();
         kill_sent_at = Some(sent_at);
         kill_attempted.extend(known.iter().copied());
         post_kill_sleep.as_mut().reset(sent_at + POST_KILL_WAIT);
+        if let Some(error) = signal_run_and_log(
+            status_prefix,
+            &signal_log_prefix,
+            opts,
+            info,
+            &known,
+            libc::SIGKILL,
+            post_kill_delivery_deadline(sent_at),
+        )
+        .await
+        {
+            retain_signal_error(&mut signal_delivery_error, error);
+        }
     }
 
     loop {
@@ -751,21 +1592,22 @@ async fn start_proc_internal(
             known = related_processes(snapshots, identity, &known);
             update_active_descendants(active_pids, info, &known);
         }
-        if kill_sent_at.is_some() {
+        if let Some(sent_at) = kill_sent_at {
             let new_targets: HashSet<_> = known.difference(&kill_attempted).copied().collect();
             if !new_targets.is_empty() {
                 kill_attempted.extend(new_targets.iter().copied());
-                if let Err(error) = signal_run_with_retry(
+                if let Some(error) = signal_run_and_log(
+                    status_prefix,
                     &signal_log_prefix,
                     opts,
                     info,
                     &new_targets,
                     libc::SIGKILL,
+                    post_kill_delivery_deadline(sent_at),
                 )
                 .await
                 {
-                    log_signal_error(status_prefix, libc::SIGKILL, &error);
-                    signal_delivery_error = Some(error.error);
+                    retain_signal_error(&mut signal_delivery_error, error);
                 }
             }
         }
@@ -781,16 +1623,32 @@ async fn start_proc_internal(
                 "{} > Could not verify process tree during shutdown, sending SIGKILL..",
                 status_prefix
             );
-            if let Err(error) =
-                signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
-            {
-                log_signal_error(status_prefix, libc::SIGKILL, &error);
-                signal_delivery_error = Some(error.error);
-            }
+            observe_child_wait_before_escalation(
+                child_wait.as_mut(),
+                &mut child_status,
+                &mut child_exit_observed_at,
+                &mut child_wait_error,
+                active_pids,
+                info,
+            )
+            .await;
             let sent_at = Instant::now();
             kill_sent_at = Some(sent_at);
             kill_attempted.extend(known.iter().copied());
             post_kill_sleep.as_mut().reset(sent_at + POST_KILL_WAIT);
+            if let Some(error) = signal_run_and_log(
+                status_prefix,
+                &signal_log_prefix,
+                opts,
+                info,
+                &known,
+                libc::SIGKILL,
+                post_kill_delivery_deadline(sent_at),
+            )
+            .await
+            {
+                retain_signal_error(&mut signal_delivery_error, error);
+            }
         }
         let post_exit_snapshot_ready = snapshots_closed
             || child_exit_observed_at
@@ -811,11 +1669,12 @@ async fn start_proc_internal(
         }
 
         tokio::select! {
-            status = &mut child_wait, if child_status.is_none() => {
+            biased;
+            status = &mut child_wait, if child_status.is_none() && child_wait_error.is_none() => {
                 match status {
                     Ok(status) => {
                         child_status = Some(status);
-                        child_exit_observed_at = Some(std::time::Instant::now());
+                        child_exit_observed_at.get_or_insert_with(std::time::Instant::now);
                         remove_active_pid(active_pids, info);
                     }
                     Err(error) => {
@@ -833,18 +1692,34 @@ async fn start_proc_internal(
                             "{} > Process scanner stopped during shutdown, sending SIGKILL..",
                             status_prefix
                         );
-                        if let Err(error) =
-                            signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
-                        {
-                            log_signal_error(status_prefix, libc::SIGKILL, &error);
-                            signal_delivery_error = Some(error.error);
-                        }
+                        observe_child_wait_before_escalation(
+                            child_wait.as_mut(),
+                            &mut child_status,
+                            &mut child_exit_observed_at,
+                            &mut child_wait_error,
+                            active_pids,
+                            info,
+                        )
+                        .await;
                         let sent_at = Instant::now();
                         kill_sent_at = Some(sent_at);
                         kill_attempted.extend(known.iter().copied());
                         post_kill_sleep
                             .as_mut()
                             .reset(sent_at + POST_KILL_WAIT);
+                        if let Some(error) = signal_run_and_log(
+                            status_prefix,
+                            &signal_log_prefix,
+                            opts,
+                            info,
+                            &known,
+                            libc::SIGKILL,
+                            post_kill_delivery_deadline(sent_at),
+                        )
+                        .await
+                        {
+                            retain_signal_error(&mut signal_delivery_error, error);
+                        }
                     }
                 }
             }
@@ -866,18 +1741,34 @@ async fn start_proc_internal(
                     status_prefix,
                     opts.shutdown_timeout
                 );
-                if let Err(error) =
-                    signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
-                {
-                    log_signal_error(status_prefix, libc::SIGKILL, &error);
-                    signal_delivery_error = Some(error.error);
-                }
+                observe_child_wait_before_escalation(
+                    child_wait.as_mut(),
+                    &mut child_status,
+                    &mut child_exit_observed_at,
+                    &mut child_wait_error,
+                    active_pids,
+                    info,
+                )
+                .await;
                 let sent_at = Instant::now();
                 kill_sent_at = Some(sent_at);
                 kill_attempted.extend(known.iter().copied());
                 post_kill_sleep
                     .as_mut()
                     .reset(sent_at + POST_KILL_WAIT);
+                if let Some(error) = signal_run_and_log(
+                    status_prefix,
+                    &signal_log_prefix,
+                    opts,
+                    info,
+                    &known,
+                    libc::SIGKILL,
+                    post_kill_delivery_deadline(sent_at),
+                )
+                .await
+                {
+                    retain_signal_error(&mut signal_delivery_error, error);
+                }
             }
             changed = shutdown.changed(), if kill_sent_at.is_none() => {
                 if changed.is_err() || *shutdown.borrow() == ShutdownState::Force {
@@ -886,18 +1777,34 @@ async fn start_proc_internal(
                         update_active_descendants(active_pids, info, &known);
                     }
                     eprintln!("{} > Shutdown escalated, sending SIGKILL..", status_prefix);
-                    if let Err(error) =
-                        signal_run_with_retry(&signal_log_prefix, opts, info, &known, libc::SIGKILL).await
-                    {
-                        log_signal_error(status_prefix, libc::SIGKILL, &error);
-                        signal_delivery_error = Some(error.error);
-                    }
+                    observe_child_wait_before_escalation(
+                        child_wait.as_mut(),
+                        &mut child_status,
+                        &mut child_exit_observed_at,
+                        &mut child_wait_error,
+                        active_pids,
+                        info,
+                    )
+                    .await;
                     let sent_at = Instant::now();
                     kill_sent_at = Some(sent_at);
                     kill_attempted.extend(known.iter().copied());
                     post_kill_sleep
                         .as_mut()
                         .reset(sent_at + POST_KILL_WAIT);
+                    if let Some(error) = signal_run_and_log(
+                        status_prefix,
+                        &signal_log_prefix,
+                        opts,
+                        info,
+                        &known,
+                        libc::SIGKILL,
+                        post_kill_delivery_deadline(sent_at),
+                    )
+                    .await
+                    {
+                        retain_signal_error(&mut signal_delivery_error, error);
+                    }
                 }
             }
         }
@@ -914,7 +1821,12 @@ async fn start_proc_internal(
     if child_status.is_none() {
         if post_kill_timed_out {
             match child.try_wait() {
-                Ok(status) => child_status = status,
+                Ok(status) => {
+                    if status.is_some() {
+                        child_exit_observed_at.get_or_insert_with(std::time::Instant::now);
+                    }
+                    child_status = status;
+                }
                 Err(error) => {
                     remove_active_pid(active_pids, info);
                     drain_output_handlers([stdout_handle, stderr_handle]).await;
@@ -923,7 +1835,10 @@ async fn start_proc_internal(
             }
         } else {
             match child.wait().await {
-                Ok(status) => child_status = Some(status),
+                Ok(status) => {
+                    child_exit_observed_at.get_or_insert_with(std::time::Instant::now);
+                    child_status = Some(status);
+                }
                 Err(error) => {
                     remove_active_pid(active_pids, info);
                     drain_output_handlers([stdout_handle, stderr_handle]).await;
@@ -933,6 +1848,19 @@ async fn start_proc_internal(
         }
     }
     remove_active_pid(active_pids, info);
+    let shim_completion = if use_job_shim && child_status.is_some() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let expected_sigkill = child_status.is_some_and(|status| {
+            status.signal() == Some(libc::SIGKILL)
+                && kill_sent_at
+                    .zip(child_exit_observed_at)
+                    .is_some_and(|(killed, observed)| killed.into_std() <= observed)
+        });
+        read_job_shim_shutdown_completion_async(&mut shim_completion_reader, expected_sigkill).await
+    } else {
+        Ok(())
+    };
     if let Some(status) = child_status {
         report_child_status(status_prefix, status);
     }
@@ -949,16 +1877,22 @@ async fn start_proc_internal(
             Err(error) => return Err(ProcessRunError::Fatal(error)),
         }
     }
+    if let Err(error) = shim_completion {
+        return Err(ProcessRunError::Fatal(error));
+    }
     if let Some(error) = timeout_error {
         return Err(ProcessRunError::Fatal(error));
     }
     let unresolved_signal_error = if let Some(error) = signal_delivery_error {
+        if error.containment_failed {
+            return Err(ProcessRunError::Fatal(error.error));
+        }
         let tree_is_running = process_tree::is_running_checked(info.identity)
             .and_then(|root| {
                 any_process_running_checked(&known).map(|descendant| root || descendant)
             })
             .map_err(ProcessRunError::Fatal)?;
-        tree_is_running.then_some(error)
+        tree_is_running.then_some(error.error)
     } else {
         None
     };
@@ -1092,6 +2026,19 @@ fn update_active_descendants(
     }
 }
 
+fn register_active_pid(
+    active_pids: &Mutex<HashMap<u32, TrackedRun>>,
+    shutdown: &mut watch::Receiver<ShutdownState>,
+    info: PidInfo,
+    descendants: HashSet<ProcessIdentity>,
+) -> ShutdownState {
+    let state = *shutdown.borrow_and_update();
+    if state == ShutdownState::Running {
+        lock_or_recover(active_pids).insert(info.identity.pid, TrackedRun { info, descendants });
+    }
+    state
+}
+
 fn remove_active_pid(active_pids: &Mutex<HashMap<u32, TrackedRun>>, info: PidInfo) {
     let mut pids = lock_or_recover(active_pids);
     if pids
@@ -1107,7 +2054,7 @@ async fn cleanup_after_natural_exit(
     opts: &JobConfig,
     info: PidInfo,
     known: &HashSet<ProcessIdentity>,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
     if !info.is_process_group {
         return Ok(());
     }
@@ -1115,15 +2062,22 @@ async fn cleanup_after_natural_exit(
     let signal_prefix = status_prefix.to_string();
     cleanup_known_processes_with(
         known,
+        POST_KILL_WAIT,
         process_tree::is_running_checked,
-        |targets| async move {
+        |targets, deadline| async move {
             eprintln!(
                 "{} > Cleaning up processes left behind by exited job",
                 status_prefix
             );
-            signal_run_with_retry(&signal_prefix, opts, info, &targets, libc::SIGKILL)
-                .await
-                .map_err(|error| error.error)
+            signal_run_with_retry(
+                &signal_prefix,
+                opts,
+                info,
+                &targets,
+                libc::SIGKILL,
+                deadline,
+            )
+            .await
         },
     )
     .await
@@ -1131,13 +2085,14 @@ async fn cleanup_after_natural_exit(
 
 async fn cleanup_known_processes_with<P, S, F>(
     known: &HashSet<ProcessIdentity>,
+    convergence_wait: Duration,
     mut probe: P,
     signal: S,
-) -> std::io::Result<()>
+) -> Result<(), SignalError>
 where
     P: FnMut(ProcessIdentity) -> std::io::Result<bool>,
-    S: FnOnce(HashSet<ProcessIdentity>) -> F,
-    F: std::future::Future<Output = std::io::Result<()>>,
+    S: FnOnce(HashSet<ProcessIdentity>, Instant) -> F,
+    F: std::future::Future<Output = Result<(), SignalError>>,
 {
     let mut initial_errors = SignalErrors::default();
     let any_running = any_process_running_best_effort_with(known, &mut initial_errors, &mut probe);
@@ -1145,18 +2100,50 @@ where
         return Ok(());
     }
 
-    let result = signal(known.clone()).await;
-    let mut validation_errors = SignalErrors::default();
-    let survivors = any_process_running_best_effort_with(known, &mut validation_errors, &mut probe);
-    if let Some(error) = validation_errors.error {
-        return Err(error);
+    let deadline = Instant::now()
+        .checked_add(convergence_wait)
+        .ok_or_else(|| {
+            SignalError::inspection(std::io::Error::other(
+                "cleanup wait exceeds the supported range",
+            ))
+        })?;
+    let signal_deadline = deadline
+        .checked_sub(RECONCILE_CONVERGENCE_RESERVE.min(convergence_wait))
+        .unwrap_or(deadline);
+    let signal_error = signal(known.clone(), signal_deadline).await.err();
+    loop {
+        let mut validation_errors = SignalErrors::default();
+        let survivors =
+            any_process_running_best_effort_with(known, &mut validation_errors, &mut probe);
+        if let Some(validation_error) = validation_errors.error {
+            if let Some(signal_error) = signal_error
+                && signal_error.containment_failed
+            {
+                return Err(signal_error);
+            }
+            return Err(SignalError::inspection(validation_error));
+        }
+        if !survivors {
+            if let Some(signal_error) = signal_error
+                && signal_error.containment_failed
+            {
+                return Err(signal_error);
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(signal_error.unwrap_or_else(|| {
+                SignalError::inspection(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "processes remained alive after cleanup SIGKILL",
+                ))
+            }));
+        }
+        sleep(
+            PROCESS_CLEANUP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
     }
-    if let Err(error) = result
-        && survivors
-    {
-        return Err(error);
-    }
-    Ok(())
 }
 
 async fn drain_output_handlers(mut handles: [JoinHandle<std::io::Result<()>>; 2]) {
@@ -1373,7 +2360,7 @@ fn create_prefix(color: &str, tag: &str) -> String {
     let code = match colors.iter().find(|(name, _)| *name == color) {
         Some((_, code)) => code,
         None => {
-            std::eprintln!("No such color, ignoring: {}", color);
+            eprintln!("No such color, ignoring: {}", color);
             return tag.to_string();
         }
     };
@@ -1392,6 +2379,52 @@ const JOB_SHIM_SIGNALS: [libc::c_int; 6] = [
 ];
 static JOB_SHIM_TERMINATION_RECEIVED: AtomicU8 = AtomicU8::new(0);
 
+struct JobShimCompletionReporter {
+    writer: Option<std::fs::File>,
+    reported: bool,
+}
+
+fn job_shim_writer_from_fd(descriptor: Option<RawFd>) -> std::io::Result<Option<std::fs::File>> {
+    let Some(descriptor) = descriptor else {
+        return Ok(None);
+    };
+    let writer = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(writer))
+}
+
+impl JobShimCompletionReporter {
+    fn from_fd(descriptor: Option<RawFd>) -> std::io::Result<Self> {
+        let writer = job_shim_writer_from_fd(descriptor)?;
+        Ok(Self {
+            writer,
+            reported: false,
+        })
+    }
+
+    fn report(&mut self, status: u8) {
+        if self.reported {
+            return;
+        }
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.write_all(&[status]);
+        }
+        self.reported = true;
+    }
+
+    fn report_success(&mut self) {
+        self.report(JOB_SHIM_COMPLETED);
+    }
+}
+
+impl Drop for JobShimCompletionReporter {
+    fn drop(&mut self) {
+        self.report(JOB_SHIM_FAILED);
+    }
+}
+
 extern "C" fn job_shim_signal_handler(signal: libc::c_int) {
     if matches!(
         signal,
@@ -1405,19 +2438,46 @@ fn run_job_shim(args: &[String]) -> ExitCode {
     use std::os::unix::process::ExitStatusExt;
 
     let mut sudo_user = None;
+    let mut cleanup_sudo_user = None;
+    let mut completion_fd = None;
+    let mut ready_fd = None;
     let mut shutdown_timeout = None;
+    let mut hold_on_supervision_failure = false;
     let mut job_env = Vec::new();
     let mut command = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--completion-fd" if index + 1 < args.len() => {
+                completion_fd = args[index + 1]
+                    .parse::<RawFd>()
+                    .ok()
+                    .filter(|descriptor| *descriptor >= 0);
+                index += 2;
+            }
+            "--ready-fd" if index + 1 < args.len() => {
+                ready_fd = args[index + 1]
+                    .parse::<RawFd>()
+                    .ok()
+                    .filter(|descriptor| *descriptor >= 0);
+                index += 2;
+            }
             "--sudo-user" if index + 1 < args.len() => {
                 sudo_user = Some(args[index + 1].clone());
+                cleanup_sudo_user = sudo_user.clone();
+                index += 2;
+            }
+            "--cleanup-sudo-user" if index + 1 < args.len() => {
+                cleanup_sudo_user = Some(args[index + 1].clone());
                 index += 2;
             }
             "--shutdown-timeout" if index + 1 < args.len() => {
                 shutdown_timeout = args[index + 1].parse::<u64>().ok();
                 index += 2;
+            }
+            "--hold-on-supervision-failure" => {
+                hold_on_supervision_failure = true;
+                index += 1;
             }
             "--job-env" if index + 2 < args.len() => {
                 job_env.push((args[index + 1].clone(), args[index + 2].clone()));
@@ -1436,6 +2496,20 @@ fn run_job_shim(args: &[String]) -> ExitCode {
     let Some(command_text) = command else {
         std::eprintln!("Job shim command is missing");
         return ExitCode::from(1);
+    };
+    let mut completion = match JobShimCompletionReporter::from_fd(completion_fd) {
+        Ok(completion) => completion,
+        Err(error) => {
+            std::eprintln!("Job shim could not initialize its completion channel: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut readiness = match job_shim_writer_from_fd(ready_fd) {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            std::eprintln!("Job shim could not initialize its readiness channel: {error}");
+            return ExitCode::from(1);
+        }
     };
     let Some(shutdown_timeout) = shutdown_timeout else {
         std::eprintln!("Job shim shutdown timeout is missing or invalid");
@@ -1499,10 +2573,19 @@ fn run_job_shim(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let status = match wait_for_job_shim_main_child(&child) {
+    if let Some(writer) = &mut readiness {
+        let _ = writer.write_all(&[JOB_SHIM_READY]);
+    }
+    drop(readiness);
+    let status = match wait_for_main_child(&child) {
         Ok(status) => status,
         Err(error) => {
             std::eprintln!("Job shim could not wait for command: {error}");
+            if hold_on_supervision_failure {
+                loop {
+                    std::thread::park();
+                }
+            }
             return ExitCode::from(1);
         }
     };
@@ -1516,16 +2599,32 @@ fn run_job_shim(args: &[String]) -> ExitCode {
     let cleanup = if termination_observed {
         match wait_for_descendants(identity, Duration::from_secs(shutdown_timeout)) {
             Ok(true) => Ok(()),
-            Ok(false) => reconcile_descendants(identity, sudo_user.as_deref(), "Job shim"),
-            Err(error) => Err(error),
+            Ok(false) => reconcile_descendants(identity, cleanup_sudo_user.as_deref(), "Job shim"),
+            Err(wait_error) => {
+                match reconcile_descendants(identity, cleanup_sudo_user.as_deref(), "Job shim") {
+                    Ok(()) => Err(wait_error),
+                    Err(cleanup_error) => Err(std::io::Error::new(
+                        wait_error.kind(),
+                        format!(
+                            "could not verify descendants before cleanup: {wait_error}; cleanup also failed: {cleanup_error}"
+                        ),
+                    )),
+                }
+            }
         }
     } else {
-        reconcile_descendants(identity, sudo_user.as_deref(), "Job shim")
+        reconcile_descendants(identity, cleanup_sudo_user.as_deref(), "Job shim")
     };
     if let Err(error) = cleanup {
         std::eprintln!("Job shim could not supervise descendants: {error}");
+        if hold_on_supervision_failure {
+            loop {
+                std::thread::park();
+            }
+        }
         return ExitCode::from(1);
     }
+    completion.report_success();
 
     if let Some(code) = status.code() {
         return ExitCode::from(code as u8);
@@ -1540,31 +2639,45 @@ fn run_job_shim(args: &[String]) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn wait_for_job_shim_main_child(
-    child: &std::process::Child,
-) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::ExitStatusExt;
-
+fn wait_for_main_child(child: &std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     let main_pid = i32::try_from(child.id())
         .map_err(|_| std::io::Error::other("process ID does not fit wait target"))?;
-    loop {
+    wait_for_main_child_with(main_pid, || {
         let mut raw_status = 0;
         let waited = unsafe { libc::waitpid(-1, &mut raw_status, 0) };
-        if waited == main_pid {
-            return Ok(std::process::ExitStatus::from_raw(raw_status));
-        }
         if waited > 0 {
-            continue;
+            Ok((waited, raw_status))
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error);
+    })
+}
+
+fn wait_for_main_child_with<W>(
+    main_pid: libc::pid_t,
+    mut wait_for_child: W,
+) -> std::io::Result<std::process::ExitStatus>
+where
+    W: FnMut() -> std::io::Result<(libc::pid_t, libc::c_int)>,
+{
+    use std::os::unix::process::ExitStatusExt;
+
+    loop {
+        match wait_for_child() {
+            Ok((pid, status)) if pid == main_pid => {
+                return Ok(std::process::ExitStatus::from_raw(status));
+            }
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+            Err(error) => return Err(error),
         }
     }
 }
 
 fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::Result<bool> {
-    let deadline = std::time::Instant::now() + duration;
+    let deadline = std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| std::io::Error::other("shutdown timeout exceeds the supported range"))?;
     let mut known = HashSet::new();
     let mut last_capture_failure_log = None;
     loop {
@@ -1579,6 +2692,12 @@ fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::R
             capture_failure_window,
             &mut last_capture_failure_log,
         )?;
+        if snapshot.process_was_unresolved(root.pid) {
+            return Err(std::io::Error::other(format!(
+                "could not inspect job shim {} while waiting for its descendants",
+                root.pid
+            )));
+        }
         known = snapshot.related_processes(root, false, &known);
         let mut any_running = false;
         for process in &known {
@@ -1728,7 +2847,14 @@ fn main() -> ExitCode {
     let mut rng = rand::rng();
     let mut next_random_color_index = rng.random_range(0..print_colors.len());
 
-    for job_config in config.jobs.values_mut() {
+    for (job_name, job_config) in &mut config.jobs {
+        if !job_config.disabled
+            && !job_config.command.is_empty()
+            && let Err(error) = validate_job_config(job_name, job_config)
+        {
+            std::eprintln!("Invalid job configuration: {error}");
+            return ExitCode::from(1);
+        }
         if job_config.color.is_empty() {
             job_config.color = print_colors[next_random_color_index].to_string();
             next_random_color_index = (next_random_color_index + 1) % print_colors.len();
@@ -1784,7 +2910,7 @@ fn main() -> ExitCode {
     let exit_code = match runtime.block_on(run_supervisor(config, base_env)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            std::eprintln!("Failed to run supervisor: {}", error);
+            eprintln!("Failed to run supervisor: {}", error);
             ExitCode::from(1)
         }
     };
@@ -1838,6 +2964,8 @@ async fn run_supervisor(
     let mut scanner_finished = false;
     let mut pid_map: HashMap<String, Arc<Mutex<HashMap<u32, TrackedRun>>>> = HashMap::new();
     let mut job_handles = JoinSet::new();
+    let mut signal_handles = JoinSet::new();
+    let mut pending_signals = VecDeque::new();
 
     for (name, job_config) in config.jobs {
         if job_config.disabled {
@@ -1915,30 +3043,28 @@ async fn run_supervisor(
             }
             _ = sigusr1.recv() => {
                 eprintln!("Received USR1 signal, forwarding to all jobs..");
-                match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(snapshot) => {
-                        if let Err(error) = forward_signal_to_jobs(&pid_map, &snapshot, libc::SIGUSR1).await {
-                            eprintln!("Signal forwarding failed: {}", error);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
-                    }
+                queue_pending_signal(&mut pending_signals, libc::SIGUSR1);
+                if let Err(error) = start_pending_signal_forwarding(
+                    &mut pending_signals,
+                    &mut signal_handles,
+                    &pid_map,
+                    &scanner_request_tx,
+                ).await {
+                    eprintln!("Could not refresh process snapshot: {}", error);
+                    break ("SCANNER FAILURE", true);
                 }
             }
             _ = sigusr2.recv() => {
                 eprintln!("Received USR2 signal, forwarding to all jobs..");
-                match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(snapshot) => {
-                        if let Err(error) = forward_signal_to_jobs(&pid_map, &snapshot, libc::SIGUSR2).await {
-                            eprintln!("Signal forwarding failed: {}", error);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
-                    }
+                queue_pending_signal(&mut pending_signals, libc::SIGUSR2);
+                if let Err(error) = start_pending_signal_forwarding(
+                    &mut pending_signals,
+                    &mut signal_handles,
+                    &pid_map,
+                    &scanner_request_tx,
+                ).await {
+                    eprintln!("Could not refresh process snapshot: {}", error);
+                    break ("SCANNER FAILURE", true);
                 }
             }
             result = job_handles.join_next(), if !job_handles.is_empty() => {
@@ -1949,6 +3075,26 @@ async fn run_supervisor(
                     None => {}
                 }
                 break ("SUPERVISOR FAILURE", true);
+            }
+            result = signal_handles.join_next(), if !signal_handles.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) if error.containment_failed => {
+                        eprintln!("Signal helper containment failed: {}", error.error);
+                        break ("SUPERVISOR FAILURE", true);
+                    }
+                    Some(Ok(Err(error))) => eprintln!("Signal forwarding failed: {}", error.error),
+                    Some(Err(error)) => eprintln!("Signal forwarding task failed: {error}"),
+                }
+                if let Err(error) = start_pending_signal_forwarding(
+                    &mut pending_signals,
+                    &mut signal_handles,
+                    &pid_map,
+                    &scanner_request_tx,
+                ).await {
+                    eprintln!("Could not refresh process snapshot: {}", error);
+                    break ("SCANNER FAILURE", true);
+                }
             }
             result = &mut scanner_handle, if !scanner_finished => {
                 scanner_finished = true;
@@ -1967,7 +3113,7 @@ async fn run_supervisor(
     let _ = shutdown_tx.send(ShutdownState::Graceful);
 
     let mut escalated = false;
-    while !job_handles.is_empty() {
+    while !job_handles.is_empty() || !signal_handles.is_empty() {
         tokio::select! {
             _ = sigterm.recv() => escalate_shutdown(&shutdown_tx, &mut escalated),
             _ = sighup.recv() => escalate_shutdown(&shutdown_tx, &mut escalated),
@@ -1975,7 +3121,7 @@ async fn run_supervisor(
             _ = sigquit.recv() => escalate_shutdown(&shutdown_tx, &mut escalated),
             _ = sigusr1.recv() => {}
             _ = sigusr2.recv() => {}
-            result = job_handles.join_next() => {
+            result = job_handles.join_next(), if !job_handles.is_empty() => {
                 match result {
                     Some(Ok(Ok(()))) | None => {}
                     Some(Ok(Err(error))) => {
@@ -1984,6 +3130,20 @@ async fn run_supervisor(
                     }
                     Some(Err(error)) => {
                         eprintln!("Job supervisor task failed during shutdown: {}", error);
+                        invariant_failed = true;
+                    }
+                }
+            }
+            result = signal_handles.join_next(), if !signal_handles.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) if error.containment_failed => {
+                        eprintln!("Signal helper containment failed: {}", error.error);
+                        invariant_failed = true;
+                    }
+                    Some(Ok(Err(error))) => eprintln!("Signal forwarding failed: {}", error.error),
+                    Some(Err(error)) => {
+                        eprintln!("Signal forwarding task failed: {error}");
                         invariant_failed = true;
                     }
                 }
@@ -2192,11 +3352,38 @@ fn send_signal_target(target: i32, signal: libc::c_int) -> std::io::Result<()> {
     Err(std::io::Error::last_os_error())
 }
 
+async fn start_pending_signal_forwarding(
+    pending: &mut VecDeque<libc::c_int>,
+    handles: &mut JoinSet<Result<(), SignalError>>,
+    pid_map: &HashMap<String, Arc<Mutex<HashMap<u32, TrackedRun>>>>,
+    scanner: &Sender<ProcessScannerRequest>,
+) -> std::io::Result<()> {
+    if !handles.is_empty() {
+        return Ok(());
+    }
+    let signal = pending.pop_front();
+    let Some(signal) = signal else {
+        return Ok(());
+    };
+
+    let snapshot = refresh_process_snapshot(scanner).await?;
+    let signal_targets = pid_map.clone();
+    handles.spawn(async move { forward_signal_to_jobs(&signal_targets, &snapshot, signal).await });
+    Ok(())
+}
+
+fn queue_pending_signal(pending: &mut VecDeque<libc::c_int>, signal: libc::c_int) {
+    if !pending.contains(&signal) {
+        pending.push_back(signal);
+    }
+}
+
 async fn forward_signal_to_jobs(
     pid_map: &HashMap<String, Arc<Mutex<HashMap<u32, TrackedRun>>>>,
     snapshot: &ProcessSnapshot,
     signal: libc::c_int,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
+    let deadline = Instant::now() + SUDO_SIGNAL_TIMEOUT;
     let mut targets = Vec::new();
     let mut delivery_error = SignalErrors::default();
     for (sudo_user, pids) in pid_map {
@@ -2208,25 +3395,35 @@ async fn forward_signal_to_jobs(
         );
     }
 
+    let mut deliveries = JoinSet::new();
     for (sudo_user, tracked) in targets {
         let descendants = if tracked.info.is_process_group {
             snapshot.related_processes(tracked.info.identity, true, &tracked.descendants)
         } else {
             HashSet::new()
         };
-        if let Err(error) = signal_process_tree(
-            "Signal forwarding",
-            (!sudo_user.is_empty()).then_some(sudo_user.as_str()),
-            tracked.info,
-            &descendants,
-            signal,
-        )
-        .await
-        {
-            delivery_error.record_signal(error);
+        deliveries.spawn(async move {
+            signal_process_tree(
+                "Signal forwarding",
+                (!sudo_user.is_empty()).then_some(sudo_user.as_str()),
+                tracked.info,
+                &descendants,
+                signal,
+                deadline,
+            )
+            .await
+        });
+    }
+    while let Some(result) = deliveries.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => delivery_error.record_signal(error),
+            Err(error) => delivery_error.record_delivery(std::io::Error::other(format!(
+                "signal delivery task failed: {error}"
+            ))),
         }
     }
-    delivery_error.finish().map_err(|error| error.error)
+    delivery_error.finish()
 }
 
 async fn signal_run(
@@ -2235,6 +3432,7 @@ async fn signal_run(
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
+    deadline: Instant,
 ) -> Result<(), SignalError> {
     signal_process_tree(
         log_prefix,
@@ -2242,6 +3440,7 @@ async fn signal_run(
         info,
         descendants,
         signal,
+        deadline,
     )
     .await
 }
@@ -2252,16 +3451,23 @@ async fn signal_run_with_retry(
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
+    deadline: Instant,
 ) -> Result<(), SignalError> {
+    let deadline = deadline.min(Instant::now() + SUDO_SIGNAL_TIMEOUT);
     let mut last_error = None;
     for attempt in 0..SIGNAL_RETRY_LIMIT {
-        match signal_run(log_prefix, opts, info, descendants, signal).await {
+        match signal_run(log_prefix, opts, info, descendants, signal, deadline).await {
             Ok(()) => return Ok(()),
+            Err(error) if error.containment_failed => return Err(error),
             Err(error) if error.delivery_failed => last_error = Some(error),
             Err(error) => return Err(error),
         }
         if attempt + 1 < SIGNAL_RETRY_LIMIT {
-            sleep(SIGNAL_RETRY_INTERVAL).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            sleep(SIGNAL_RETRY_INTERVAL.min(remaining)).await;
         }
     }
     Err(last_error
@@ -2269,7 +3475,9 @@ async fn signal_run_with_retry(
 }
 
 fn log_signal_error(status_prefix: &PrefixWriter<'_>, signal: libc::c_int, error: &SignalError) {
-    let operation = if error.delivery_failed {
+    let operation = if error.containment_failed {
+        "contain signal helper processes after"
+    } else if error.delivery_failed {
         "deliver"
     } else {
         "verify targets for"
@@ -2283,12 +3491,105 @@ fn log_signal_error(status_prefix: &PrefixWriter<'_>, signal: libc::c_int, error
     );
 }
 
+fn retain_signal_error(current: &mut Option<SignalError>, error: SignalError) {
+    if current
+        .as_ref()
+        .is_none_or(|existing| !existing.containment_failed)
+    {
+        *current = Some(error);
+    }
+}
+
+async fn signal_run_and_log(
+    status_prefix: &PrefixWriter<'_>,
+    log_prefix: &str,
+    opts: &JobConfig,
+    info: PidInfo,
+    descendants: &HashSet<ProcessIdentity>,
+    signal: libc::c_int,
+    deadline: Instant,
+) -> Option<SignalError> {
+    match signal_run_with_retry(log_prefix, opts, info, descendants, signal, deadline).await {
+        Ok(()) => None,
+        Err(error) => {
+            log_signal_error(status_prefix, signal, &error);
+            Some(error)
+        }
+    }
+}
+
+fn sudo_transport_processes(
+    root: ProcessIdentity,
+    username: &str,
+    processes: &[ProcessIdentity],
+) -> HashSet<ProcessIdentity> {
+    let mut candidates = Vec::new();
+    for process in processes {
+        let parent_pid = match process_tree::parent_pid_checked(*process) {
+            Ok(Some(parent_pid)) => parent_pid,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+        let executable = process_tree::executable_path_checked(*process)
+            .ok()
+            .flatten();
+        let launch_command = process_tree::command_line_checked(*process)
+            .ok()
+            .flatten()
+            .is_some_and(|command_line| is_sudo_launch_command(&command_line, username));
+        candidates.push((*process, parent_pid, executable, launch_command));
+    }
+
+    let mut transports = HashMap::new();
+    for (process, parent_pid, executable, launch_command) in &candidates {
+        if *parent_pid == root.pid && *launch_command {
+            transports.insert(*process, executable.clone());
+        }
+    }
+    loop {
+        let previous_len = transports.len();
+        for (process, parent_pid, executable, launch_command) in &candidates {
+            let Some(parent_executable) = transports.iter().find_map(|(transport, path)| {
+                (transport.pid == *parent_pid).then_some(path.as_ref())
+            }) else {
+                continue;
+            };
+            if *launch_command
+                || executable
+                    .as_ref()
+                    .is_some_and(|path| Some(path) == parent_executable)
+            {
+                transports.insert(*process, executable.clone());
+            }
+        }
+        if transports.len() == previous_len {
+            return transports.into_keys().collect();
+        }
+    }
+}
+
+fn is_sudo_launch_command(command_line: &[u8], username: &str) -> bool {
+    let arguments: Vec<&[u8]> = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    arguments.get(1..7).is_some_and(|arguments| {
+        arguments[0] == b"-n"
+            && arguments[1] == b"-u"
+            && arguments[2] == username.as_bytes()
+            && arguments[3] == b"--"
+            && arguments[4] == b"env"
+            && arguments[5] == b"--"
+    })
+}
+
 async fn signal_process_tree(
     log_prefix: &str,
     sudo_user: Option<&str>,
     info: PidInfo,
     descendants: &HashSet<ProcessIdentity>,
     signal: libc::c_int,
+    deadline: Instant,
 ) -> Result<(), SignalError> {
     let root = info.identity;
     let mut delivery_error = SignalErrors::default();
@@ -2302,14 +3603,23 @@ async fn signal_process_tree(
             delivery_error.record_delivery(error);
         }
 
-        let targets: HashSet<ProcessIdentity> = descendants
-            .iter()
-            .copied()
-            .filter(|process| process_is_running_best_effort(*process, &mut delivery_error))
-            .collect();
+        let mut targets = Vec::new();
+        for process in descendants {
+            if !process_is_running_best_effort(*process, &mut delivery_error) {
+                continue;
+            }
+            targets.push(*process);
+        }
+        if signal != libc::SIGKILL {
+            let transports = sudo_transport_processes(root, username, &targets);
+            if targets.iter().any(|process| !transports.contains(process)) {
+                targets.retain(|process| !transports.contains(process));
+            }
+        }
+        let targets: HashSet<_> = targets.into_iter().collect();
         if !targets.is_empty()
             && let Err(error) =
-                signal_identities_as_user(log_prefix, username, signal, &targets).await
+                signal_identities_as_user(log_prefix, username, signal, &targets, deadline).await
         {
             delivery_error.record_signal(error);
         }
@@ -2377,13 +3687,31 @@ async fn signal_process_tree(
 struct SignalError {
     error: std::io::Error,
     delivery_failed: bool,
+    containment_failed: bool,
 }
 
 impl SignalError {
+    fn inspection(error: std::io::Error) -> Self {
+        Self {
+            error,
+            delivery_failed: false,
+            containment_failed: false,
+        }
+    }
+
     fn delivery(error: std::io::Error) -> Self {
         Self {
             error,
             delivery_failed: true,
+            containment_failed: false,
+        }
+    }
+
+    fn containment(error: std::io::Error) -> Self {
+        Self {
+            error,
+            delivery_failed: false,
+            containment_failed: true,
         }
     }
 }
@@ -2392,6 +3720,7 @@ impl SignalError {
 struct SignalErrors {
     error: Option<std::io::Error>,
     delivery_failed: bool,
+    containment_failed: bool,
 }
 
 impl SignalErrors {
@@ -2402,14 +3731,23 @@ impl SignalErrors {
     }
 
     fn record_delivery(&mut self, error: std::io::Error) {
-        if !self.delivery_failed {
+        if !self.containment_failed && !self.delivery_failed {
             self.error = Some(error);
         }
         self.delivery_failed = true;
     }
 
+    fn record_containment(&mut self, error: std::io::Error) {
+        if !self.containment_failed {
+            self.error = Some(error);
+        }
+        self.containment_failed = true;
+    }
+
     fn record_signal(&mut self, error: SignalError) {
-        if error.delivery_failed {
+        if error.containment_failed {
+            self.record_containment(error.error);
+        } else if error.delivery_failed {
             self.record_delivery(error.error);
         } else {
             self.record_inspection(error.error);
@@ -2421,6 +3759,7 @@ impl SignalErrors {
             Err(SignalError {
                 error,
                 delivery_failed: self.delivery_failed,
+                containment_failed: self.containment_failed,
             })
         })
     }
@@ -2468,49 +3807,299 @@ async fn signal_as_user(
     username: &str,
     signal: libc::c_int,
     targets: &[i32],
-) -> std::io::Result<()> {
-    let mut command = Command::new("sudo");
+    deadline: Instant,
+) -> Result<(), SignalError> {
+    let started_at = Instant::now();
+    let helper_deadline =
+        started_at + SUDO_SIGNAL_TIMEOUT.min(deadline.saturating_duration_since(started_at));
+    let cleanup_reserve =
+        SIGNAL_HELPER_CLEANUP_RESERVE.min(helper_deadline.saturating_duration_since(started_at));
+    let helper_timeout = helper_deadline
+        .saturating_duration_since(started_at)
+        .saturating_sub(cleanup_reserve);
+    if helper_timeout.is_zero() {
+        return Err(SignalError::delivery(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{log_prefix} > sudo signal deadline expired"),
+        )));
+    }
+    let (completion_reader, completion_writer) =
+        job_shim_completion_pipe().map_err(SignalError::delivery)?;
+    let mut completion_reader = Some(completion_reader);
+    let mut helper_command = "exec sudo -n -u ".to_string();
+    helper_command.push_str(username);
+    helper_command.push_str(
+        " -- sh -c 'signal=$1; shift; failed=0; for target do kill \"$signal\" \"$target\" || { [ ! -e \"/proc/$target\" ] || failed=1; }; done; exit \"$failed\"' job-runner-signal -",
+    );
+    helper_command.push_str(signal_number_to_name(signal));
+    for target in targets {
+        helper_command.push(' ');
+        helper_command.push_str(&target.to_string());
+    }
+
+    let completion_fd = completion_writer.as_raw_fd();
+    let mut command = Command::new("/proc/self/exe");
     command
         .args([
-            "-n",
-            "-u",
-            username,
+            "--job-shim",
+            "--completion-fd",
+            &completion_fd.to_string(),
+            "--shutdown-timeout",
+            "0",
+            "--hold-on-supervision-failure",
             "--",
-            "sh",
-            "-c",
-            "signal=$1; shift; failed=0; for target do kill \"$signal\" \"$target\" || failed=1; done; exit \"$failed\"",
-            "job-runner-signal",
-            &format!("-{}", signal_number_to_name(signal)),
+            &helper_command,
         ])
-        .args(targets.iter().map(i32::to_string))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(completion_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = command.spawn().map_err(|error| {
-        std::io::Error::new(
+        SignalError::delivery(std::io::Error::new(
             error.kind(),
             format!("{log_prefix} > Could not run sudo signal helper: {error}"),
-        )
+        ))
     })?;
-    match timeout(SUDO_SIGNAL_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(std::io::Error::other(format!(
-            "{log_prefix} > sudo signal helper exited with {status}"
-        ))),
-        Ok(Err(error)) => Err(std::io::Error::new(
-            error.kind(),
-            format!("{log_prefix} > sudo signal helper failed: {error}"),
-        )),
+    drop(completion_writer);
+    let helper_identity = child.id().and_then(|pid| process_tree::identity(pid).ok());
+    match timeout(helper_timeout, child.wait()).await {
+        Ok(Ok(status)) => match read_job_shim_completion_async(&mut completion_reader).await {
+            Ok(()) if status.success() => Ok(()),
+            Ok(()) => Err(SignalError::delivery(std::io::Error::other(format!(
+                "{log_prefix} > sudo signal helper exited with {status}"
+            )))),
+            Err(completion_error) => {
+                let cleanup_error =
+                    cleanup_signal_helper(&mut child, helper_identity, username, helper_deadline)
+                        .await;
+                let detail = cleanup_error
+                    .map(|cleanup| format!("; helper cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
+                Err(SignalError::containment(std::io::Error::new(
+                    completion_error.kind(),
+                    format!(
+                        "{log_prefix} > sudo signal helper did not confirm cleanup: {completion_error}{detail}"
+                    ),
+                )))
+            }
+        },
+        Ok(Err(error)) => {
+            let cleanup_error =
+                cleanup_signal_helper(&mut child, helper_identity, username, helper_deadline).await;
+            let detail = cleanup_error
+                .map(|cleanup| format!("; helper cleanup failed: {cleanup}"))
+                .unwrap_or_default();
+            Err(SignalError::containment(std::io::Error::new(
+                error.kind(),
+                format!("{log_prefix} > sudo signal helper failed: {error}{detail}"),
+            )))
+        }
         Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(std::io::Error::new(
+            let cleanup_error =
+                cleanup_signal_helper(&mut child, helper_identity, username, helper_deadline).await;
+            let detail = cleanup_error
+                .as_ref()
+                .map(|cleanup| format!("; helper cleanup failed: {cleanup}"))
+                .unwrap_or_default();
+            let error = std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("{log_prefix} > sudo signal helper timed out"),
-            ))
+                format!("{log_prefix} > sudo signal helper timed out{detail}"),
+            );
+            Err(if cleanup_error.is_some() {
+                SignalError::containment(error)
+            } else {
+                SignalError::delivery(error)
+            })
         }
     }
+}
+
+async fn cleanup_signal_helper(
+    child: &mut tokio::process::Child,
+    identity: Option<ProcessIdentity>,
+    username: &str,
+    deadline: Instant,
+) -> Option<std::io::Error> {
+    let descendant_error = if let Some(identity) = identity {
+        let username = username.to_string();
+        match spawn_blocking(move || cleanup_signal_helper_tree(identity, &username, deadline))
+            .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(std::io::Error::other(format!(
+                "signal helper cleanup task failed: {error}"
+            ))),
+        }
+    } else {
+        Some(std::io::Error::other(
+            "could not inspect signal helper before cleanup",
+        ))
+    };
+
+    let root_error = terminate_signal_helper_root(child, deadline).await.err();
+    match (descendant_error, root_error) {
+        (None, None) => None,
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (Some(descendant_error), Some(root_error)) => Some(std::io::Error::new(
+            descendant_error.kind(),
+            format!("{descendant_error}; signal helper root cleanup failed: {root_error}"),
+        )),
+    }
+}
+
+async fn terminate_signal_helper_root(
+    child: &mut tokio::process::Child,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut last_error = None;
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => last_error = Some(error),
+    }
+
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = send_signal_target(-pid, libc::SIGKILL);
+    }
+    if let Err(error) = child.start_kill() {
+        last_error = Some(error);
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        match timeout(remaining, child.wait()).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => last_error = Some(error),
+    }
+
+    let detail = last_error
+        .map(|error| format!("; last termination error: {error}"))
+        .unwrap_or_default();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("signal helper did not exit after SIGKILL{detail}"),
+    ))
+}
+
+fn cleanup_signal_helper_tree(
+    root: ProcessIdentity,
+    username: &str,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let snapshot = ProcessSnapshot::capture()?;
+    let root_was_unresolved = snapshot.process_was_unresolved(root.pid);
+    let descendants = snapshot.related_processes(root, false, &HashSet::new());
+    let mut targets = Vec::new();
+    let root_exists = process_tree::exists_checked(root)?;
+    let mut group_is_owned = root_exists;
+    for process in &descendants {
+        if process_tree::is_running_checked(*process)? {
+            if process.process_group == root.pid {
+                group_is_owned = true;
+            }
+            targets.push(
+                i32::try_from(process.pid)
+                    .map_err(|_| std::io::Error::other("process ID does not fit signal target"))?,
+            );
+        }
+    }
+
+    let mut first_error = None;
+    for target in helper_root_signal_targets(root, root_exists, group_is_owned) {
+        if let Err(error) = send_signal_target(target, libc::SIGKILL)
+            && error.raw_os_error() != Some(libc::ESRCH)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    let mut privileged_targets = Vec::new();
+    for target in &targets {
+        if let Err(error) = send_signal_target(*target, libc::SIGKILL) {
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => {}
+                Some(libc::EPERM) => privileged_targets.push(*target),
+                _ if first_error.is_none() => first_error = Some(error),
+                _ => {}
+            }
+        }
+    }
+    if !privileged_targets.is_empty() {
+        let helper_timeout = deadline.saturating_duration_since(Instant::now());
+        if let Err(error) = run_sudo_reconcile_helper(username, &privileged_targets, helper_timeout)
+        {
+            if error.containment_failed {
+                return Err(error.error);
+            }
+            if first_error.is_none() {
+                first_error = Some(error.error);
+            }
+        }
+    }
+
+    loop {
+        let mut survivors = 0;
+        for process in &descendants {
+            if process_tree::is_running_checked(*process)? {
+                survivors += 1;
+            }
+        }
+        if survivors == 0 {
+            return if root_was_unresolved {
+                Err(std::io::Error::other(format!(
+                    "could not inspect signal helper {} while discovering its descendants",
+                    root.pid
+                )))
+            } else {
+                Ok(())
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(first_error.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{survivors} signal helper descendants remained alive after SIGKILL"),
+                )
+            }));
+        }
+        std::thread::sleep(
+            PROCESS_CLEANUP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn helper_root_signal_targets(
+    root: ProcessIdentity,
+    root_exists: bool,
+    group_is_owned: bool,
+) -> Vec<i32> {
+    let Ok(pid) = i32::try_from(root.pid) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::with_capacity(2);
+    if group_is_owned {
+        targets.push(-pid);
+    }
+    if root_exists {
+        targets.push(pid);
+    }
+    targets
 }
 
 async fn signal_identities_as_user(
@@ -2518,6 +4107,7 @@ async fn signal_identities_as_user(
     username: &str,
     signal: libc::c_int,
     processes: &HashSet<ProcessIdentity>,
+    deadline: Instant,
 ) -> Result<(), SignalError> {
     let mut errors = SignalErrors::default();
     let mut targets = Vec::with_capacity(processes.len());
@@ -2534,9 +4124,9 @@ async fn signal_identities_as_user(
         }
     }
     if !targets.is_empty()
-        && let Err(error) = signal_as_user(log_prefix, username, signal, &targets).await
+        && let Err(error) = signal_as_user(log_prefix, username, signal, &targets, deadline).await
     {
-        errors.record_delivery(error);
+        errors.record_signal(error);
     }
     errors.finish()
 }
@@ -2669,7 +4259,7 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
                 Ok(())
             });
         }
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
                 lock_or_recover(&signal_state).cancel_publication();
@@ -2679,45 +4269,41 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
             }
         };
 
-        let identity = match process_tree::identity(child.id()) {
+        let mut inner_termination_error = None;
+        let inner_was_supervised = match process_tree::identity(child.id()) {
             Ok(identity) => {
                 publish_wrapper_inner(&signal_state, identity);
-                identity
+                match wait_for_main_child(&child) {
+                    Ok(exit_status) => match exit_status.code() {
+                        Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
+                        None => eprintln!("[Wrapper] Process terminated by signal"),
+                    },
+                    Err(e) => {
+                        eprintln!("[Wrapper] Failed to read exit status: {}", e);
+                    }
+                }
+                lock_or_recover(&signal_state).clear(identity);
+                true
             }
             Err(error) => {
                 lock_or_recover(&signal_state).cancel_publication();
                 eprintln!("[Wrapper] Could not inspect inner process: {}", error);
-                let _ = child.kill();
-                let _ = child.wait();
-                if shutdown_state.load(Ordering::Acquire) != 0 {
-                    eprintln!("[Wrapper] Shutdown complete, exiting..");
-                    return ExitCode::SUCCESS;
-                }
-                eprintln!(
-                    "[Wrapper] Inner process could not be supervised, waiting 15 seconds before restarting.."
-                );
-                wrapper_delay(&shutdown_state, Duration::from_secs(15));
-                continue;
+                inner_termination_error = terminate_wrapper_inner(child).err();
+                false
             }
         };
-
-        match child.wait() {
-            Ok(exit_status) => match exit_status.code() {
-                Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
-                None => eprintln!("[Wrapper] Process terminated by signal"),
-            },
-            Err(e) => {
-                eprintln!("[Wrapper] Failed to read exit status: {}", e);
-            }
-        }
-        lock_or_recover(&signal_state).clear(identity);
 
         if let Err(error) = reconcile_descendants_with_sudo_users(
             wrapper_identity,
             configured_wrapper_sudo_users(inner_args),
             "Wrapper",
+            false,
         ) {
             eprintln!("[Wrapper] Could not clean up previous-generation jobs: {error}");
+            return ExitCode::from(1);
+        }
+        if let Some(error) = inner_termination_error {
+            eprintln!("[Wrapper] Could not stop unsupervised inner process: {error}");
             return ExitCode::from(1);
         }
 
@@ -2726,8 +4312,44 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
+        if inner_was_supervised {
+            eprintln!("[Wrapper] Inner process exited, waiting 15 seconds before restarting..");
+        } else {
+            eprintln!(
+                "[Wrapper] Inner process could not be supervised, waiting 15 seconds before restarting.."
+            );
+        }
         wrapper_delay(&shutdown_state, Duration::from_secs(15));
+    }
+}
+
+fn terminate_wrapper_inner(mut child: std::process::Child) -> std::io::Result<()> {
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + POST_KILL_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                hand_off_child_reaping(child)?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "inner process did not exit after SIGKILL",
+                ));
+            }
+            Err(error) => {
+                let handoff_detail = hand_off_child_reaping(child)
+                    .err()
+                    .map(|handoff| format!("; background reaping failed: {handoff}"))
+                    .unwrap_or_default();
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("could not reap inner process: {error}{handoff_detail}"),
+                ));
+            }
+        }
     }
 }
 
@@ -2740,6 +4362,7 @@ fn reconcile_descendants(
         root,
         sudo_user.into_iter().map(str::to_owned).collect(),
         label,
+        true,
     )
 }
 
@@ -2747,12 +4370,14 @@ fn reconcile_descendants_with_sudo_users(
     root: ProcessIdentity,
     mut sudo_users: HashSet<String>,
     label: &str,
+    require_root_resolution: bool,
 ) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + POST_KILL_WAIT;
     let mut known = HashSet::new();
     let mut cleanup_logged = false;
     let mut last_capture_failure_log = None;
     let mut last_kill_error = None;
+    let mut containment_error = None;
     loop {
         let capture_failure_window = PROCESS_SCAN_FAILURE_WINDOW.min(
             deadline
@@ -2765,6 +4390,15 @@ fn reconcile_descendants_with_sudo_users(
             capture_failure_window,
             &mut last_capture_failure_log,
         )?;
+        if require_root_resolution
+            && snapshot.process_was_unresolved(root.pid)
+            && containment_error.is_none()
+        {
+            containment_error = Some(std::io::Error::other(format!(
+                "could not inspect job shim {} while discovering its descendants",
+                root.pid
+            )));
+        }
         known = snapshot.related_processes(root, false, &known);
         let mut running = Vec::new();
         for process in &known {
@@ -2774,10 +4408,13 @@ fn reconcile_descendants_with_sudo_users(
         }
         if running.is_empty() {
             reap_adopted_children()?;
+            if let Some(error) = containment_error {
+                return Err(error);
+            }
             return Ok(());
         }
         if !cleanup_logged {
-            std::eprintln!(
+            eprintln!(
                 "[{label}] Cleaning up {} descendant process{}..",
                 running.len(),
                 if running.len() == 1 { "" } else { "es" }
@@ -2786,7 +4423,13 @@ fn reconcile_descendants_with_sudo_users(
         }
         discover_job_shim_sudo_users(&running, &mut sudo_users);
         if let Err(error) = kill_reconciled_processes(&running, &sudo_users, deadline) {
-            last_kill_error = Some(error);
+            if error.containment_failed {
+                if containment_error.is_none() {
+                    containment_error = Some(error.error);
+                }
+            } else {
+                last_kill_error = Some(error.error);
+            }
         }
         reap_adopted_children()?;
         if std::time::Instant::now() >= deadline {
@@ -2798,6 +4441,9 @@ fn reconcile_descendants_with_sudo_users(
             }
             if survivors.is_empty() {
                 reap_adopted_children()?;
+                if let Some(error) = containment_error {
+                    return Err(error);
+                }
                 return Ok(());
             }
             let survivor_pids = survivors
@@ -2805,8 +4451,9 @@ fn reconcile_descendants_with_sudo_users(
                 .map(|process| process.pid.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let detail = last_kill_error
+            let detail = containment_error
                 .as_ref()
+                .or(last_kill_error.as_ref())
                 .map(|error| format!("; last signal error: {error}"))
                 .unwrap_or_default();
             return Err(std::io::Error::new(
@@ -2854,41 +4501,54 @@ fn kill_reconciled_processes(
     processes: &[ProcessIdentity],
     sudo_users: &HashSet<String>,
     deadline: std::time::Instant,
-) -> std::io::Result<()> {
+) -> Result<(), SignalError> {
+    let mut errors = SignalErrors::default();
     let mut targets = Vec::with_capacity(processes.len());
     for process in processes {
-        if process_tree::is_running_checked(*process)? {
-            targets.push(
-                i32::try_from(process.pid)
-                    .map_err(|_| std::io::Error::other("process ID does not fit signal target"))?,
-            );
+        match process_tree::is_running_checked(*process) {
+            Ok(true) => match i32::try_from(process.pid) {
+                Ok(pid) => targets.push(pid),
+                Err(_) => errors.record_delivery(std::io::Error::other(
+                    "process ID does not fit signal target",
+                )),
+            },
+            Ok(false) => {}
+            Err(error) => errors.record_inspection(error),
         }
     }
     if targets.is_empty() {
-        return Ok(());
+        return errors.finish();
     }
-    let mut first_error = None;
+    let mut privileged_targets = Vec::new();
+    for target in targets {
+        if let Err(error) = send_signal_target(target, libc::SIGKILL) {
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => {}
+                Some(libc::EPERM) => {
+                    privileged_targets.push(target);
+                    if sudo_users.is_empty() {
+                        errors.record_delivery(error);
+                    }
+                }
+                _ => errors.record_delivery(error),
+            }
+        }
+    }
+    if privileged_targets.is_empty() {
+        return errors.finish();
+    }
     for (index, username) in sudo_users.iter().enumerate() {
         let helpers_left = u32::try_from(sudo_users.len() - index).unwrap_or(u32::MAX);
         let remaining = deadline
             .saturating_duration_since(std::time::Instant::now())
             .saturating_sub(RECONCILE_CONVERGENCE_RESERVE);
         let helper_timeout = (remaining / helpers_left).min(SUDO_SIGNAL_TIMEOUT);
-        if let Err(error) = run_sudo_reconcile_helper(username, &targets, helper_timeout)
-            && first_error.is_none()
+        if let Err(error) = run_sudo_reconcile_helper(username, &privileged_targets, helper_timeout)
         {
-            first_error = Some(error);
+            errors.record_signal(error);
         }
     }
-    for target in targets {
-        if let Err(error) = send_signal_target(target, libc::SIGKILL)
-            && error.raw_os_error() != Some(libc::ESRCH)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
+    errors.finish()
 }
 
 fn discover_job_shim_sudo_users(processes: &[ProcessIdentity], sudo_users: &mut HashSet<String>) {
@@ -2916,7 +4576,7 @@ fn discover_job_shim_sudo_users(processes: &[ProcessIdentity], sudo_users: &mut 
             continue;
         }
         for pair in arguments.windows(2) {
-            if pair[0] != b"--sudo-user" {
+            if pair[0] != b"--sudo-user" && pair[0] != b"--cleanup-sudo-user" {
                 continue;
             }
             let Ok(username) = std::str::from_utf8(pair[1]) else {
@@ -2933,42 +4593,248 @@ fn run_sudo_reconcile_helper(
     username: &str,
     targets: &[i32],
     duration: Duration,
-) -> std::io::Result<()> {
-    let mut child = std::process::Command::new("sudo")
+) -> Result<(), SignalError> {
+    use std::os::unix::process::CommandExt;
+
+    if duration.is_zero() {
+        return Err(SignalError::delivery(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "sudo cleanup helper deadline expired",
+        )));
+    }
+    let (completion_reader, completion_writer) =
+        job_shim_completion_pipe().map_err(SignalError::delivery)?;
+    let mut completion_reader = Some(completion_reader);
+    let mut helper_command = "exec sudo -n -u ".to_string();
+    helper_command.push_str(username);
+    helper_command.push_str(
+        " -- sh -c 'failed=0; for target do case \"$target\" in -*) /bin/kill -KILL -- \"$target\" ;; *) kill -KILL \"$target\" ;; esac || failed=1; done; exit \"$failed\"' job-runner-reconcile",
+    );
+    for target in targets {
+        helper_command.push(' ');
+        helper_command.push_str(&target.to_string());
+    }
+
+    let completion_fd = completion_writer.as_raw_fd();
+    let mut command = std::process::Command::new("/proc/self/exe");
+    command
         .args([
-            "-n",
-            "-u",
+            "--job-shim",
+            "--completion-fd",
+            &completion_fd.to_string(),
+            "--shutdown-timeout",
+            "0",
+            "--cleanup-sudo-user",
             username,
+            "--hold-on-supervision-failure",
             "--",
-            "sh",
-            "-c",
-            "failed=0; for target do kill -KILL \"$target\" || failed=1; done; exit \"$failed\"",
-            "job-runner-reconcile",
+            &helper_command,
         ])
-        .args(targets.iter().map(i32::to_string))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(completion_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(SignalError::delivery)?;
+    drop(completion_writer);
+    let helper_identity = process_tree::identity(child.id()).ok();
+    let mut known_descendants = HashSet::new();
+    let mut capture_error = None;
     let deadline = std::time::Instant::now() + duration;
+    let execution_deadline = std::time::Instant::now() + duration / 2;
+    let mut next_capture = std::time::Instant::now() + PROCESS_CLEANUP_POLL_INTERVAL;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(identity) = helper_identity
+            && std::time::Instant::now() >= next_capture
+        {
+            match ProcessSnapshot::capture() {
+                Ok(snapshot) => {
+                    let root_was_unresolved = snapshot.process_was_unresolved(identity.pid);
+                    known_descendants =
+                        snapshot.related_processes(identity, false, &known_descendants);
+                    capture_error = root_was_unresolved.then(|| {
+                        std::io::Error::other(format!(
+                            "could not inspect sudo cleanup helper {} while discovering its descendants",
+                            identity.pid
+                        ))
+                    });
+                }
+                Err(error) => capture_error = Some(error),
+            }
+            next_capture = std::time::Instant::now() + PROCESS_CLEANUP_POLL_INTERVAL;
+        }
+        let child_status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(identity) = helper_identity
+                    && let Ok(snapshot) = ProcessSnapshot::capture()
+                {
+                    known_descendants =
+                        snapshot.related_processes(identity, false, &known_descendants);
+                }
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    let _ = send_signal_target(-pid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let cleanup_error =
+                    cleanup_reconcile_helper_descendants(&known_descendants, deadline).err();
+                let reaping_error = hand_off_child_reaping(child).err();
+                let detail = cleanup_error
+                    .map(|cleanup| format!("; descendant cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
+                let reaping_detail = reaping_error
+                    .map(|reaping| format!("; helper reaping failed: {reaping}"))
+                    .unwrap_or_default();
+                return Err(SignalError::containment(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not inspect sudo cleanup helper status: {error}{detail}{reaping_detail}"
+                    ),
+                )));
+            }
+        };
+        if let Some(status) = child_status {
+            cleanup_reconcile_helper_descendants(&known_descendants, deadline)
+                .map_err(SignalError::containment)?;
+            read_job_shim_completion(&mut completion_reader).map_err(|error| {
+                SignalError::containment(std::io::Error::new(
+                    error.kind(),
+                    format!("sudo cleanup helper did not confirm containment: {error}"),
+                ))
+            })?;
             return if status.success() {
                 Ok(())
             } else {
-                Err(std::io::Error::other(format!(
+                Err(SignalError::delivery(std::io::Error::other(format!(
                     "sudo cleanup helper exited with {status}"
-                )))
+                ))))
             };
         }
-        if std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= execution_deadline {
+            if let Some(identity) = helper_identity {
+                match ProcessSnapshot::capture() {
+                    Ok(snapshot) => {
+                        let root_was_unresolved = snapshot.process_was_unresolved(identity.pid);
+                        known_descendants =
+                            snapshot.related_processes(identity, false, &known_descendants);
+                        capture_error = root_was_unresolved.then(|| {
+                            std::io::Error::other(format!(
+                                "could not inspect sudo cleanup helper {} while discovering its descendants",
+                                identity.pid
+                            ))
+                        });
+                    }
+                    Err(error) => capture_error = Some(error),
+                }
+            }
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = send_signal_target(-pid, libc::SIGKILL);
+            }
             let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
+            let cleanup_result = cleanup_reconcile_helper_descendants(&known_descendants, deadline);
+            let mut reaped = false;
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        reaped = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = hand_off_child_reaping(child);
+                        return Err(SignalError::containment(std::io::Error::new(
+                            error.kind(),
+                            format!("could not reap sudo cleanup helper: {error}"),
+                        )));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !reaped {
+                let handoff_error = hand_off_child_reaping(child).err();
+                let cleanup_detail = cleanup_result
+                    .err()
+                    .map(|error| format!("; descendant cleanup failed: {error}"))
+                    .unwrap_or_default();
+                let handoff_detail = handoff_error
+                    .map(|error| format!("; background reaping failed: {error}"))
+                    .unwrap_or_default();
+                return Err(SignalError::containment(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "sudo cleanup helper did not exit after SIGKILL{cleanup_detail}{handoff_detail}"
+                    ),
+                )));
+            }
+            cleanup_result.map_err(SignalError::containment)?;
+            if helper_identity.is_none() {
+                return Err(SignalError::containment(std::io::Error::other(
+                    "could not inspect sudo cleanup helper before timeout",
+                )));
+            }
+            if let Some(error) = capture_error {
+                return Err(SignalError::containment(std::io::Error::new(
+                    error.kind(),
+                    format!("could not verify sudo cleanup helper descendants: {error}"),
+                )));
+            }
+            return Err(SignalError::delivery(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "sudo cleanup helper timed out",
-            ));
+            )));
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn cleanup_reconcile_helper_descendants(
+    descendants: &HashSet<ProcessIdentity>,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let mut first_error = None;
+    for process in descendants {
+        if !process_tree::is_running_checked(*process)? {
+            continue;
+        }
+        let target = i32::try_from(process.pid)
+            .map_err(|_| std::io::Error::other("process ID does not fit signal target"))?;
+        if let Err(error) = send_signal_target(target, libc::SIGKILL)
+            && error.raw_os_error() != Some(libc::ESRCH)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+
+    loop {
+        let mut survivors = 0;
+        for process in descendants {
+            if process_tree::is_running_checked(*process)? {
+                survivors += 1;
+            }
+        }
+        if survivors == 0 {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(first_error.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "{survivors} sudo cleanup helper descendants remained alive after SIGKILL"
+                    ),
+                )
+            }));
+        }
+        std::thread::sleep(
+            Duration::from_millis(10)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
 }
 
@@ -3025,6 +4891,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forced_shim_kill_ignores_only_a_missing_completion() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (reader, writer) = job_shim_completion_pipe().unwrap();
+            drop(writer);
+            read_job_shim_shutdown_completion_async(&mut Some(reader), true)
+                .await
+                .unwrap();
+
+            let (reader, writer) = job_shim_completion_pipe().unwrap();
+            let mut writer = std::fs::File::from(writer);
+            writer.write_all(&[JOB_SHIM_FAILED]).unwrap();
+            drop(writer);
+            let error = read_job_shim_shutdown_completion_async(&mut Some(reader), true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("descendant supervision failure"));
+
+            let (reader, writer) = job_shim_completion_pipe().unwrap();
+            drop(writer);
+            assert!(
+                read_job_shim_shutdown_completion_async(&mut Some(reader), false)
+                    .await
+                    .is_err()
+            );
+
+            let (reader, _writer) = job_shim_completion_pipe().unwrap();
+            let error = read_job_shim_shutdown_completion_async(&mut Some(reader), true)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        });
+    }
+
+    #[test]
+    fn job_shim_readiness_wait_is_bounded() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (reader, _writer) = job_shim_readiness_pipe().unwrap();
+            let (_shutdown_tx, mut shutdown) = watch::channel(ShutdownState::Running);
+            let result = wait_for_job_shim_readiness(
+                &mut Some(reader),
+                &mut shutdown,
+                Duration::from_millis(10),
+            )
+            .await;
+            assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut));
+        });
+    }
+
+    #[test]
     fn process_group_defaults_to_enabled() {
         let config: Config =
             serde_yaml::from_str("jobs:\n  example:\n    command: echo ok\n").unwrap();
@@ -3042,6 +4959,156 @@ mod tests {
         )
         .unwrap();
         assert!(!config.jobs["example"].process_group);
+    }
+
+    #[test]
+    fn rejects_invalid_datetime_and_unrepresentable_durations() {
+        let mut config: Config =
+            serde_yaml::from_str("jobs:\n  example:\n    command: echo ok\n").unwrap();
+        let job = config.jobs.get_mut("example").unwrap();
+        job.datetime.enabled = true;
+        job.datetime.format = "%Q".to_string();
+        assert!(
+            validate_job_config("example", job)
+                .unwrap_err()
+                .contains("invalid datetime format")
+        );
+
+        job.datetime.format = "%#z".to_string();
+        assert!(
+            validate_job_config("example", job)
+                .unwrap_err()
+                .contains("invalid datetime format")
+        );
+
+        job.datetime.enabled = false;
+        job.shutdown_timeout = u64::MAX;
+        assert!(
+            validate_job_config("example", job)
+                .unwrap_err()
+                .contains("shutdown_timeout")
+        );
+    }
+
+    #[test]
+    fn invalid_datetime_format_falls_back_to_plain_prefix() {
+        let datetime = DateTimeConfig {
+            enabled: true,
+            format: "%#z".to_string(),
+            local: false,
+        };
+        let prefix = PrefixWriter::from("job (s)".to_string(), &datetime);
+
+        assert_eq!(prefix.to_string(), "job (s)");
+    }
+
+    #[test]
+    fn active_pid_registration_consumes_existing_shutdown_notification() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownState::Running);
+        shutdown_tx.send(ShutdownState::Graceful).unwrap();
+        let active = Mutex::new(HashMap::new());
+        let info = PidInfo {
+            is_process_group: true,
+            identity: ProcessIdentity {
+                pid: 42,
+                process_group: 42,
+                start_time: 1,
+            },
+        };
+
+        let state = register_active_pid(&active, &mut shutdown_rx, info, HashSet::new());
+
+        assert_eq!(state, ShutdownState::Graceful);
+        assert!(lock_or_recover(&active).is_empty());
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            assert!(
+                timeout(Duration::from_millis(10), shutdown_rx.changed())
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn main_child_wait_reaps_other_children_first() {
+        let mut waits = [(41, 0), (42, 7 << 8)].into_iter();
+        let status = wait_for_main_child_with(42, || Ok(waits.next().unwrap())).unwrap();
+
+        assert_eq!(status.code(), Some(7));
+        assert!(waits.next().is_none());
+    }
+
+    #[test]
+    fn background_child_reaper_does_not_block_on_an_earlier_live_child() {
+        let first = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let first_pid = first.id();
+        hand_off_child_reaping(first).unwrap();
+        let second = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let second_pid = second.id();
+        hand_off_child_reaping(second).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::path::Path::new(&format!("/proc/{second_pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "later handed-off child remained unreaped behind a live child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(std::path::Path::new(&format!("/proc/{first_pid}")).exists());
+        let _ = send_signal_target(i32::try_from(first_pid).unwrap(), libc::SIGKILL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::path::Path::new(&format!("/proc/{first_pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first handed-off child remained unreaped after SIGKILL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pending_user_signals_are_coalesced_without_reordering() {
+        let mut pending = VecDeque::new();
+        queue_pending_signal(&mut pending, libc::SIGUSR1);
+        queue_pending_signal(&mut pending, libc::SIGUSR2);
+        queue_pending_signal(&mut pending, libc::SIGUSR1);
+
+        assert_eq!(pending.pop_front(), Some(libc::SIGUSR1));
+        assert_eq!(pending.pop_front(), Some(libc::SIGUSR2));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_the_job_shims_sudo_launch_command() {
+        assert!(is_sudo_launch_command(
+            b"sudo\0-n\0-u\0worker\0--\0env\0--\0sh\0-c\0sleep 1\0",
+            "worker"
+        ));
+        assert!(!is_sudo_launch_command(
+            b"/custom/sudo\0/output/path\0",
+            "worker"
+        ));
+    }
+
+    #[test]
+    fn stale_helper_identity_does_not_authorize_pid_or_group_signals() {
+        let stale = ProcessIdentity {
+            pid: 42,
+            process_group: 42,
+            start_time: 1,
+        };
+
+        assert!(helper_root_signal_targets(stale, false, false).is_empty());
+        assert_eq!(helper_root_signal_targets(stale, false, true), vec![-42]);
+        assert_eq!(helper_root_signal_targets(stale, true, true), vec![-42, 42]);
     }
 
     #[test]
@@ -3932,6 +5999,18 @@ mod tests {
     }
 
     #[test]
+    fn signal_errors_prioritize_helper_containment_failure() {
+        let mut errors = SignalErrors::default();
+        errors.record_delivery(std::io::Error::other("delivery"));
+        errors.record_containment(std::io::Error::other("containment"));
+        errors.record_delivery(std::io::Error::other("later delivery"));
+
+        let error = errors.finish().unwrap_err();
+        assert!(error.containment_failed);
+        assert_eq!(error.error.to_string(), "containment");
+    }
+
+    #[test]
     fn cleanup_signals_before_returning_an_inspection_error() {
         let unreadable = ProcessIdentity {
             pid: 123,
@@ -3949,6 +6028,7 @@ mod tests {
         let error = runtime
             .block_on(cleanup_known_processes_with(
                 &HashSet::from([unreadable, running]),
+                Duration::ZERO,
                 |process| {
                     if process == unreadable {
                         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
@@ -3956,7 +6036,7 @@ mod tests {
                         Ok(true)
                     }
                 },
-                |targets| {
+                |targets, _| {
                     signaled.replace(Some(targets));
                     std::future::ready(Ok(()))
                 },
@@ -3964,7 +6044,59 @@ mod tests {
             .unwrap_err();
 
         assert!(signaled.borrow().as_ref().unwrap().contains(&running));
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn cleanup_rejects_a_survivor_after_successful_signal_delivery() {
+        let running = ProcessIdentity {
+            pid: 124,
+            process_group: 123,
+            start_time: 457,
+        };
+        let runtime = Builder::new_current_thread().build().unwrap();
+
+        let error = runtime
+            .block_on(cleanup_known_processes_with(
+                &HashSet::from([running]),
+                Duration::ZERO,
+                |_| Ok(true),
+                |_, _| std::future::ready(Ok(())),
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn cleanup_preserves_containment_failure_after_targets_exit() {
+        let process = ProcessIdentity {
+            pid: 124,
+            process_group: 123,
+            start_time: 457,
+        };
+        let probes = std::cell::Cell::new(0);
+        let runtime = Builder::new_current_thread().build().unwrap();
+
+        let error = runtime
+            .block_on(cleanup_known_processes_with(
+                &HashSet::from([process]),
+                Duration::ZERO,
+                |_| {
+                    let count = probes.get();
+                    probes.set(count + 1);
+                    Ok(count == 0)
+                },
+                |_, _| {
+                    std::future::ready(Err(SignalError::containment(std::io::Error::other(
+                        "helper containment failed",
+                    ))))
+                },
+            ))
+            .unwrap_err();
+
+        assert!(error.containment_failed);
+        assert_eq!(error.error.to_string(), "helper containment failed");
     }
 
     #[test]
@@ -4053,6 +6185,7 @@ mod tests {
                 },
                 &HashSet::new(),
                 libc::SIGKILL,
+                Instant::now() + Duration::from_secs(2),
             ));
             assert!(result.is_ok(), "signaling reported an error");
 

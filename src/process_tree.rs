@@ -92,13 +92,16 @@ impl ProcessSnapshot {
             root,
             include_process_group,
             known,
-            include_process_group,
             &self.unresolved_pids,
         )
     }
 
     pub(crate) fn started_after(&self, instant: std::time::Instant) -> bool {
         self.started_at >= instant
+    }
+
+    pub(crate) fn process_was_unresolved(&self, pid: u32) -> bool {
+        self.unresolved_pids.contains(&pid)
     }
 
     pub(crate) fn anomaly_summary(&self) -> Option<String> {
@@ -222,6 +225,63 @@ where
 
 pub(crate) fn exists(process: ProcessIdentity) -> bool {
     exists_checked(process).unwrap_or(false)
+}
+
+pub(crate) fn parent_pid_checked(process: ProcessIdentity) -> io::Result<Option<u32>> {
+    match read_stat(process.pid) {
+        Ok(ProcessInspection::Live(stat)) if stat.identity == process => Ok(Some(stat.parent_pid)),
+        Ok(ProcessInspection::Live(_) | ProcessInspection::Departed) => Ok(None),
+        Err(error) if process_disappeared(&error) => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "could not inspect tracked process /proc/{}/stat: {error}",
+                process.pid
+            ),
+        )),
+    }
+}
+
+pub(crate) fn executable_path_checked(
+    process: ProcessIdentity,
+) -> io::Result<Option<std::path::PathBuf>> {
+    let executable = match std::fs::read_link(format!("/proc/{}/exe", process.pid)) {
+        Ok(executable) => executable,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not inspect tracked process /proc/{}/exe: {error}",
+                    process.pid
+                ),
+            ));
+        }
+    };
+    if !exists_checked(process)? {
+        return Ok(None);
+    }
+    Ok(Some(executable))
+}
+
+pub(crate) fn command_line_checked(process: ProcessIdentity) -> io::Result<Option<Vec<u8>>> {
+    let command_line = match std::fs::read(format!("/proc/{}/cmdline", process.pid)) {
+        Ok(command_line) => command_line,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not inspect tracked process /proc/{}/cmdline: {error}",
+                    process.pid
+                ),
+            ));
+        }
+    };
+    if !exists_checked(process)? {
+        return Ok(None);
+    }
+    Ok(Some(command_line))
 }
 
 fn snapshot() -> io::Result<SnapshotContents> {
@@ -372,7 +432,6 @@ fn collect_related(
     root: ProcessIdentity,
     include_process_group: bool,
     known: &HashSet<ProcessIdentity>,
-    process_group_was_validated: bool,
     unresolved_pids: &HashSet<u32>,
 ) -> HashSet<ProcessIdentity> {
     let by_pid: HashMap<u32, ProcessStat> = snapshot
@@ -383,6 +442,9 @@ fn collect_related(
     let root_exists = by_pid
         .get(&root.pid)
         .is_some_and(|stat| stat.identity == root);
+    let root_was_reused = by_pid
+        .get(&root.pid)
+        .is_some_and(|stat| stat.identity != root);
 
     let mut owned: HashSet<u32> = HashSet::new();
     if root_exists {
@@ -397,13 +459,13 @@ fn collect_related(
         }
     }
 
-    let old_group_is_owned = process_group_was_validated
-        || root_exists
-        || known.iter().any(|process| {
-            by_pid.get(&process.pid).is_some_and(|stat| {
-                stat.identity == *process && stat.identity.process_group == root.pid
-            })
-        });
+    let old_group_is_owned = !root_was_reused
+        && (root_exists
+            || known.iter().any(|process| {
+                by_pid.get(&process.pid).is_some_and(|stat| {
+                    stat.identity == *process && stat.identity.process_group == root.pid
+                })
+            }));
     if include_process_group && old_group_is_owned {
         owned.extend(
             snapshot
@@ -568,14 +630,7 @@ mod tests {
             stat(200, 1, 200, 5),
         ];
 
-        let related = collect_related(
-            &snapshot,
-            root,
-            true,
-            &HashSet::new(),
-            true,
-            &HashSet::new(),
-        );
+        let related = collect_related(&snapshot, root, true, &HashSet::new(), &HashSet::new());
         assert_eq!(
             related,
             HashSet::from([
@@ -593,14 +648,14 @@ mod tests {
         let known = HashSet::from([escaped]);
         let snapshot = [stat(102, 1, 102, 3), stat(103, 102, 102, 4)];
 
-        let related = collect_related(&snapshot, root, true, &known, true, &HashSet::new());
+        let related = collect_related(&snapshot, root, true, &known, &HashSet::new());
         assert_eq!(related, HashSet::from([escaped, snapshot[1].identity]));
 
         let reused = [stat(102, 1, 102, 99), stat(103, 102, 102, 4)];
-        assert!(collect_related(&reused, root, true, &known, true, &HashSet::new()).is_empty());
-        assert!(collect_related(&[], root, true, &known, true, &HashSet::new()).is_empty());
+        assert!(collect_related(&reused, root, true, &known, &HashSet::new()).is_empty());
+        assert!(collect_related(&[], root, true, &known, &HashSet::new()).is_empty());
         assert_eq!(
-            collect_related(&[], root, true, &known, true, &HashSet::from([102])),
+            collect_related(&[], root, true, &known, &HashSet::from([102])),
             known
         );
     }
@@ -612,7 +667,7 @@ mod tests {
         let known = HashSet::from([before_setsid]);
         let snapshot = [stat(102, 1, 102, 3), stat(103, 102, 102, 4)];
 
-        let related = collect_related(&snapshot, root, true, &known, true, &HashSet::new());
+        let related = collect_related(&snapshot, root, true, &known, &HashSet::new());
         let refreshed = related
             .iter()
             .find(|process| process.pid == before_setsid.pid)
@@ -627,34 +682,48 @@ mod tests {
         let snapshot = [stat(101, 1, 100, 2), stat(102, 1, 100, 3)];
 
         assert!(
-            collect_related(
-                &snapshot,
-                root,
-                true,
-                &HashSet::new(),
-                false,
-                &HashSet::new(),
-            )
-            .is_empty()
+            collect_related(&snapshot, root, true, &HashSet::new(), &HashSet::new(),).is_empty()
         );
 
         let known = HashSet::from([snapshot[0].identity]);
         assert_eq!(
-            collect_related(&snapshot, root, true, &known, false, &HashSet::new(),),
+            collect_related(&snapshot, root, true, &known, &HashSet::new(),),
             HashSet::from([snapshot[0].identity, snapshot[1].identity])
         );
+    }
 
-        assert_eq!(
-            collect_related(
-                &snapshot,
-                root,
-                true,
-                &HashSet::new(),
-                true,
-                &HashSet::new(),
-            ),
-            HashSet::from([snapshot[0].identity, snapshot[1].identity])
+    #[test]
+    fn public_lookup_rejects_a_reused_process_group_root() {
+        let root = stat(100, 1, 100, 1).identity;
+        let snapshot = ProcessSnapshot {
+            processes: vec![stat(100, 1, 100, 999), stat(101, 100, 100, 1_000)],
+            started_at: std::time::Instant::now(),
+            anomaly_count: 0,
+            first_anomaly: None,
+            anomaly_kinds: HashSet::new(),
+            unresolved_pids: HashSet::new(),
+        };
+
+        assert!(
+            snapshot
+                .related_processes(root, true, &HashSet::new())
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn reports_an_unresolved_process() {
+        let snapshot = ProcessSnapshot {
+            processes: Vec::new(),
+            started_at: std::time::Instant::now(),
+            anomaly_count: 1,
+            first_anomaly: Some("inspection failed".to_string()),
+            anomaly_kinds: HashSet::from([io::ErrorKind::PermissionDenied]),
+            unresolved_pids: HashSet::from([100]),
+        };
+
+        assert!(snapshot.process_was_unresolved(100));
+        assert!(!snapshot.process_was_unresolved(101));
     }
 
     #[test]

@@ -175,6 +175,9 @@ The shim:
 - Reaps daemonized helpers while the main command is running.
 - Kills and reaps adopted descendants before reporting a natural command exit,
   including descendants that daemonize before the first `/proc` scan.
+- Confirms successful descendant cleanup separately from the command exit status;
+  a missing or failed confirmation stops supervision instead of starting an
+  overlapping replacement.
 - After a termination, waits up to `shutdown_timeout` for descendants, then
   force-cleans them so an externally terminated leader cannot stall restarts.
 - Linux `/proc` ancestry is also tracked with PID and process start time so
@@ -203,10 +206,11 @@ The reaper shim closes the ordinary daemonization gap without privileges, and a
 bounded post-`SIGKILL` sweep signals descendants first observed after the
 initial kill. It is still not kernel-enforced containment: PID validation has a
 check/signal race, an uninterruptible kernel task may remain after `SIGKILL`,
-and abruptly killing an unwrapped supervisor can leave jobs alive. An escaped
-descendant can also become unattributable if its shim is abruptly killed before
-the next reconciliation; wrapper mode only reclaims it when the inner runner
-itself exits. Use a delegated cgroup v2 subtree and `cgroup.kill` when zero
+and abruptly killing an unwrapped supervisor can leave jobs alive. If a shim is
+abruptly killed, the supervisor refuses to restart that job without cleanup
+confirmation. An escaped descendant that was not yet observed may still remain;
+wrapper mode reclaims it when the resulting inner-runner failure exits that
+generation. Use a delegated cgroup v2 subtree and `cgroup.kill` when zero
 surviving descendants or strict isolation is required.
 
 At startup, the supervisor immediately verifies that it can parse its own
