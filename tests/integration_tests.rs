@@ -491,6 +491,7 @@ jobs:
 fn graceful_shutdown_clean_exit() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
     let graceful = temp.path().join("graceful");
     let config = format!(
         r#"
@@ -511,32 +512,28 @@ jobs:
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn_guarded()
         .expect("Failed to start job-runner");
 
-    let stderr = child.stderr.take().unwrap();
-
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGTERM);
 
-    let output = collect_output_for(stderr, Duration::from_secs(3));
+    assert!(
+        wait_until(Duration::from_secs(3), || child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "graceful shutdown did not finish: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let output = std::fs::read_to_string(&log).unwrap();
 
     assert!(child.wait().unwrap().success(), "{output:?}");
     assert!(graceful.exists(), "TERM trap did not run: {output:?}");
-    assert!(
-        output
-            .iter()
-            .any(|line| line.contains("Received TERM signal")),
-        "{output:?}"
-    );
-    assert!(
-        !output
-            .iter()
-            .any(|line| line.contains("Killed by signal 9")),
-        "{output:?}"
-    );
+    assert!(output.contains("Received TERM signal"), "{output:?}");
+    assert!(!output.contains("Killed by signal 9"), "{output:?}");
 }
 
 #[test]
