@@ -119,6 +119,7 @@ JSON config files may contain full-line comments beginning with `//`:
 | `sudo_user` | string | none | Run as this user via sudo |
 | `env` | object | none | Additional environment variables |
 | `datetime` | object | disabled | Timestamp configuration |
+| `prefix` | string | existing layout | Output prefix template; empty string disables prefixes |
 
 ### Datetime Options
 
@@ -291,6 +292,47 @@ Each serialized output frame is capped at 64 KiB. Long payloads are split, and
 oversized prefixes or diagnostics are truncated. Each stream has a 4 MiB
 bounded queue and a dedicated writer thread, so blocked output cannot stall
 shutdown. Output is dropped after a queue fills or a bounded exit flush expires.
+
+### Custom Prefixes
+
+Set a job's `prefix` to customize its stdout, stderr, and job-status prefixes:
+
+```yaml
+jobs:
+  api:
+    command: "node server.js"
+    prefix: "{datetime} {color}[{job}:{stream}]{reset} "
+    datetime:
+      enabled: true
+      format: "%H:%M:%S"
+      local: true
+```
+
+| Variable | Value |
+|----------|-------|
+| `{color}` | ANSI code for the configured color, or the automatically assigned color |
+| `{reset}` | ANSI reset code; empty when the configured color is invalid |
+| `{job}` | Job name, inserted literally |
+| `{stream}` | `s` for job status, `1` for stdout, `2` for stderr |
+| `{datetime}` | Current time using `datetime.format` and `datetime.local`; empty when disabled |
+
+Automatic colors stay fixed per job across output lines and restarts. Timestamps
+are rendered for each output frame. Templates are expanded once: braces in a
+job name are not interpreted as variables. Use `{{` and `}}` for literal braces.
+Unknown variables and unmatched braces are rejected before any job starts.
+
+Templates include all separators and trailing whitespace. No separator or space
+is appended automatically. Set `prefix: ""` for unprefixed job output. Global
+supervisor and wrapper messages are not affected.
+
+Omitting `prefix` preserves the existing layout exactly:
+
+```yaml
+# Without timestamps:
+prefix: "{color}{job}{reset} ({stream}) > "
+# With timestamps enabled and a nonempty format:
+prefix: "{color}{job}{reset} ({stream}) > {datetime} > "
+```
 
 ## Wrapper Mode
 

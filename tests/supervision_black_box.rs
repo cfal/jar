@@ -1425,6 +1425,99 @@ fn non_restarting_job_cleans_descendants_and_drains_output() {
 }
 
 #[test]
+fn prefix_templates_apply_to_stdout_stderr_and_job_status() {
+    for (template, expected) in [
+        (
+            "{color}<{job}:{stream}>{reset} {datetime}: ",
+            "\x1b[31m<worker:STREAM>\x1b[0m STAMP: ",
+        ),
+        ("", ""),
+        ("{job}", "worker"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {"worker": {
+                "command": "printf 'out\\n'; printf err >&2",
+                "restart": false,
+                "color": "red",
+                "prefix": template,
+                "datetime": {"enabled": true, "format": "STAMP"}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let mut runner = Runner::start(&config, temp.path().join("runner.log"), &[]);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        let output = runner.log();
+        for (stream, message) in [("1", "out"), ("2", "err"), ("s", "Exited with code 0")] {
+            let line = format!("{}{message}", expected.replace("STREAM", stream));
+            assert!(
+                output.lines().any(|actual| actual == line),
+                "missing {line:?}: {output}"
+            );
+        }
+        assert!(
+            output.lines().any(|line| line
+                .starts_with(&format!("{}Started (pid ", expected.replace("STREAM", "s")))),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn prefix_automatic_color_is_stable_across_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    fs::write(
+        &config,
+        "jobs:\n  worker:\n    command: echo payload\n    restart_delay: 100\n    prefix: '{color}{job}{reset}/{stream}: '\n",
+    )
+    .unwrap();
+    let mut runner = Runner::start(&config, temp.path().join("runner.log"), &[]);
+    assert!(wait_until(Duration::from_secs(5), || runner
+        .log()
+        .matches("payload")
+        .count()
+        >= 3));
+    runner.signal(libc::SIGTERM);
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    let output = runner.log();
+    let lines: Vec<_> = output
+        .lines()
+        .filter(|line| line.ends_with("payload"))
+        .collect();
+    assert!(lines.len() >= 3, "{output}");
+    assert!(lines[0].starts_with("\x1b["));
+    assert!(lines[0].ends_with("worker\x1b[0m/1: payload"));
+    assert!(lines.iter().all(|line| *line == lines[0]));
+}
+
+#[test]
+fn invalid_prefix_prevents_all_jobs_from_starting() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    let marker = temp.path().join("started");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  first:\n    command: 'touch {}'\n    restart: false\n  invalid:\n    command: echo bad\n    restart: false\n    prefix: '{{unknown}}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut runner = Runner::start(&config, temp.path().join("runner.log"), &[]);
+    assert!(!runner.wait(Duration::from_secs(5)).success());
+    assert!(runner.log().contains("invalid prefix"));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn shell_compound_commands_are_not_truncated_by_exec() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("jobs.yaml");

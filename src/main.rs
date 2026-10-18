@@ -265,6 +265,8 @@ struct JobConfig {
     restart_delay: u64,
     #[serde(default)]
     datetime: DateTimeConfig,
+    #[serde(default)]
+    prefix: Option<String>,
     #[serde(default = "default_process_group", alias = "processGroup")]
     process_group: bool,
     #[serde(default = "default_shutdown_timeout", alias = "shutdownTimeout")]
@@ -343,6 +345,10 @@ fn datetime_format_is_valid(config: &DateTimeConfig) -> bool {
 }
 
 fn validate_job_config(name: &str, config: &JobConfig) -> Result<(), String> {
+    if let Some(template) = &config.prefix {
+        compile_prefix(template, "", "")
+            .map_err(|error| format!("job {name:?} has an invalid prefix: {error}"))?;
+    }
     if config.datetime.enabled && !datetime_format_is_valid(&config.datetime) {
         return Err(format!(
             "job {name:?} has an invalid datetime format: {:?}",
@@ -893,7 +899,7 @@ async fn stop_spawned_child(
 }
 
 async fn stop_unready_job_shim(
-    status_prefix: &PrefixWriter<'_>,
+    status_prefix: &PrefixWriter,
     opts: &JobConfig,
     child: &mut tokio::process::Child,
     pid: u32,
@@ -960,47 +966,127 @@ impl From<std::io::Error> for ProcessRunError {
 }
 
 #[derive(Clone)]
-struct PrefixWriter<'a> {
-    prefix: String,
-    datetime_items: Vec<chrono::format::Item<'a>>,
+enum PrefixPart {
+    Literal(String),
+    Stream,
+    DateTime,
+}
+
+fn compile_prefix(template: &str, job: &str, color: &str) -> Result<Vec<PrefixPart>, String> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut remaining = template;
+    while !remaining.is_empty() {
+        if let Some(rest) = remaining.strip_prefix("{{") {
+            literal.push('{');
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix("}}") {
+            literal.push('}');
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix('{') {
+            let (variable, rest) = rest
+                .split_once('}')
+                .ok_or_else(|| "unclosed template variable".to_string())?;
+            match variable {
+                "job" => literal.push_str(job),
+                "color" => literal.push_str(color),
+                "reset" if !color.is_empty() => literal.push_str("\x1b[0m"),
+                "reset" => {}
+                "stream" | "datetime" => {
+                    parts.push(PrefixPart::Literal(std::mem::take(&mut literal)));
+                    parts.push(if variable == "stream" {
+                        PrefixPart::Stream
+                    } else {
+                        PrefixPart::DateTime
+                    });
+                }
+                _ => return Err(format!("unknown template variable {{{variable}}}")),
+            }
+            remaining = rest;
+        } else if remaining.starts_with('}') {
+            return Err("unmatched }; use }} for a literal brace".to_string());
+        } else {
+            let character = remaining.chars().next().unwrap();
+            literal.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        }
+    }
+    parts.push(PrefixPart::Literal(literal));
+    Ok(parts)
+}
+
+#[derive(Clone)]
+struct PrefixWriter {
+    parts: Vec<PrefixPart>,
+    stream: &'static str,
+    datetime_items: Vec<chrono::format::Item<'static>>,
     datetime_local: bool,
 }
 
-impl<'a> PrefixWriter<'a> {
-    pub fn from(prefix: String, config: &'a DateTimeConfig) -> Self {
-        let datetime_items = if config.enabled {
-            chrono::format::StrftimeItems::new(&config.format).collect()
+impl PrefixWriter {
+    fn from_job(job: &str, config: &JobConfig) -> Self {
+        let datetime = &config.datetime;
+        let datetime_items = if datetime.enabled && datetime_format_is_valid(datetime) {
+            chrono::format::StrftimeItems::new(&datetime.format)
+                .map(chrono::format::Item::to_owned)
+                .collect::<Vec<_>>()
         } else {
             vec![]
         };
+        let default_template = if datetime_items.is_empty() {
+            "{color}{job}{reset} ({stream}) > "
+        } else {
+            "{color}{job}{reset} ({stream}) > {datetime} > "
+        };
+        let template = config.prefix.as_deref().unwrap_or(default_template);
+        let parts = compile_prefix(template, job, color_code(&config.color))
+            .expect("prefix template was validated before starting jobs");
         Self {
-            prefix,
+            parts,
+            stream: "s",
             datetime_items,
-            datetime_local: config.local,
+            datetime_local: datetime.local,
+        }
+    }
+
+    fn for_stream(&self, stream: &'static str) -> Self {
+        Self {
+            stream,
+            ..self.clone()
         }
     }
 }
 
-impl<'a> std::fmt::Display for PrefixWriter<'a> {
+impl std::fmt::Display for PrefixWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.datetime_items.is_empty() {
-            return write!(f, "{}", self.prefix);
-        }
-
         let mut timestamp = String::new();
-        let result = if self.datetime_local {
-            chrono::offset::Local::now()
-                .format_with_items(self.datetime_items.iter())
-                .write_to(&mut timestamp)
-        } else {
-            chrono::offset::Utc::now()
-                .format_with_items(self.datetime_items.iter())
-                .write_to(&mut timestamp)
-        };
-        if result.is_err() {
-            return write!(f, "{}", self.prefix);
+        if !self.datetime_items.is_empty()
+            && self
+                .parts
+                .iter()
+                .any(|part| matches!(part, PrefixPart::DateTime))
+        {
+            let result = if self.datetime_local {
+                chrono::offset::Local::now()
+                    .format_with_items(self.datetime_items.iter())
+                    .write_to(&mut timestamp)
+            } else {
+                chrono::offset::Utc::now()
+                    .format_with_items(self.datetime_items.iter())
+                    .write_to(&mut timestamp)
+            };
+            if result.is_err() {
+                timestamp.clear();
+            }
         }
-        write!(f, "{} > {}", self.prefix, timestamp)
+        for part in &self.parts {
+            match part {
+                PrefixPart::Literal(value) => f.write_str(value)?,
+                PrefixPart::Stream => f.write_str(self.stream)?,
+                PrefixPart::DateTime => f.write_str(&timestamp)?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1016,14 +1102,14 @@ enum JobOutcome {
 }
 
 async fn start_proc(
-    prefix: String,
+    name: String,
     opts: JobConfig,
     active_pids: Arc<Mutex<HashMap<u32, TrackedRun>>>,
     mut shutdown: watch::Receiver<ShutdownState>,
     mut scanner: ProcessScannerHandle,
     base_env: Arc<HashMap<String, String>>,
 ) -> std::io::Result<JobOutcome> {
-    let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
+    let status_prefix = PrefixWriter::from_job(&name, &opts);
     let mut initial = true;
 
     loop {
@@ -1045,11 +1131,7 @@ async fn start_proc(
         };
 
         if !delay.is_zero() {
-            eprintln!(
-                "{} > Starting in {:.3}s",
-                status_prefix,
-                delay.as_secs_f64()
-            );
+            eprintln!("{}Starting in {:.3}s", status_prefix, delay.as_secs_f64());
             tokio::select! {
                 _ = sleep(delay) => {}
                 changed = shutdown.changed() => {
@@ -1062,7 +1144,6 @@ async fn start_proc(
 
         match start_proc_internal(
             &status_prefix,
-            &prefix,
             &opts,
             &active_pids,
             &mut shutdown,
@@ -1080,24 +1161,23 @@ async fn start_proc(
                 }
             }
             Err(ProcessRunError::Retry(e)) => {
-                eprintln!("{} > Process error: {}", status_prefix, e);
+                eprintln!("{}Process error: {}", status_prefix, e);
                 if !opts.restart {
                     return Ok(JobOutcome::Completed { success: false });
                 }
             }
             Err(ProcessRunError::Fatal(e)) => {
-                eprintln!("{} > Fatal process supervision error: {}", status_prefix, e);
+                eprintln!("{}Fatal process supervision error: {}", status_prefix, e);
                 return Err(e);
             }
         }
     }
-    eprintln!("{} > Shutting down..", status_prefix);
+    eprintln!("{}Shutting down..", status_prefix);
     Ok(JobOutcome::Shutdown)
 }
 
 async fn start_proc_internal(
-    status_prefix: &PrefixWriter<'_>,
-    prefix: &str,
+    status_prefix: &PrefixWriter,
     opts: &JobConfig,
     active_pids: &Arc<Mutex<HashMap<u32, TrackedRun>>>,
     shutdown: &mut watch::Receiver<ShutdownState>,
@@ -1306,18 +1386,10 @@ async fn start_proc_internal(
             return Err(ProcessRunError::Fatal(cleanup.err().unwrap_or(error)));
         }
     };
-    let stdout_handle = spawn_output_handler(
-        stdout,
-        format!("{} (1)", prefix),
-        opts.datetime.clone(),
-        OutputStream::Stdout,
-    );
-    let stderr_handle = spawn_output_handler(
-        stderr,
-        format!("{} (2)", prefix),
-        opts.datetime.clone(),
-        OutputStream::Stderr,
-    );
+    let stdout_handle =
+        spawn_output_handler(stdout, status_prefix.for_stream("1"), OutputStream::Stdout);
+    let stderr_handle =
+        spawn_output_handler(stderr, status_prefix.for_stream("2"), OutputStream::Stderr);
 
     match wait_for_job_shim_readiness(
         &mut shim_readiness_reader,
@@ -1421,7 +1493,7 @@ async fn start_proc_internal(
 
     let shutdown_at_registration = register_active_pid(active_pids, shutdown, info, known.clone());
 
-    eprintln!("{} > Started (pid {})", status_prefix, pid);
+    eprintln!("{}Started (pid {})", status_prefix, pid);
 
     let mut child_wait = Box::pin(child.wait());
     let shutdown_state = if shutdown_at_registration != ShutdownState::Running {
@@ -1646,7 +1718,7 @@ async fn start_proc_internal(
             kill_sent_at.is_some(),
         ) {
             eprintln!(
-                "{} > Could not verify process tree during shutdown, sending SIGKILL..",
+                "{}Could not verify process tree during shutdown, sending SIGKILL..",
                 status_prefix
             );
             observe_child_wait_before_escalation(
@@ -1687,7 +1759,7 @@ async fn start_proc_internal(
         }
         if kill_sent_at.is_some_and(|sent| sent.elapsed() >= POST_KILL_WAIT) {
             eprintln!(
-                "{} > Timed out waiting for killed process tree to exit",
+                "{}Timed out waiting for killed process tree to exit",
                 status_prefix
             );
             post_kill_timed_out = true;
@@ -1715,7 +1787,7 @@ async fn start_proc_internal(
                     snapshots_closed = true;
                     if kill_sent_at.is_none() {
                         eprintln!(
-                            "{} > Process scanner stopped during shutdown, sending SIGKILL..",
+                            "{}Process scanner stopped during shutdown, sending SIGKILL..",
                             status_prefix
                         );
                         observe_child_wait_before_escalation(
@@ -1751,7 +1823,7 @@ async fn start_proc_internal(
             }
             _ = &mut post_kill_sleep, if kill_sent_at.is_some() => {
                 eprintln!(
-                    "{} > Timed out waiting for killed process tree to exit",
+                    "{}Timed out waiting for killed process tree to exit",
                     status_prefix
                 );
                 post_kill_timed_out = true;
@@ -1763,7 +1835,7 @@ async fn start_proc_internal(
                     update_active_descendants(active_pids, info, &known);
                 }
                 eprintln!(
-                    "{} > Process tree exceeded {}s shutdown timeout, sending SIGKILL..",
+                    "{}Process tree exceeded {}s shutdown timeout, sending SIGKILL..",
                     status_prefix,
                     opts.shutdown_timeout
                 );
@@ -1802,7 +1874,7 @@ async fn start_proc_internal(
                         known = related_processes(snapshots, identity, &known);
                         update_active_descendants(active_pids, info, &known);
                     }
-                    eprintln!("{} > Shutdown escalated, sending SIGKILL..", status_prefix);
+                    eprintln!("{}Shutdown escalated, sending SIGKILL..", status_prefix);
                     observe_child_wait_before_escalation(
                         child_wait.as_mut(),
                         &mut child_status,
@@ -2076,7 +2148,7 @@ fn remove_active_pid(active_pids: &Mutex<HashMap<u32, TrackedRun>>, info: PidInf
 }
 
 async fn cleanup_after_natural_exit(
-    status_prefix: &PrefixWriter<'_>,
+    status_prefix: &PrefixWriter,
     opts: &JobConfig,
     info: PidInfo,
     known: &HashSet<ProcessIdentity>,
@@ -2092,7 +2164,7 @@ async fn cleanup_after_natural_exit(
         process_tree::is_running_checked,
         |targets, deadline| async move {
             eprintln!(
-                "{} > Cleaning up processes left behind by exited job",
+                "{}Cleaning up processes left behind by exited job",
                 status_prefix
             );
             signal_run_with_retry(
@@ -2183,7 +2255,7 @@ async fn drain_output_handlers(mut handles: [JoinHandle<std::io::Result<()>>; 2]
     }
 }
 
-fn report_child_status(status_prefix: &PrefixWriter<'_>, status: ExitStatus) {
+fn report_child_status(status_prefix: &PrefixWriter, status: ExitStatus) {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -2194,7 +2266,7 @@ fn report_child_status(status_prefix: &PrefixWriter<'_>, status: ExitStatus) {
         } else {
             "Exited with unknown status".to_string()
         };
-        eprintln!("{} > {}", status_prefix, exit_msg);
+        eprintln!("{}{}", status_prefix, exit_msg);
     }
 
     #[cfg(not(unix))]
@@ -2203,18 +2275,16 @@ fn report_child_status(status_prefix: &PrefixWriter<'_>, status: ExitStatus) {
             Some(code) => format!("Exited with code {}", code),
             None => "Exited with unknown status".to_string(),
         };
-        eprintln!("{} > {}", status_prefix, exit_msg);
+        eprintln!("{}{}", status_prefix, exit_msg);
     }
 }
 
 fn spawn_output_handler<R: 'static + AsyncRead + Send + Unpin>(
     reader: R,
-    output_prefix: String,
-    datetime: DateTimeConfig,
+    output_prefix: PrefixWriter,
     stream: OutputStream,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        let output_prefix = PrefixWriter::from(output_prefix, &datetime);
         let sender = output_sender(stream);
         let mut reader = reader;
         let mut input = [0_u8; 8192];
@@ -2309,11 +2379,8 @@ fn bounded_format(arguments: std::fmt::Arguments<'_>, limit: usize) -> Vec<u8> {
     output.bytes
 }
 
-fn send_output(sender: &SyncSender<OutputMessage>, output_prefix: &PrefixWriter<'_>, line: &[u8]) {
-    let prefix = bounded_format(
-        format_args!("{} > ", output_prefix),
-        MAX_OUTPUT_PREFIX_BYTES,
-    );
+fn send_output(sender: &SyncSender<OutputMessage>, output_prefix: &PrefixWriter, line: &[u8]) {
+    let prefix = bounded_format(format_args!("{}", output_prefix), MAX_OUTPUT_PREFIX_BYTES);
     let payload_limit = MAX_OUTPUT_FRAME_BYTES - prefix.len() - 1;
 
     if line.is_empty() {
@@ -2371,7 +2438,7 @@ fn flush_output_sink(sender: &SyncSender<OutputMessage>) {
     let _ = receiver.recv_timeout(remaining);
 }
 
-fn create_prefix(color: &str, tag: &str) -> String {
+fn color_code(color: &str) -> &'static str {
     let colors = [
         ("red", "\x1b[31m"),
         ("green", "\x1b[32m"),
@@ -2383,16 +2450,13 @@ fn create_prefix(color: &str, tag: &str) -> String {
         ("gray", "\x1b[90m"),
     ];
 
-    let code = match colors.iter().find(|(name, _)| *name == color) {
+    match colors.iter().find(|(name, _)| *name == color) {
         Some((_, code)) => code,
         None => {
             eprintln!("No such color, ignoring: {}", color);
-            return tag.to_string();
+            ""
         }
-    };
-
-    let reset = "\x1b[0m";
-    format!("{}{}{}", code, tag, reset)
+    }
 }
 
 const JOB_SHIM_SIGNALS: [libc::c_int; 6] = [
@@ -3002,7 +3066,6 @@ async fn run_supervisor(
         }
 
         eprintln!("Initializing job \"{}\"", name);
-        let prefix = create_prefix(&job_config.color, &name);
         let sudo_user = job_config.sudo_user.clone().unwrap_or_default();
         let pid_set = match pid_map.entry(sudo_user) {
             Entry::Occupied(entry) => entry.get().clone(),
@@ -3016,7 +3079,7 @@ async fn run_supervisor(
         let job_env = base_env.clone();
         job_handles.spawn(async move {
             start_proc(
-                prefix,
+                name,
                 job_config,
                 pid_set,
                 job_shutdown,
@@ -3439,7 +3502,7 @@ async fn forward_signal_to_jobs(
         };
         deliveries.spawn(async move {
             signal_process_tree(
-                "Signal forwarding",
+                "Signal forwarding > ",
                 (!sudo_user.is_empty()).then_some(sudo_user.as_str()),
                 tracked.info,
                 &descendants,
@@ -3509,7 +3572,7 @@ async fn signal_run_with_retry(
         .unwrap_or_else(|| SignalError::delivery(std::io::Error::other("signal delivery failed"))))
 }
 
-fn log_signal_error(status_prefix: &PrefixWriter<'_>, signal: libc::c_int, error: &SignalError) {
+fn log_signal_error(status_prefix: &PrefixWriter, signal: libc::c_int, error: &SignalError) {
     let operation = if error.containment_failed {
         "contain signal helper processes after"
     } else if error.delivery_failed {
@@ -3518,7 +3581,7 @@ fn log_signal_error(status_prefix: &PrefixWriter<'_>, signal: libc::c_int, error
         "verify targets for"
     };
     eprintln!(
-        "{} > Could not {} SIG{}: {}",
+        "{}Could not {} SIG{}: {}",
         status_prefix,
         operation,
         signal_number_to_name(signal),
@@ -3536,7 +3599,7 @@ fn retain_signal_error(current: &mut Option<SignalError>, error: SignalError) {
 }
 
 async fn signal_run_and_log(
-    status_prefix: &PrefixWriter<'_>,
+    status_prefix: &PrefixWriter,
     log_prefix: &str,
     opts: &JobConfig,
     info: PidInfo,
@@ -3707,7 +3770,7 @@ async fn signal_process_tree(
             && error.raw_os_error() != Some(libc::ESRCH)
         {
             eprintln!(
-                "{} > Failed to send {} to target {}: {}",
+                "{}Failed to send {} to target {}: {}",
                 log_prefix,
                 signal_number_to_name(signal),
                 target,
@@ -3855,7 +3918,7 @@ async fn signal_as_user(
     if helper_timeout.is_zero() {
         return Err(SignalError::delivery(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("{log_prefix} > sudo signal deadline expired"),
+            format!("{log_prefix}sudo signal deadline expired"),
         )));
     }
     let (completion_reader, completion_writer) =
@@ -3900,7 +3963,7 @@ async fn signal_as_user(
     let mut child = command.spawn().map_err(|error| {
         SignalError::delivery(std::io::Error::new(
             error.kind(),
-            format!("{log_prefix} > Could not run sudo signal helper: {error}"),
+            format!("{log_prefix}Could not run sudo signal helper: {error}"),
         ))
     })?;
     drop(completion_writer);
@@ -3909,7 +3972,7 @@ async fn signal_as_user(
         Ok(Ok(status)) => match read_job_shim_completion_async(&mut completion_reader).await {
             Ok(()) if status.success() => Ok(()),
             Ok(()) => Err(SignalError::delivery(std::io::Error::other(format!(
-                "{log_prefix} > sudo signal helper exited with {status}"
+                "{log_prefix}sudo signal helper exited with {status}"
             )))),
             Err(completion_error) => {
                 let cleanup_error =
@@ -3921,7 +3984,7 @@ async fn signal_as_user(
                 Err(SignalError::containment(std::io::Error::new(
                     completion_error.kind(),
                     format!(
-                        "{log_prefix} > sudo signal helper did not confirm cleanup: {completion_error}{detail}"
+                        "{log_prefix}sudo signal helper did not confirm cleanup: {completion_error}{detail}"
                     ),
                 )))
             }
@@ -3934,7 +3997,7 @@ async fn signal_as_user(
                 .unwrap_or_default();
             Err(SignalError::containment(std::io::Error::new(
                 error.kind(),
-                format!("{log_prefix} > sudo signal helper failed: {error}{detail}"),
+                format!("{log_prefix}sudo signal helper failed: {error}{detail}"),
             )))
         }
         Err(_) => {
@@ -3946,7 +4009,7 @@ async fn signal_as_user(
                 .unwrap_or_default();
             let error = std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("{log_prefix} > sudo signal helper timed out{detail}"),
+                format!("{log_prefix}sudo signal helper timed out{detail}"),
             );
             Err(if cleanup_error.is_some() {
                 SignalError::containment(error)
@@ -5065,14 +5128,100 @@ mod tests {
 
     #[test]
     fn invalid_datetime_format_falls_back_to_plain_prefix() {
-        let datetime = DateTimeConfig {
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok\ncolor: red").unwrap();
+        job.datetime = DateTimeConfig {
             enabled: true,
             format: "%#z".to_string(),
             local: false,
         };
-        let prefix = PrefixWriter::from("job (s)".to_string(), &datetime);
+        let prefix = PrefixWriter::from_job("job", &job);
 
-        assert_eq!(prefix.to_string(), "job (s)");
+        assert_eq!(prefix.to_string(), "\x1b[31mjob\x1b[0m (s) > ");
+    }
+
+    #[test]
+    fn default_prefix_preserves_color_stream_and_datetime_layout() {
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok\ncolor: red").unwrap();
+        for enabled in [false, true] {
+            job.datetime = DateTimeConfig {
+                enabled,
+                format: "STAMP".to_string(),
+                local: false,
+            };
+            let prefix = PrefixWriter::from_job("worker", &job);
+            for stream in ["s", "1", "2"] {
+                assert_eq!(
+                    prefix.for_stream(stream).to_string(),
+                    format!(
+                        "\x1b[31mworker\x1b[0m ({stream}) > {}",
+                        if enabled { "STAMP > " } else { "" }
+                    )
+                );
+            }
+        }
+        job.datetime.format.clear();
+        assert_eq!(
+            PrefixWriter::from_job("worker", &job).to_string(),
+            "\x1b[31mworker\x1b[0m (s) > "
+        );
+        job.color = "invalid".to_string();
+        assert_eq!(
+            PrefixWriter::from_job("worker", &job).to_string(),
+            "worker (s) > "
+        );
+    }
+
+    #[test]
+    fn custom_prefix_expands_once_and_preserves_literal_text() {
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok\ncolor: red").unwrap();
+        job.prefix = Some("{{literal}} {color}{job}{reset}|{stream}|{datetime}: ".to_string());
+        job.datetime = DateTimeConfig {
+            enabled: true,
+            format: "STAMP".to_string(),
+            local: true,
+        };
+        assert!(validate_job_config("worker", &job).is_ok());
+        assert_eq!(
+            PrefixWriter::from_job("{stream}", &job)
+                .for_stream("2")
+                .to_string(),
+            "{literal} \x1b[31m{stream}\x1b[0m|2|STAMP: "
+        );
+        job.datetime.enabled = false;
+        assert_eq!(
+            PrefixWriter::from_job("worker", &job).to_string(),
+            "{literal} \x1b[31mworker\x1b[0m|s|: "
+        );
+        job.prefix = Some(String::new());
+        assert_eq!(PrefixWriter::from_job("worker", &job).to_string(), "");
+    }
+
+    #[test]
+    fn prefix_datetime_is_refreshed_on_every_render() {
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok\ncolor: red").unwrap();
+        job.prefix = Some("{datetime}|{datetime}".to_string());
+        job.datetime = DateTimeConfig {
+            enabled: true,
+            format: "%s%.f".to_string(),
+            local: false,
+        };
+        let prefix = PrefixWriter::from_job("worker", &job);
+        let first = prefix.to_string();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = prefix.to_string();
+        assert_ne!(first, second);
+        let (left, right) = second.split_once('|').unwrap();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn invalid_prefix_templates_are_rejected() {
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok").unwrap();
+        for template in ["{unknown}", "{job", "}", "{}", "{job{stream}"] {
+            job.prefix = Some(template.to_string());
+            let error = validate_job_config("worker", &job).unwrap_err();
+            assert!(error.contains("invalid prefix"), "{template}: {error}");
+        }
     }
 
     #[test]
@@ -5256,8 +5405,9 @@ mod tests {
 
     #[test]
     fn complete_output_frames_are_bounded() {
-        let datetime = DateTimeConfig::default();
-        let prefix = PrefixWriter::from("x".repeat(MAX_OUTPUT_FRAME_BYTES * 2), &datetime);
+        let mut job: JobConfig = serde_yaml::from_str("command: echo ok\ncolor: red").unwrap();
+        job.prefix = Some("x".repeat(MAX_OUTPUT_FRAME_BYTES * 2));
+        let prefix = PrefixWriter::from_job("worker", &job);
         let line = vec![b'y'; MAX_OUTPUT_FRAME_BYTES * 2];
         let (sender, receiver) = sync_channel(8);
 
