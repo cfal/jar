@@ -5803,9 +5803,34 @@ mod tests {
         assert_eq!(state.receive(libc::SIGQUIT), None);
         assert!(state.clear(inner).is_empty());
         assert_eq!(finalized, [libc::SIGTERM]);
+        state.publish(inner);
+        state.record_forwarded(inner, libc::SIGTERM);
         state.begin_publication();
         state.publish(inner);
         assert!(state.clear(inner).is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrapper_publication_records_queued_termination_for_a_live_inner() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let identity = process_tree::identity(child.id().unwrap()).unwrap();
+        let state = Mutex::new(WrapperSignalState::default());
+        lock_or_recover(&state).begin_publication();
+        forward_or_queue_wrapper_signal(&state, libc::SIGTERM);
+        assert!(child.try_wait().unwrap().is_none());
+        publish_wrapper_inner(&state, identity);
+        let status = timeout(Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(lock_or_recover(&state).clear(identity), [libc::SIGTERM]);
     }
 
     #[test]

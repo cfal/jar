@@ -1610,6 +1610,7 @@ fn build_paused_wrapper_inner_library(root: &Path) -> PathBuf {
         r#"#define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -1621,7 +1622,9 @@ fn build_paused_wrapper_inner_library(root: &Path) -> PathBuf {
 #include <unistd.h>
 
 static int term_ack = -1;
+static int is_wrapper;
 static _Atomic int reaped_signal_child;
+static int prereap_barrier_used;
 
 static void acknowledge_term(int signal) {
     (void) signal;
@@ -1631,6 +1634,7 @@ static void acknowledge_term(int signal) {
 __attribute__((constructor)) static void initialize(void) {
     if (!getenv("JR_TEST_WRAPPER_INITIALIZED")) {
         setenv("JR_TEST_WRAPPER_INITIALIZED", "1", 1);
+        is_wrapper = 1;
         return;
     }
     struct rlimit limit = {0, 0};
@@ -1651,6 +1655,22 @@ __attribute__((constructor)) static void initialize(void) {
 pid_t waitpid(pid_t pid, int *status, int options) {
     static pid_t (*original)(pid_t, int *, int);
     if (!original) original = dlsym(RTLD_NEXT, "waitpid");
+    const char *ready = getenv("JR_TEST_PREREAP_READY");
+    const char *release = getenv("JR_TEST_PREREAP_RELEASE");
+    if (is_wrapper && ready && release && pid == -1 && options == 0
+        && !prereap_barrier_used++) {
+        siginfo_t info;
+        int result;
+        do {
+            result = waitid(P_ALL, 0, &info, WEXITED | WNOWAIT);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) _exit(99);
+        int fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) _exit(99);
+        close(fd);
+        for (int i = 0; i < 500 && access(release, F_OK); i++) usleep(10000);
+        if (access(release, F_OK)) _exit(98);
+    }
     pid_t result = original(pid, status, options);
     if (result > 0 && status && WIFSIGNALED(*status))
         atomic_store(&reaped_signal_child, 1);
@@ -1794,6 +1814,73 @@ fn one_generation_wrapper_preserves_unrequested_signal_during_shutdown() {
         assert!(!inner.running());
         assert_eq!(runner.log().matches("Starting inner process").count(), 1);
     }
+}
+
+#[test]
+fn one_generation_wrapper_does_not_record_shutdown_sent_to_a_zombie_inner() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    let config = temp.path().join("jobs.json");
+    let ready = temp.path().join("inner");
+    let zombie = temp.path().join("zombie");
+    let release = temp.path().join("release");
+    fs::write(
+        &config,
+        r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+    )
+    .unwrap();
+    let mut runner = Runner::start_with_env(
+        &config,
+        temp.path().join("log"),
+        &["--wrap"],
+        &[
+            ("LD_PRELOAD", library.to_str().unwrap()),
+            ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+            ("JR_TEST_PREREAP_READY", zombie.to_str().unwrap()),
+            ("JR_TEST_PREREAP_RELEASE", release.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+            &ready
+        ))
+        .is_empty()),
+        "{}",
+        runner.log()
+    );
+    let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+    inner.signal(libc::SIGTERM, None);
+    assert!(
+        wait_until(Duration::from_secs(5), || zombie.exists()),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(process_state(inner.pid), Some('Z'));
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received termination signal")),
+        "{}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received another termination signal")),
+        "{}",
+        runner.log()
+    );
+    fs::write(&release, "release").unwrap();
+    assert_eq!(
+        runner.wait(Duration::from_secs(5)).code(),
+        Some(143),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(support::ProcessIdentity::read(inner.pid), None);
+    assert_eq!(runner.log().matches("Starting inner process").count(), 1);
 }
 
 #[test]
