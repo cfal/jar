@@ -4459,6 +4459,15 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
 
         if !restart_inner {
             let code = inner_exit_status.map_or(1, |status| {
+                // The inner may receive shutdown before installing its handlers.
+                if shutdown_state.load(Ordering::Acquire) != 0
+                    && matches!(
+                        status.signal(),
+                        Some(libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT)
+                    )
+                {
+                    return 0;
+                }
                 status
                     .code()
                     .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))

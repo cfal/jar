@@ -1617,6 +1617,98 @@ fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
 }
 
 #[test]
+fn one_generation_wrapper_shutdown_before_inner_signal_handlers_is_successful() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pause-inner.c");
+    let library = temp.path().join("pause-inner.so");
+    fs::write(
+        &source,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void initialize(void) {
+    if (!getenv("JR_TEST_WRAPPER_INITIALIZED")) {
+        setenv("JR_TEST_WRAPPER_INITIALIZED", "1", 1);
+        return;
+    }
+    struct rlimit limit = {0, 0};
+    setrlimit(RLIMIT_CORE, &limit);
+    FILE *ready = fopen(getenv("JR_TEST_INNER_READY"), "w");
+    if (!ready) _exit(99);
+    fprintf(ready, "%d\n", getpid());
+    fclose(ready);
+    for (;;) pause();
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        for requested_shutdown in [true, false] {
+            let config = temp.path().join("jobs.json");
+            let ready = temp
+                .path()
+                .join(format!("inner-{signal}-{requested_shutdown}"));
+            let started = temp.path().join("started");
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {"job": {
+                    "command": format!("touch {}", started.display()), "restart": false
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+            let mut runner = Runner::start_with_env(
+                &config,
+                temp.path().join("log"),
+                &["--wrap"],
+                &[
+                    ("LD_PRELOAD", library.to_str().unwrap()),
+                    ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+                ],
+            );
+            assert!(
+                wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                    &ready
+                ))
+                .is_empty()),
+                "{}",
+                runner.log()
+            );
+            let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+            assert_eq!(parent_process_id(inner.pid), Some(runner.child.id()));
+            if requested_shutdown {
+                runner.signal(signal);
+            } else {
+                inner.signal(signal, None);
+            }
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(if requested_shutdown { 0 } else { 128 + signal }),
+                "{}",
+                runner.log()
+            );
+            assert!(!inner.running());
+            assert!(!started.exists());
+            assert!(runner.log().contains("Process terminated by signal"));
+            assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+        }
+    }
+}
+
+#[test]
 fn one_generation_wrapper_preserves_job_failures_during_shutdown() {
     for wrap in [false, true] {
         for failure in [0, 3] {
