@@ -1218,6 +1218,21 @@ fn exercise_sudo_signal_route(username: &str) {
     assert!(wait_until(Duration::from_secs(5), || {
         fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0)
     }));
+    let pid = read_pids(std::slice::from_ref(&pid_file))[0];
+    let expected_uid = Command::new("id").args(["-u", username]).output().unwrap();
+    assert!(expected_uid.status.success());
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let effective_uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        effective_uid,
+        String::from_utf8_lossy(&expected_uid.stdout).trim()
+    );
     let process_tree = Command::new("pstree")
         .args(["-ap", &runner.child.id().to_string()])
         .output()
@@ -1266,12 +1281,19 @@ fn docker_available() -> bool {
 }
 
 fn container_exists(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let output = Command::new("docker")
+        .args(["container", "ls", "--all", "--format", "{{.Names}}"])
+        .output()
+        .expect("could not query Docker containers");
+    assert!(
+        output.status.success(),
+        "Docker container query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .any(|line| line == name)
 }
 
 fn unique_container_name(label: &str) -> String {
@@ -1801,10 +1823,14 @@ fn configurations_without_active_jobs_exit_successfully() {
 
 #[test]
 fn wrapper_reads_commented_json_and_extensionless_configs_with_thread_options() {
-    for extension in ["json", "conf"] {
+    for extension in ["json", "conf", ""] {
         for threads_after_config in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let config = temp.path().join(format!("jobs.{extension}"));
+            let config = temp.path().join(if extension.is_empty() {
+                "jobs".to_string()
+            } else {
+                format!("jobs.{extension}")
+            });
             let runs = temp.path().join("runs");
             fs::write(&config, format!("// whole-line comment\n{}\n", serde_json::json!({"jobs": {"once": {
                 "command": format!("echo run >> {}; printf '%s' 'https://example.test/#fragment'", runs.display()),
@@ -4343,7 +4369,11 @@ fn same_user_sudo_delivers_each_signal_once() {
 
 #[test]
 fn cross_uid_sudo_signals_and_stops_job() {
-    let username = "root";
+    let username = if unsafe { libc::geteuid() } == 0 {
+        "nobody"
+    } else {
+        "root"
+    };
     if !sudo_available_for(username) {
         eprintln!("skipped: noninteractive sudo unavailable for {username}");
         return;
