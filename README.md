@@ -1,7 +1,9 @@
-# jr
+# jar
 
 A lightweight asynchronous process supervisor for Linux. It runs multiple jobs,
 restarts them after exit, forwards signals, and shuts down their process trees.
+
+The Cargo package is `jar`; the executable is `jr`.
 
 ## Features
 
@@ -29,7 +31,7 @@ To install `jr` into Cargo's bin directory:
 cargo install --path . --bin jr
 ```
 
-The Cargo package remains named `job-runner-rs`.
+After publication on crates.io, install the package with `cargo install jar`.
 
 ## Usage
 
@@ -37,7 +39,7 @@ The Cargo package remains named `job-runner-rs`.
 # Run with a config file
 jr config.yaml
 
-# Wrapper mode (auto-restarts the entire job-runner on failure)
+# Wrapper mode (auto-restarts jr on failure)
 jr --wrap config.yaml
 
 # Show help
@@ -141,7 +143,7 @@ JSON config files may contain full-line comments beginning with `//`:
 |-------------|------------|
 | `#cwd#` | Directory containing the config file |
 | `#home#` | User's `$HOME` directory |
-| `#runner_cwd#` | Directory where job-runner was started |
+| `#runner_cwd#` | Directory where `jr` was started |
 
 Jobs also receive `CWD` and `RUNNER_CWD` environment variables, plus the inherited
 `HOME`. The shell expands `$CWD`, `$RUNNER_CWD`, and `$HOME` in commands. A `cwd`
@@ -191,7 +193,7 @@ When a termination signal is received:
 With the default `process_group: true`, each job runs under a small internal
 reaper shim. The shim starts a dedicated noninteractive session via `setsid()`,
 acts as a Linux child subreaper, and launches the configured command. This
-prevents a job using `kill(0, ...)` from signaling job-runner itself.
+prevents a job using `kill(0, ...)` from signaling `jr` itself.
 
 The shim:
 
@@ -336,7 +338,7 @@ prefix: "{color}{job}{reset} ({stream}) > {datetime} > "
 
 ## Wrapper Mode
 
-The `--wrap` flag runs job-runner itself under supervision:
+The `--wrap` flag runs `jr` itself under supervision:
 
 ```bash
 jr --wrap config.yaml
@@ -348,7 +350,7 @@ Otherwise, wrapper recovery remains enabled: a non-restarting job runs once per
 inner generation and may run again after a runner failure. Completion is not
 persisted across generations.
 
-When the inner job-runner exits, the wrapper adopts and kills any remaining
+When the inner `jr` process exits, the wrapper adopts and kills any remaining
 previous-generation jobs before waiting 15 seconds and restarting it. Cleanup
 failure stops the wrapper instead of allowing old and new generations to
 overlap. For `sudo_user` jobs, the wrapper reloads configured usernames and
@@ -438,7 +440,7 @@ jobs:
 Many daemons reopen log files on SIGUSR1. Forward the signal to all jobs:
 
 ```bash
-# Rotate logs and signal job-runner
+# Rotate logs and signal jr
 logrotate /etc/logrotate.conf
 kill -USR1 $(pidof jr)
 ```

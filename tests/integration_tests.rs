@@ -781,6 +781,7 @@ jobs:
 
 #[test]
 fn help_flag() {
+    assert_eq!(env!("CARGO_PKG_NAME"), "jar");
     assert_eq!(
         std::path::Path::new(&binary_path()).file_name().unwrap(),
         "jr"
