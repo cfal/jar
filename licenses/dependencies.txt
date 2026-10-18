@@ -2059,7 +2059,7 @@ limitations under the License.
 
 
 License: GNU General Public License v3.0 only (GPL-3.0-only)
-Package: jar 0.1.0
+Package: jar 0.1.2
 Repository: https://github.com/cfal/jar
 
 GNU GENERAL PUBLIC LICENSE
