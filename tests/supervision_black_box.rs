@@ -3393,6 +3393,161 @@ fn blocked_stderr_does_not_block_final_supervision_error() {
 }
 
 #[test]
+fn direct_process_mode_signals_only_the_shell_and_bounds_output_draining() {
+    for natural_exit in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let child = temp.path().join("child.pid");
+        let ready = temp.path().join("ready");
+        let received = temp.path().join("received");
+        let command = if natural_exit {
+            format!(
+                "sleep 30 & echo $! > {}; echo tail; exit 0",
+                child.display()
+            )
+        } else {
+            format!(
+                "sleep 30 & echo $! > {}; trap 'echo usr1 >> {}' USR1; trap 'exit 0' TERM; touch {}; while :; do sleep 0.05; done",
+                child.display(),
+                received.display(),
+                ready.display()
+            )
+        };
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {"direct": {
+                "command": command, "process_group": false, "restart": false
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let _cleanup = ProcessCleanup(vec![child.clone()]);
+        let mut runner = Runner::start(&config, temp.path().join("log"), &[]);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &child
+            ))
+            .is_empty()
+                && (natural_exit || ready.exists())),
+            "{}",
+            runner.log()
+        );
+        let pid = read_pids(std::slice::from_ref(&child))[0];
+        let identity = support::ProcessIdentity::read(pid).unwrap();
+        if !natural_exit {
+            runner.signal(libc::SIGUSR1);
+            assert!(
+                wait_until(Duration::from_secs(3), || received.exists()),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(&received).unwrap(), "usr1\n");
+            assert!(identity.running(), "USR1 was incorrectly sent to the group");
+            runner.signal(libc::SIGTERM);
+        }
+        assert!(
+            runner.wait(Duration::from_secs(3)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(
+            identity.running(),
+            "direct mode unexpectedly killed a descendant"
+        );
+        if natural_exit {
+            assert!(runner.log().contains("tail"));
+        }
+    }
+}
+
+#[test]
+fn int_hup_and_quit_request_graceful_shutdown() {
+    for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let ready = temp.path().join("ready");
+            let graceful = temp.path().join("graceful");
+            let pid_path = temp.path().join("job.pid");
+            fs::write(&config, serde_json::json!({"jobs": {"job": {
+                "command": format!("echo $$ > {}; trap 'echo term >> {}; exit 0' TERM; touch {}; while :; do sleep 0.1; done", pid_path.display(), graceful.display(), ready.display()),
+                "restart": false
+            }}}).to_string()).unwrap();
+            let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+            assert!(
+                wait_until(Duration::from_secs(5), || ready.exists()
+                    && !read_pids(std::slice::from_ref(&pid_path)).is_empty()),
+                "{}",
+                runner.log()
+            );
+            let identity = support::ProcessIdentity::read(read_pids(&[pid_path])[0]).unwrap();
+            runner.signal(signal);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(0),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(graceful).unwrap(), "term\n");
+            assert!(!identity.running());
+            let name = match signal {
+                libc::SIGINT => "INT",
+                libc::SIGHUP => "HUP",
+                _ => "QUIT",
+            };
+            assert!(
+                runner.log().contains(&format!("Received {name} signal")),
+                "{}",
+                runner.log()
+            );
+        }
+    }
+}
+
+#[test]
+fn second_sigint_forces_shutdown_without_waiting_for_grace_period() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let pid_path = temp.path().join("job.pid");
+        fs::write(&config, serde_json::json!({"jobs": {"job": {
+            "command": format!("trap '' TERM; echo $$ > {}; while :; do sleep 1; done", pid_path.display()),
+            "shutdown_timeout": 30, "restart": false
+        }}}).to_string()).unwrap();
+        let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &pid_path
+            ))
+            .is_empty()),
+            "{}",
+            runner.log()
+        );
+        let identity = support::ProcessIdentity::read(read_pids(&[pid_path])[0]).unwrap();
+        runner.signal(libc::SIGINT);
+        assert!(
+            wait_until(Duration::from_secs(5), || runner
+                .log()
+                .contains("shutting down active processes")),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGINT);
+        assert_eq!(
+            runner.wait(Duration::from_secs(4)).code(),
+            Some(0),
+            "{}",
+            runner.log()
+        );
+        assert!(!identity.running());
+    }
+}
+
+#[test]
 fn second_termination_signal_forces_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("stubborn.pid");
