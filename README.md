@@ -31,7 +31,7 @@ To install `jr` into Cargo's bin directory:
 cargo install --path . --bin jr
 ```
 
-After publication on crates.io, install the package with `cargo install jar`.
+Install from crates.io with `cargo install jar`.
 
 ## Usage
 

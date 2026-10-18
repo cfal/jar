@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.88"
 description = "A lightweight Linux process supervisor"
 license = "GPL-3.0-only"
+repository = "https://github.com/cfal/jar"
+readme = "README.md"
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "jr"
