@@ -3933,7 +3933,8 @@ fn int_hup_and_quit_request_graceful_shutdown() {
             let mut runner = Runner::start(&config, temp.path().join("log"), &args);
             assert!(
                 wait_until(Duration::from_secs(5), || ready.exists()
-                    && !read_pids(std::slice::from_ref(&pid_path)).is_empty()),
+                    && !read_pids(std::slice::from_ref(&pid_path)).is_empty()
+                    && runner.log().contains("Started (pid ")),
                 "{}",
                 runner.log()
             );
@@ -3978,7 +3979,8 @@ fn second_sigint_forces_shutdown_without_waiting_for_grace_period() {
             wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
                 &pid_path
             ))
-            .is_empty()),
+            .is_empty()
+                && runner.log().contains("Started (pid ")),
             "{}",
             runner.log()
         );
