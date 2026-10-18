@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[allow(dead_code)]
 mod support;
 use support::SpawnGuarded;
 

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
 mod support;
 use support::{GuardedChild, SpawnGuarded};
 
