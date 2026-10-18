@@ -102,6 +102,17 @@ fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
+fn wait_for_started_job(ready: &std::path::Path, log: &std::path::Path) {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            ready.exists()
+                && std::fs::read_to_string(log).is_ok_and(|output| output.contains("Started (pid "))
+        }),
+        "job trap or supervisor registration not ready: {}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+}
+
 #[test]
 fn invalid_cli_arguments_report_specific_errors_without_starting_jobs() {
     for (args, diagnostic) in [
@@ -182,6 +193,7 @@ jobs:
 fn sigusr1_forwarding() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
     let config = format!(
         r#"
 jobs:
@@ -199,13 +211,13 @@ jobs:
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -226,6 +238,7 @@ jobs:
 fn sigusr2_forwarding() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
     let config = format!(
         r#"
 jobs:
@@ -243,13 +256,13 @@ jobs:
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR2);
 
@@ -308,6 +321,7 @@ fn process_group_kills_children() {
 fn process_group_signal_via_negative_pid() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
     let config = format!(
         r#"
 jobs:
@@ -315,7 +329,7 @@ jobs:
     command: |
       trap ':' USR1
       bash -c 'trap "echo CHILD_GOT_USR1" USR1; touch {}; while true; do sleep 0.2; done' &
-      while :; do wait; done
+      while :; do wait; sleep 0.05; done
     process_group: true
 "#,
         ready.display()
@@ -326,13 +340,13 @@ jobs:
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -568,6 +582,7 @@ jobs:
 fn multiple_usr_signals() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
     let received = temp.path().join("received");
     let config = format!(
         r#"
@@ -588,13 +603,13 @@ jobs:
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    wait_for_started_job(&ready, &log);
 
     for expected in 1..=3 {
         send_signal(child.id(), libc::SIGUSR1);
