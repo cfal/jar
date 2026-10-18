@@ -954,13 +954,14 @@ fn install_failing_signal_sudo(root: &Path) -> String {
     )
 }
 
-fn install_unready_cleanup_leaking_sudo(root: &Path, escapee_pid: &Path) -> String {
+fn install_unready_cleanup_leaking_sudo(root: &Path, escapee_pid: &Path, release: &Path) -> String {
     let real_sudo = real_sudo_path();
     install_fake_sudo(
         root,
         &format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    {real_sudo} \"$@\"\n    setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n    while [ ! -s {escapee_pid} ]; do sleep 0.01; done\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    {real_sudo} \"$@\"\n    setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n    while [ ! -e {release} ]; do sleep 0.01; done\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
             escapee_pid = escapee_pid.display(),
+            release = release.display(),
         ),
     )
 }
@@ -4228,6 +4229,7 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
     let shim_pid = temp.path().join("shim.pid");
     let workload_pid = temp.path().join("workload.pid");
     let helper_escapee_pid = temp.path().join("helper-escapee.pid");
+    let release = temp.path().join("release-helper");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     for path in [&workload_pid, &helper_escapee_pid] {
@@ -4240,7 +4242,7 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
     permissions.set_mode(0o755);
     fs::set_permissions(temp.path(), permissions).unwrap();
     let probe = build_shim_startup_probe_library(temp.path());
-    let path = install_unready_cleanup_leaking_sudo(temp.path(), &helper_escapee_pid);
+    let path = install_unready_cleanup_leaking_sudo(temp.path(), &helper_escapee_pid, &release);
     let config_data = serde_json::json!({
         "jobs": {
             "job": {
@@ -4278,6 +4280,17 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
         runner.log()
     );
     runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&helper_escapee_pid)).is_empty()
+        }),
+        "signal-helper descendant did not start: {}",
+        runner.log()
+    );
+    let escapee =
+        support::ProcessIdentity::read(read_pids(std::slice::from_ref(&helper_escapee_pid))[0])
+            .unwrap();
+    fs::write(&release, "release").unwrap();
     let status = runner.wait(Duration::from_secs(8));
 
     assert!(
@@ -4286,11 +4299,11 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
         runner.log()
     );
     assert!(
-        read_pids(std::slice::from_ref(&helper_escapee_pid))
-            .into_iter()
-            .any(process_is_running),
+        escapee.running(),
         "test did not exercise a surviving signal-helper descendant"
     );
+    assert_eq!(support::cleanup_pid_file(&helper_escapee_pid, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !escapee.running()));
 }
 
 #[test]
