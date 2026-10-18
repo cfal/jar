@@ -259,6 +259,8 @@ struct JobConfig {
     env: Option<HashMap<String, String>>,
     #[serde(default, alias = "sudoUser")]
     sudo_user: Option<String>,
+    #[serde(default = "default_restart")]
+    restart: bool,
     #[serde(default = "default_restart_delay", alias = "restartDelay")]
     restart_delay: u64,
     #[serde(default)]
@@ -289,6 +291,10 @@ struct DateTimeConfig {
 
 fn default_restart_delay() -> u64 {
     15_000
+}
+
+fn default_restart() -> bool {
+    true
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -998,6 +1004,17 @@ impl<'a> std::fmt::Display for PrefixWriter<'a> {
     }
 }
 
+enum ProcessOutcome {
+    Shutdown,
+    Exited(ExitStatus),
+}
+
+#[derive(Debug)]
+enum JobOutcome {
+    Shutdown,
+    Completed { success: bool },
+}
+
 async fn start_proc(
     prefix: String,
     opts: JobConfig,
@@ -1005,7 +1022,7 @@ async fn start_proc(
     mut shutdown: watch::Receiver<ShutdownState>,
     mut scanner: ProcessScannerHandle,
     base_env: Arc<HashMap<String, String>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<JobOutcome> {
     let status_prefix = PrefixWriter::from(format!("{} (s)", prefix), &opts.datetime);
     let mut initial = true;
 
@@ -1054,10 +1071,19 @@ async fn start_proc(
         )
         .await
         {
-            Ok(true) => break,
-            Ok(false) => {}
+            Ok(ProcessOutcome::Shutdown) => break,
+            Ok(ProcessOutcome::Exited(status)) => {
+                if !opts.restart {
+                    return Ok(JobOutcome::Completed {
+                        success: status.success(),
+                    });
+                }
+            }
             Err(ProcessRunError::Retry(e)) => {
                 eprintln!("{} > Process error: {}", status_prefix, e);
+                if !opts.restart {
+                    return Ok(JobOutcome::Completed { success: false });
+                }
             }
             Err(ProcessRunError::Fatal(e)) => {
                 eprintln!("{} > Fatal process supervision error: {}", status_prefix, e);
@@ -1066,7 +1092,7 @@ async fn start_proc(
         }
     }
     eprintln!("{} > Shutting down..", status_prefix);
-    Ok(())
+    Ok(JobOutcome::Shutdown)
 }
 
 async fn start_proc_internal(
@@ -1077,9 +1103,9 @@ async fn start_proc_internal(
     shutdown: &mut watch::Receiver<ShutdownState>,
     scanner: &mut ProcessScannerHandle,
     base_env: &Arc<HashMap<String, String>>,
-) -> Result<bool, ProcessRunError> {
+) -> Result<ProcessOutcome, ProcessRunError> {
     if *shutdown.borrow() != ShutdownState::Running {
-        return Ok(true);
+        return Ok(ProcessOutcome::Shutdown);
     }
     let snapshots = &mut scanner.snapshots;
     let scanner_requests = &scanner.requests;
@@ -1314,7 +1340,7 @@ async fn start_proc_internal(
             return match cleanup {
                 Ok(status) => {
                     report_child_status(status_prefix, status);
-                    Ok(true)
+                    Ok(ProcessOutcome::Shutdown)
                 }
                 Err(error) => Err(ProcessRunError::Fatal(error)),
             };
@@ -1489,7 +1515,7 @@ async fn start_proc_internal(
                         return Err(ProcessRunError::Fatal(error));
                     }
                     drain_output_handlers([stdout_handle, stderr_handle]).await;
-                    return Ok(false);
+                    return Ok(ProcessOutcome::Exited(status));
                 }
             }
         }
@@ -1899,7 +1925,7 @@ async fn start_proc_internal(
     if let Some(error) = unresolved_signal_error {
         return Err(ProcessRunError::Fatal(error));
     }
-    Ok(true)
+    Ok(ProcessOutcome::Shutdown)
 }
 
 fn post_kill_timeout_error(
@@ -2906,7 +2932,7 @@ fn main() -> ExitCode {
     };
 
     let exit_code = match runtime.block_on(run_supervisor(config, base_env)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(success) => ExitCode::from(u8::from(!success)),
         Err(error) => {
             eprintln!("Failed to run supervisor: {}", error);
             ExitCode::from(1)
@@ -2919,7 +2945,7 @@ fn main() -> ExitCode {
 async fn run_supervisor(
     config: Config,
     base_env: Arc<HashMap<String, String>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     process_tree::validate_procfs().map_err(|error| {
         std::io::Error::new(
             error.kind(),
@@ -3001,41 +3027,45 @@ async fn run_supervisor(
         });
     }
 
+    let mut jobs_succeeded = true;
     let (first_signal, mut invariant_failed) = loop {
+        if job_handles.is_empty() {
+            break (None, false);
+        }
         tokio::select! {
             _ = sigterm.recv() => {
                 match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(_) => break ("TERM", false),
+                    Ok(_) => break (Some("TERM"), false),
                     Err(error) => {
                         eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
+                        break (Some("SCANNER FAILURE"), true);
                     }
                 }
             }
             _ = sighup.recv() => {
                 match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(_) => break ("HUP", false),
+                    Ok(_) => break (Some("HUP"), false),
                     Err(error) => {
                         eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
+                        break (Some("SCANNER FAILURE"), true);
                     }
                 }
             }
             _ = sigint.recv() => {
                 match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(_) => break ("INT", false),
+                    Ok(_) => break (Some("INT"), false),
                     Err(error) => {
                         eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
+                        break (Some("SCANNER FAILURE"), true);
                     }
                 }
             }
             _ = sigquit.recv() => {
                 match refresh_process_snapshot(&scanner_request_tx).await {
-                    Ok(_) => break ("QUIT", false),
+                    Ok(_) => break (Some("QUIT"), false),
                     Err(error) => {
                         eprintln!("Could not refresh process snapshot: {}", error);
-                        break ("SCANNER FAILURE", true);
+                        break (Some("SCANNER FAILURE"), true);
                     }
                 }
             }
@@ -3049,7 +3079,7 @@ async fn run_supervisor(
                     &scanner_request_tx,
                 ).await {
                     eprintln!("Could not refresh process snapshot: {}", error);
-                    break ("SCANNER FAILURE", true);
+                    break (Some("SCANNER FAILURE"), true);
                 }
             }
             _ = sigusr2.recv() => {
@@ -3062,24 +3092,28 @@ async fn run_supervisor(
                     &scanner_request_tx,
                 ).await {
                     eprintln!("Could not refresh process snapshot: {}", error);
-                    break ("SCANNER FAILURE", true);
+                    break (Some("SCANNER FAILURE"), true);
                 }
             }
             result = job_handles.join_next(), if !job_handles.is_empty() => {
                 match result {
-                    Some(Ok(Ok(()))) => eprintln!("Job supervisor task stopped unexpectedly"),
+                    Some(Ok(Ok(JobOutcome::Completed { success }))) => {
+                        jobs_succeeded &= success;
+                        continue;
+                    }
+                    Some(Ok(Ok(JobOutcome::Shutdown))) => eprintln!("Job supervisor task stopped unexpectedly"),
                     Some(Ok(Err(error))) => eprintln!("Job supervisor failed: {}", error),
                     Some(Err(error)) => eprintln!("Job supervisor task failed: {}", error),
                     None => {}
                 }
-                break ("SUPERVISOR FAILURE", true);
+                break (Some("SUPERVISOR FAILURE"), true);
             }
             result = signal_handles.join_next(), if !signal_handles.is_empty() => {
                 match result {
                     Some(Ok(Ok(()))) | None => {}
                     Some(Ok(Err(error))) if error.containment_failed => {
                         eprintln!("Signal helper containment failed: {}", error.error);
-                        break ("SUPERVISOR FAILURE", true);
+                        break (Some("SUPERVISOR FAILURE"), true);
                     }
                     Some(Ok(Err(error))) => eprintln!("Signal forwarding failed: {}", error.error),
                     Some(Err(error)) => eprintln!("Signal forwarding task failed: {error}"),
@@ -3091,21 +3125,23 @@ async fn run_supervisor(
                     &scanner_request_tx,
                 ).await {
                     eprintln!("Could not refresh process snapshot: {}", error);
-                    break ("SCANNER FAILURE", true);
+                    break (Some("SCANNER FAILURE"), true);
                 }
             }
             result = &mut scanner_handle, if !scanner_finished => {
                 scanner_finished = true;
                 log_unexpected_scanner_stop(result);
-                break ("SCANNER FAILURE", true);
+                break (Some("SCANNER FAILURE"), true);
             }
         }
     };
 
-    eprintln!(
-        "\nReceived {} signal, shutting down active processes..",
-        first_signal
-    );
+    if let Some(first_signal) = first_signal {
+        eprintln!(
+            "\nReceived {} signal, shutting down active processes..",
+            first_signal
+        );
+    }
     let _ = refresh_process_snapshot(&scanner_request_tx).await;
     let _ = scanner_request_tx.send(ProcessScannerRequest::UseCleanupInterval);
     let _ = shutdown_tx.send(ShutdownState::Graceful);
@@ -3121,7 +3157,8 @@ async fn run_supervisor(
             _ = sigusr2.recv() => {}
             result = job_handles.join_next(), if !job_handles.is_empty() => {
                 match result {
-                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Ok(JobOutcome::Completed { success }))) => jobs_succeeded &= success,
+                    Some(Ok(Ok(JobOutcome::Shutdown))) | None => {}
                     Some(Ok(Err(error))) => {
                         eprintln!("Job supervisor failed during shutdown: {}", error);
                         invariant_failed = true;
@@ -3172,7 +3209,7 @@ async fn run_supervisor(
     if invariant_failed {
         Err(std::io::Error::other("job supervisor task failed"))
     } else {
-        Ok(())
+        Ok(jobs_succeeded)
     }
 }
 
@@ -4130,7 +4167,7 @@ async fn signal_identities_as_user(
 }
 
 fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     if let Err(error) = process_tree::validate_procfs() {
         eprintln!("[Wrapper] Could not validate Linux procfs: {error}");
@@ -4238,6 +4275,12 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
         }
 
         eprintln!("[Wrapper] Starting inner process..");
+        let restart_inner = configured_wrapper_jobs(inner_args).is_none_or(|config| {
+            config
+                .jobs
+                .values()
+                .any(|job| !job.disabled && !job.command.is_empty() && job.restart)
+        });
         lock_or_recover(&signal_state).begin_publication();
         if shutdown_state.load(Ordering::Acquire) != 0 {
             lock_or_recover(&signal_state).cancel_publication();
@@ -4262,20 +4305,27 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
             Err(e) => {
                 lock_or_recover(&signal_state).cancel_publication();
                 eprintln!("[Wrapper] Failed to spawn inner process: {}", e);
+                if !restart_inner {
+                    return ExitCode::from(1);
+                }
                 wrapper_delay(&shutdown_state, Duration::from_secs(15));
                 continue;
             }
         };
 
         let mut inner_termination_error = None;
+        let mut inner_exit_status = None;
         let inner_was_supervised = match process_tree::identity(child.id()) {
             Ok(identity) => {
                 publish_wrapper_inner(&signal_state, identity);
                 match wait_for_main_child(&child) {
-                    Ok(exit_status) => match exit_status.code() {
-                        Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
-                        None => eprintln!("[Wrapper] Process terminated by signal"),
-                    },
+                    Ok(exit_status) => {
+                        inner_exit_status = Some(exit_status);
+                        match exit_status.code() {
+                            Some(code) => eprintln!("[Wrapper] Exited with status code: {code}"),
+                            None => eprintln!("[Wrapper] Process terminated by signal"),
+                        }
+                    }
                     Err(e) => {
                         eprintln!("[Wrapper] Failed to read exit status: {}", e);
                     }
@@ -4308,6 +4358,15 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
         if shutdown_state.load(Ordering::Acquire) != 0 {
             eprintln!("[Wrapper] Shutdown complete, exiting..");
             return ExitCode::SUCCESS;
+        }
+
+        if !restart_inner {
+            let code = inner_exit_status.map_or(1, |status| {
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+            });
+            return ExitCode::from(code as u8);
         }
 
         if inner_was_supervised {
@@ -4465,7 +4524,7 @@ fn reconcile_descendants_with_sudo_users(
     }
 }
 
-fn configured_wrapper_sudo_users(inner_args: &[String]) -> HashSet<String> {
+fn configured_wrapper_jobs(inner_args: &[String]) -> Option<Config> {
     let mut config_path = None;
     let mut skip_next = false;
     for argument in inner_args {
@@ -4477,17 +4536,16 @@ fn configured_wrapper_sudo_users(inner_args: &[String]) -> HashSet<String> {
             config_path = Some(argument);
         }
     }
-    let Some(config_path) = config_path else {
-        return HashSet::new();
-    };
-    let Ok(data) = std::fs::read_to_string(config_path) else {
-        return HashSet::new();
-    };
+    let config_path = config_path?;
+    let data = std::fs::read_to_string(config_path).ok()?;
     let without_json_comments = strip_json_comments(&data);
-    let config = serde_yaml::from_str::<Config>(&data)
+    serde_yaml::from_str::<Config>(&data)
         .ok()
-        .or_else(|| serde_json::from_str::<Config>(&without_json_comments).ok());
-    config
+        .or_else(|| serde_json::from_str::<Config>(&without_json_comments).ok())
+}
+
+fn configured_wrapper_sudo_users(inner_args: &[String]) -> HashSet<String> {
+    configured_wrapper_jobs(inner_args)
         .into_iter()
         .flat_map(|config| config.jobs.into_values())
         .filter_map(|job| job.sudo_user)
@@ -4946,6 +5004,7 @@ mod tests {
         let job = &config.jobs["example"];
 
         assert!(job.process_group);
+        assert!(job.restart);
         assert_eq!(job.shutdown_timeout, 5);
         assert_eq!(job.restart_delay, 15_000);
     }
@@ -4957,6 +5016,22 @@ mod tests {
         )
         .unwrap();
         assert!(!config.jobs["example"].process_group);
+    }
+
+    #[test]
+    fn restart_can_be_explicitly_disabled_in_yaml_and_json() {
+        let yaml: Config = serde_yaml::from_str(
+            "jobs:\n  once:\n    command: echo ok\n    restart: false\n    restartDelay: 123\n",
+        )
+        .unwrap();
+        let json: Config = serde_json::from_str(
+            r#"{"jobs":{"once":{"command":"echo ok","restart":false,"restartDelay":123}}}"#,
+        )
+        .unwrap();
+        for config in [yaml, json] {
+            assert!(!config.jobs["once"].restart);
+            assert_eq!(config.jobs["once"].restart_delay, 123);
+        }
     }
 
     #[test]

@@ -1307,6 +1307,124 @@ fn unique_container_name(label: &str) -> String {
 }
 
 #[test]
+fn non_restarting_jobs_finish_once_and_aggregate_failures() {
+    for wrap in [false, true] {
+        for command in ["exit 0", "exit 7", "kill -TERM $$"] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.yaml");
+            let runs = temp.path().join("runs");
+            let done = temp.path().join("done");
+            fs::write(
+                &config,
+                format!(
+                    "jobs:\n  first:\n    command: 'echo run >> {}; {}'\n    restart: false\n    restartDelay: 0\n  last:\n    command: 'touch {}'\n    delay: 200\n    restart: false\n  disabled:\n    command: 'exit 1'\n    disabled: true\n  empty:\n    command: ''\n",
+                    runs.display(), command, done.display()
+                ),
+            )
+            .unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+            let status = runner.wait(Duration::from_secs(5));
+            assert_eq!(status.success(), command == "exit 0", "{}", runner.log());
+            assert!(done.exists(), "another job was stopped: {}", runner.log());
+            assert_eq!(fs::read_to_string(&runs).unwrap(), "run\n");
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn non_restarting_startup_failure_does_not_retry_or_stop_other_jobs() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.yaml");
+        let done = temp.path().join("done");
+        fs::write(
+            &config,
+            format!(
+                "jobs:\n  invalid:\n    command: 'echo no'\n    cwd: '{}/missing'\n    restart: false\n  last:\n    command: 'touch {}'\n    delay: 200\n    restart: false\n",
+                temp.path().display(), done.display()
+            ),
+        )
+        .unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+        assert!(!runner.wait(Duration::from_secs(5)).success());
+        assert!(done.exists());
+        assert_eq!(
+            runner
+                .log()
+                .matches("Working directory does not exist")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn non_restarting_jobs_can_run_alongside_restarting_jobs() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.yaml");
+        let once = temp.path().join("once");
+        let repeated = temp.path().join("repeated");
+        fs::write(
+            &config,
+            format!(
+                "jobs:\n  once:\n    command: 'echo run >> {}; exit 1'\n    restart: false\n  repeated:\n    command: 'echo run >> {}'\n    restartDelay: 100\n",
+                once.display(), repeated.display()
+            ),
+        )
+        .unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fs::read_to_string(&repeated)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    >= 3
+            }),
+            "{}",
+            runner.log()
+        );
+        assert!(runner.is_running());
+        assert_eq!(fs::read_to_string(&once).unwrap(), "run\n");
+        runner.signal(libc::SIGTERM);
+        let status = runner.wait(Duration::from_secs(5));
+        // A wrapper's explicit shutdown keeps its existing successful exit contract.
+        assert_eq!(status.success(), wrap, "{}", runner.log());
+    }
+}
+
+#[test]
+fn non_restarting_job_cleans_descendants_and_drains_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    let descendant = temp.path().join("descendant.pid");
+    fs::write(
+        &config,
+        format!(
+            "jobs:\n  once:\n    command: 'sleep 30 & echo $! > {}; printf final-output'\n    restart: false\n    shutdown_timeout: 0\n",
+            descendant.display()
+        ),
+    )
+    .unwrap();
+    let _cleanup = ProcessCleanup(vec![descendant.clone()]);
+    let mut runner = Runner::start(&config, temp.path().join("runner.log"), &[]);
+    assert!(
+        runner.wait(Duration::from_secs(5)).success(),
+        "{}",
+        runner.log()
+    );
+    assert!(runner.log().contains("final-output"));
+    let pids = read_pids(&[descendant]);
+    assert!(!pids.is_empty());
+    assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+}
+
+#[test]
 fn shell_compound_commands_are_not_truncated_by_exec() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("jobs.yaml");

@@ -111,6 +111,7 @@ JSON config files may contain full-line comments beginning with `//`:
 | `cwd` | string | runner cwd | Working directory |
 | `color` | string | random | Output color (see colors below) |
 | `delay` | integer | 0 | Initial startup delay in milliseconds |
+| `restart` | boolean | true | Restart after exit; set to false to run once |
 | `restart_delay` | integer | 15000 | Delay before restart after exit (ms) |
 | `disabled` | boolean | false | Skip this job |
 | `process_group` | boolean | true | Signal the job's process group and discovered descendants |
@@ -147,9 +148,23 @@ value may be one of those variables or begin with one followed by `/`, such as
 `$HOME/work`.
 
 Commands already run through `sh -c`; do not add another `sh -c` unless nested
-shell semantics are intentional. Each completed command is restarted after
-`restart_delay`, whether it succeeded or failed. Restarts always wait at least
-100 ms to prevent an accidental busy loop.
+shell semantics are intentional. With the default `restart: true`, each completed
+command is restarted after `restart_delay`, whether it succeeded or failed.
+Restarts always wait at least 100 ms to prevent an accidental busy loop.
+
+Set `restart: false` to run a job once, including when it fails to start or exits
+unsuccessfully. Its initial `delay`, output draining, and process-tree cleanup
+still apply; `restart_delay` is unused. Other jobs continue independently. When
+all enabled jobs finish, `jr` exits with status 0 if every job succeeded, or 1
+if any non-restarting job failed. Fatal supervision or containment failures still
+stop all jobs immediately.
+
+```yaml
+jobs:
+  migrate:
+    command: "./migrate"
+    restart: false
+```
 
 ## Signal Handling
 
@@ -284,6 +299,12 @@ The `--wrap` flag runs job-runner itself under supervision:
 ```bash
 jr --wrap config.yaml
 ```
+
+If every enabled, nonempty job has `restart: false`, the wrapper runs only one
+inner generation, cleans up, and returns its exit status without restarting it.
+Otherwise, wrapper recovery remains enabled: a non-restarting job runs once per
+inner generation and may run again after a runner failure. Completion is not
+persisted across generations.
 
 When the inner job-runner exits, the wrapper adopts and kills any remaining
 previous-generation jobs before waiting 15 seconds and restarting it. Cleanup
