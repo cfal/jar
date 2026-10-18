@@ -19,8 +19,17 @@ The Cargo package is `jar`; the executable is `jr`.
 
 ## Installation
 
+Prebuilt `jr` binaries for Linux x86_64 and ARM64, with GNU and musl variants,
+are available on [GitHub Releases](https://github.com/cfal/jar/releases).
+Each archive includes license notices. `jar-source.tar.gz` contains matching
+source and vendored dependencies for offline builds; `SHA256SUMS` covers all
+release archives. GNU binaries require a compatible glibc; use musl for a
+self-contained executable.
+
+To build from a checkout:
+
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
 The binary will be at `target/release/jr`.
@@ -28,10 +37,30 @@ The binary will be at `target/release/jr`.
 To install `jr` into Cargo's bin directory:
 
 ```bash
-cargo install --path . --bin jr
+cargo install --path . --locked --bin jr
 ```
 
-After publication on crates.io, install the package with `cargo install jar`.
+Install from crates.io with `cargo install jar --locked`.
+
+## Development and Releases
+
+Development branches use wildcard dependency requirements. `Cargo.lock` pins
+the tested versions, and CI uses `--locked` throughout. Dependency upgrades are
+explicit: run `cargo update`, then validate and commit the updated lockfile.
+
+CI runs formatting, Clippy, the Linux test suite (including sudo and Docker
+coverage), a Rust 1.88 compatibility check, and all four release builds on pull
+requests. Dependency notices are regenerated and compared with the committed
+bundle. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for regeneration.
+
+Release from a `release-X.Y.Z` branch: bump the package version, replace wildcard
+requirements with the tested versions from `Cargo.lock`, regenerate notices,
+and commit. Keep those release-only version requirements off `master`.
+After the release branch passes CI, push its matching `vX.Y.Z` tag. The workflow
+checks the tag/version match and creates a draft GitHub release only after all
+checks and builds pass. Review the archives and checksums before publishing it.
+Crates.io publication uses the same release branch with versioned dependencies:
+`cargo publish --locked --dry-run`, then `cargo publish --locked`.
 
 ## Usage
 

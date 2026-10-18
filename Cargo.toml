@@ -5,22 +5,25 @@ edition = "2024"
 rust-version = "1.88"
 description = "A lightweight Linux process supervisor"
 license = "GPL-3.0-only"
+repository = "https://github.com/cfal/jar"
+readme = "README.md"
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/licenses/**", "/about.toml", "/scripts/**"]
 
 [[bin]]
 name = "jr"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.49", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-rand = "0.9"
-chrono = "0.4"
-libc = "0.2"
+tokio = { version = "*", features = ["full"] }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+serde_yaml = "*"
+rand = "*"
+chrono = "*"
+libc = "*"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "*"
 
 [profile.release]
 opt-level = 3
