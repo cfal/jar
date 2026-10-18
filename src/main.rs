@@ -9,7 +9,7 @@ use std::sync::mpsc::{RecvTimeoutError, Sender, SyncSender, TrySendError, channe
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -607,7 +607,8 @@ fn job_shim_completion_pipe() -> std::io::Result<(std::fs::File, OwnedFd)> {
 
 fn job_shim_readiness_pipe() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
     let (reader, writer) = job_shim_pipe()?;
-    Ok((AsyncFd::new(reader)?, writer))
+    // The owned descriptor stays open and unchanged until AsyncFd drops it.
+    Ok((unsafe { AsyncFd::register(reader)? }, writer))
 }
 
 enum JobShimReadiness {
@@ -757,7 +758,8 @@ async fn take_job_shim_completion_async(
     let Some(reader) = reader.take() else {
         return Ok(None);
     };
-    let reader = AsyncFd::new(reader)?;
+    // The owned file keeps the same descriptor open for the AsyncFd lifetime.
+    let reader = unsafe { AsyncFd::register(reader)? };
     let completion = timeout(JOB_SHIM_COMPLETION_SETTLE_TIMEOUT, async {
         loop {
             let mut readable = reader.readable().await?;
