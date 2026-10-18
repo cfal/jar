@@ -79,9 +79,11 @@ jr --help
 
 Pass exactly one configuration file. Unknown fields, invalid field types, and
 duplicate snake_case/camelCase aliases are errors, including in disabled jobs.
-Configuration parsing and active-job validation finish before any job or wrapper
-generation starts. Disabled jobs and empty commands skip semantic checks such as
-prefix, datetime-format, and duration validation.
+Configuration parsing and active-job prefix, datetime-format, and duration
+validation finish before any job or wrapper generation starts. Disabled jobs and
+empty commands skip these semantic checks. Launch inputs (working directory, sudo
+user, environment keys, and embedded NUL bytes) are checked on each launch;
+failures affect only that job and follow its restart policy.
 
 ### Minimal Example
 
