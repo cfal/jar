@@ -1595,6 +1595,46 @@ fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
 }
 
 #[test]
+fn one_generation_wrapper_preserves_job_failures_during_shutdown() {
+    for wrap in [false, true] {
+        for failure in [0, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let pid_path = temp.path().join("active.pid");
+            fs::write(&config, serde_json::json!({"jobs": {
+                "finished": {"command": format!("exit {failure}"), "restart": false, "prefix": "finished: "},
+                "active": {"command": format!("echo $$ > {}; exec sleep 30", pid_path.display()), "restart": false}
+            }}).to_string()).unwrap();
+            let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    !read_pids(std::slice::from_ref(&pid_path)).is_empty()
+                        && runner
+                            .log()
+                            .contains(&format!("finished: Exited with code {failure}"))
+                }),
+                "{}",
+                runner.log()
+            );
+            let pids = read_pids(std::slice::from_ref(&pid_path));
+            runner.signal(libc::SIGTERM);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(i32::from(failure != 0)),
+                "{}",
+                runner.log()
+            );
+            assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+            if wrap {
+                assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn one_generation_wrapper_cleans_jobs_after_inner_sigkill_without_restarting() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("jobs.yaml");

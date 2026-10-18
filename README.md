@@ -375,6 +375,8 @@ jr --wrap config.yaml
 
 If every enabled, nonempty job has `restart: false`, the wrapper runs only one
 inner generation, cleans up, and returns its exit status without restarting it.
+This preserves earlier job failures even when shutdown is requested by a signal.
+An explicit shutdown with no recorded job failure still returns status 0.
 Otherwise, wrapper recovery remains enabled: a non-restarting job runs once per
 inner generation and may run again after a runner failure. Completion is not
 persisted across generations.

@@ -4445,7 +4445,7 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
 
-        if shutdown_state.load(Ordering::Acquire) != 0 {
+        if restart_inner && shutdown_state.load(Ordering::Acquire) != 0 {
             eprintln!("[Wrapper] Shutdown complete, exiting..");
             return ExitCode::SUCCESS;
         }
