@@ -5426,6 +5426,42 @@ mod tests {
     }
 
     #[test]
+    fn stale_updates_cannot_replace_or_remove_a_newer_active_identity() {
+        let current = PidInfo {
+            is_process_group: true,
+            identity: ProcessIdentity {
+                pid: 42,
+                process_group: 42,
+                start_time: 200,
+            },
+        };
+        let stale = PidInfo {
+            identity: ProcessIdentity {
+                start_time: 100,
+                ..current.identity
+            },
+            ..current
+        };
+        let descendant = ProcessIdentity {
+            pid: 43,
+            process_group: 42,
+            start_time: 201,
+        };
+        let active = Mutex::new(HashMap::from([(
+            42,
+            TrackedRun {
+                info: current,
+                descendants: HashSet::from([descendant]),
+            },
+        )]));
+        update_active_descendants(&active, stale, &HashSet::new());
+        remove_active_pid(&active, stale);
+        let active = active.lock().unwrap();
+        assert_eq!(active[&42].info.identity, current.identity);
+        assert_eq!(active[&42].descendants, HashSet::from([descendant]));
+    }
+
+    #[test]
     fn active_pid_registration_consumes_existing_shutdown_notification() {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownState::Running);
         shutdown_tx.send(ShutdownState::Graceful).unwrap();

@@ -2681,6 +2681,123 @@ fn inherited_output_pipe_does_not_block_restart() {
 }
 
 #[test]
+fn replacement_checks_previous_identity_before_starting_and_reruns_one_shots_per_generation() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let previous = temp.path().join("previous");
+        let overlap = temp.path().join("overlap");
+        let children = temp.path().join("children");
+        let shim = temp.path().join("shim");
+        let once = temp.path().join("once");
+        let script = temp.path().join("generation.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+read_identity() {{
+    record=$(cat /proc/$1/stat 2>/dev/null) || return 1
+    record=${{record##*) }}
+    set -- $record
+    printf '%s %s\n' "$1" "${{20}}"
+}}
+if [ -s {previous} ]; then
+    read -r old_pid old_start < {previous}
+    if current=$(read_identity "$old_pid"); then
+        set -- $current
+        if [ "$2" = "$old_start" ] && [ "$1" != Z ] && [ "$1" != X ]; then
+            echo overlap >> {overlap}
+        fi
+    fi
+fi
+sleep 30 &
+pid=$!
+set -- $(read_identity "$pid")
+echo "$pid $2" > {previous}
+echo $PPID > {shim}
+echo "$pid" >> {children}
+{finish}
+"#,
+                previous = previous.display(),
+                overlap = overlap.display(),
+                shim = shim.display(),
+                children = children.display(),
+                finish = if wrap {
+                    "while :; do sleep 1; done"
+                } else {
+                    "exit 0"
+                }
+            ),
+        );
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {
+                "once": {"command": format!("echo run >> {}", once.display()), "restart": false},
+                "repeated": {"command": format!("exec {}", script.display()), "restart_delay": 100}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let _cleanup = ProcessCleanup(vec![children.clone(), shim.clone()]);
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &children
+            ))
+            .is_empty()
+                && fs::read_to_string(&once)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    == 1
+                && !read_pids(std::slice::from_ref(&shim)).is_empty()),
+            "{}",
+            runner.log()
+        );
+        if wrap {
+            let inner = parent_process_id(read_pids(&[shim])[0]).unwrap();
+            assert_eq!(parent_process_id(inner), Some(runner.child.id()));
+            assert_eq!(
+                unsafe { libc::kill(inner as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+        }
+        assert!(
+            wait_until(Duration::from_secs(if wrap { 25 } else { 5 }), || {
+                read_pids(std::slice::from_ref(&children)).len() >= 2
+                    && fs::read_to_string(&once)
+                        .unwrap_or_default()
+                        .lines()
+                        .count()
+                        == if wrap { 2 } else { 1 }
+            }),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(
+            !overlap.exists(),
+            "a replacement observed its previous generation alive"
+        );
+        assert_eq!(
+            fs::read_to_string(once).unwrap().lines().count(),
+            if wrap { 2 } else { 1 }
+        );
+        assert!(
+            read_pids(&[children])
+                .into_iter()
+                .all(|pid| !process_is_running(pid))
+        );
+    }
+}
+
+#[test]
 fn natural_leader_exit_kills_residual_process_group_before_restart() {
     let temp = tempfile::tempdir().unwrap();
     let children = temp.path().join("children");
