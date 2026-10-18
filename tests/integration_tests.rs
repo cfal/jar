@@ -180,13 +180,21 @@ jobs:
 
 #[test]
 fn sigusr1_forwarding() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let config = format!(
+        r#"
 jobs:
   signal_handler:
-    command: "sh -c 'trap \"echo USR1_RECEIVED\" USR1; while true; do sleep 0.5; done'"
-"#;
+    command: |
+      trap 'echo USR1_RECEIVED' USR1
+      touch {}
+      while true; do sleep 0.5; done
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -197,7 +205,7 @@ jobs:
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(1));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -216,13 +224,21 @@ jobs:
 
 #[test]
 fn sigusr2_forwarding() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let config = format!(
+        r#"
 jobs:
   signal_handler:
-    command: "sh -c 'trap \"echo USR2_RECEIVED\" USR2; while true; do sleep 0.5; done'"
-"#;
+    command: |
+      trap 'echo USR2_RECEIVED' USR2
+      touch {}
+      while true; do sleep 0.5; done
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -233,7 +249,7 @@ jobs:
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(1));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
 
     send_signal(child.id(), libc::SIGUSR2);
 
@@ -290,14 +306,22 @@ fn process_group_kills_children() {
 
 #[test]
 fn process_group_signal_via_negative_pid() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let config = format!(
+        r#"
 jobs:
   group_leader:
-    command: "bash -c 'bash -c \"trap \\\"echo CHILD_GOT_USR1\\\" USR1; while true; do sleep 0.2; done\" & wait'"
+    command: |
+      trap ':' USR1
+      bash -c 'trap "echo CHILD_GOT_USR1" USR1; touch {}; while true; do sleep 0.2; done' &
+      while :; do wait; done
     process_group: true
-"#;
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -308,7 +332,7 @@ jobs:
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -542,16 +566,24 @@ jobs:
 
 #[test]
 fn multiple_usr_signals() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let received = temp.path().join("received");
+    let config = format!(
+        r#"
 jobs:
   counter:
     command: |
       count=0
-      trap 'count=$((count+1)); echo COUNT=$count' USR1
+      trap 'count=$((count+1)); echo COUNT=$count; echo $count > {}' USR1
+      touch {}
       while true; do sleep 0.2; done
-"#;
+"#,
+        received.display(),
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -562,11 +594,17 @@ jobs:
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_millis(500));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
 
-    for _ in 0..3 {
+    for expected in 1..=3 {
         send_signal(child.id(), libc::SIGUSR1);
-        thread::sleep(Duration::from_millis(300));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                std::fs::read_to_string(&received)
+                    .is_ok_and(|contents| contents.trim() == expected.to_string())
+            }),
+            "signal {expected} was not acknowledged"
+        );
     }
 
     let output = collect_output_for(stdout, Duration::from_secs(2));
@@ -579,9 +617,10 @@ jobs:
         .filter(|line| line.contains("COUNT="))
         .collect();
 
-    assert!(
-        count_lines.len() >= 2,
-        "Expected at least 2 signal receipts, got: {:?}",
+    assert_eq!(
+        count_lines.len(),
+        3,
+        "Expected exactly 3 signal receipts, got: {:?}",
         count_lines
     );
 }
