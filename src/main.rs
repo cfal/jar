@@ -5590,14 +5590,16 @@ mod tests {
     #[test]
     fn output_frames_preserve_payload_bytes_and_repeat_the_bounded_prefix() {
         let mut job: JobConfig = serde_yaml::from_str("command: true").unwrap();
-        for template in [
-            String::new(),
-            "[{job}/{stream}] ".to_string(),
-            "\u{20ac}".repeat(MAX_OUTPUT_PREFIX_BYTES),
+        for (template, expected_prefix) in [
+            (String::new(), Vec::new()),
+            ("[{job}/{stream}] ".to_string(), b"[worker/2] ".to_vec()),
+            (
+                "\u{20ac}".repeat(MAX_OUTPUT_PREFIX_BYTES),
+                "\u{20ac}".repeat(MAX_OUTPUT_PREFIX_BYTES / 3).into_bytes(),
+            ),
         ] {
             job.prefix = Some(template);
             let prefix = PrefixWriter::from_job("worker", &job).for_stream("2");
-            let expected_prefix = bounded_format(format_args!("{prefix}"), MAX_OUTPUT_PREFIX_BYTES);
             assert!(std::str::from_utf8(&expected_prefix).is_ok());
             for length in [
                 0,
@@ -5660,6 +5662,10 @@ mod tests {
         let output = bounded_format(format_args!("{diagnostic}"), MAX_OUTPUT_FRAME_BYTES - 1);
 
         assert!(output.len() < MAX_OUTPUT_FRAME_BYTES);
+        assert_eq!(
+            output,
+            "é".repeat((MAX_OUTPUT_FRAME_BYTES - 1) / 2).as_bytes()
+        );
         assert!(std::str::from_utf8(&output).is_ok());
     }
 

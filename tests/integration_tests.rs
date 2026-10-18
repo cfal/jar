@@ -450,13 +450,24 @@ jobs:
 
 #[test]
 fn graceful_shutdown_clean_exit() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let graceful = temp.path().join("graceful");
+    let config = format!(
+        r#"
 jobs:
-  quick_exit:
-    command: "sleep 0.5"
-"#;
+  active:
+    command: |
+      trap 'touch {}; exit 0' TERM
+      touch {}
+      while :; do sleep 1; done
+    restart: false
+"#,
+        graceful.display(),
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
@@ -467,23 +478,25 @@ jobs:
 
     let stderr = child.stderr.take().unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
 
     send_signal(child.id(), libc::SIGTERM);
 
     let output = collect_output_for(stderr, Duration::from_secs(3));
 
-    let _ = child.wait();
-
-    let graceful_or_no_remaining = output
-        .iter()
-        .any(|line| line.contains("gracefully") || line.contains("Exited with code 0"))
-        || !output.iter().any(|line| line.contains("SIGKILL"));
-
+    assert!(child.wait().unwrap().success(), "{output:?}");
+    assert!(graceful.exists(), "TERM trap did not run: {output:?}");
     assert!(
-        graceful_or_no_remaining,
-        "Expected graceful shutdown. Output: {:?}",
         output
+            .iter()
+            .any(|line| line.contains("Received TERM signal")),
+        "{output:?}"
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|line| line.contains("Killed by signal 9")),
+        "{output:?}"
     );
 }
 
@@ -720,7 +733,7 @@ fn json_config_with_comments() {
         .iter()
         .any(|line| line.contains("json_with_comments"));
     assert!(
-        job_ran || status.success(),
+        job_ran && status.success(),
         "JSON with comments should be parsed correctly. Output: {:?}",
         output
     );
@@ -865,6 +878,11 @@ jobs:
     send_signal(child.id(), libc::SIGTERM);
 
     let status = child.wait().expect("Failed to wait for child");
+    let output = collect_output_for(child.stdout.take().unwrap(), Duration::from_secs(1));
+    assert!(
+        output.iter().any(|line| line.ends_with("hello")),
+        "{output:?}"
+    );
 
     assert!(
         status.success(),
