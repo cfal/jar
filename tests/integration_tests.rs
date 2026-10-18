@@ -4,6 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+mod support;
+use support::SpawnGuarded;
+
 #[derive(Clone, Copy, Debug)]
 struct TestProcess {
     pid: u32,
@@ -143,7 +146,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -188,7 +191,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -224,7 +227,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -260,7 +263,7 @@ fn process_group_kills_children() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(
@@ -299,7 +302,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -335,7 +338,7 @@ fn process_group_all_children_killed() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(
@@ -375,7 +378,7 @@ fn process_group_enabled_by_default() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(wait_until(Duration::from_secs(3), || {
@@ -421,7 +424,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -459,7 +462,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -499,7 +502,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -540,7 +543,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -586,7 +589,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -621,7 +624,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
@@ -662,7 +665,7 @@ jobs:
         .args(["--wrap", config_file.path().to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner in wrapper mode");
 
     let stdout = child.stdout.take().unwrap();
@@ -704,7 +707,7 @@ fn json_config_with_comments() {
         .arg(file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -784,7 +787,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -855,7 +858,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
@@ -886,7 +889,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -927,7 +930,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -976,7 +979,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1026,7 +1029,7 @@ fn cwd_placeholder_substitution() {
         .arg(&config_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1061,7 +1064,7 @@ fn runner_cwd_placeholder_substitution() {
         .current_dir(runner_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1103,7 +1106,7 @@ fn dollar_placeholder_substitution() {
         .current_dir(runner_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1170,7 +1173,7 @@ fn dollar_cwd_prefix_substitution() {
         .env("HOME", home_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1194,7 +1197,7 @@ fn home_placeholder_substitution() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1235,7 +1238,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1271,7 +1274,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1309,7 +1312,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
@@ -1345,7 +1348,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1378,7 +1381,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1414,7 +1417,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();

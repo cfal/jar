@@ -4,11 +4,14 @@ use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod support;
+use support::{GuardedChild, SpawnGuarded};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TEST_RECONCILE_INTERVAL_ENV: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
@@ -22,7 +25,7 @@ fn serialize_resource_intensive_test() -> MutexGuard<'static, ()> {
 }
 
 struct Runner {
-    child: Child,
+    child: GuardedChild,
     log_path: PathBuf,
 }
 
@@ -38,7 +41,7 @@ impl Runner {
         }
 
         Self {
-            child: command.spawn().unwrap(),
+            child: command.spawn_guarded().unwrap(),
             log_path,
         }
     }
@@ -132,18 +135,6 @@ impl Runner {
     }
 }
 
-impl Drop for Runner {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
-                libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = self.child.wait();
-        }
-    }
-}
-
 struct ForkedProcess(libc::pid_t);
 
 impl Drop for ForkedProcess {
@@ -159,11 +150,8 @@ struct ProcessCleanup(Vec<PathBuf>);
 
 impl Drop for ProcessCleanup {
     fn drop(&mut self) {
-        for pid in read_pids(&self.0) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+        for path in &self.0 {
+            support::cleanup_pid_file(path, None);
         }
     }
 }
@@ -233,27 +221,7 @@ struct SudoProcessCleanup {
 
 impl Drop for SudoProcessCleanup {
     fn drop(&mut self) {
-        for pid in read_pids(std::slice::from_ref(&self.pid_path)) {
-            let process_group = process_group_id(pid)
-                .map(|group| format!("-{group}"))
-                .unwrap_or_else(|| pid.to_string());
-            let pid = pid.to_string();
-            let _ = Command::new("sudo")
-                .args([
-                    "-n",
-                    "-u",
-                    &self.username,
-                    "--",
-                    "kill",
-                    "-KILL",
-                    "--",
-                    &process_group,
-                    &pid,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        support::cleanup_pid_file(&self.pid_path, Some(&self.username));
     }
 }
 
@@ -808,13 +776,7 @@ fn fork_with_retry() -> libc::pid_t {
 fn read_pids(paths: &[PathBuf]) -> Vec<u32> {
     paths
         .iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .flat_map(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| support::observe_pid_file(path))
         .collect()
 }
 
@@ -5253,7 +5215,7 @@ fn sudo_job_shim_kills_escaped_descendant_before_exiting() {
         ])
         .stdout(output.try_clone().unwrap())
         .stderr(output)
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let _cleanup = SudoProcessCleanup {
         username: username.to_string(),
@@ -5316,7 +5278,7 @@ fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
         .env("PATH", path)
         .stdout(output.try_clone().unwrap())
         .stderr(output)
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let _cleanup = SudoProcessCleanup {
         username: username.to_string(),
