@@ -1842,6 +1842,97 @@ fn wrapper_reads_commented_json_and_extensionless_configs_with_thread_options() 
 }
 
 #[test]
+fn output_reader_preserves_complete_payloads_at_buffer_and_frame_boundaries() {
+    for length in [8191, 8192, 8193, 65535, 65536, 65537, 131072] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let payload_path = temp.path().join("payload");
+        let stdout_path = temp.path().join("stdout");
+        let stderr_path = temp.path().join("stderr");
+        let payload: Vec<_> = (0..length).map(|i| [b'a', 0, 255][i % 3]).collect();
+        let mut input = payload.clone();
+        input.extend_from_slice(b"\n\ntail");
+        fs::write(&payload_path, input).unwrap();
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {"binary": {
+                "command": format!("cat {0}; cat {0} >&2", payload_path.display()),
+                "prefix": "{stream}>", "restart": false
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+        command
+            .arg(config)
+            .stdout(File::create(&stdout_path).unwrap())
+            .stderr(File::create(&stderr_path).unwrap());
+        let mut runner = Runner::spawn_in_session(command, stderr_path.clone());
+        assert!(runner.wait(Duration::from_secs(5)).success());
+        for (stream, path) in [(b'1', stdout_path), (b'2', stderr_path)] {
+            let mut expected = Vec::new();
+            for reader_chunk in payload.chunks(65536) {
+                for frame in reader_chunk.chunks(65533) {
+                    expected.extend_from_slice(&[stream, b'>']);
+                    expected.extend_from_slice(frame);
+                    expected.push(b'\n');
+                }
+            }
+            expected.extend_from_slice(&[stream, b'>', b'\n', stream, b'>']);
+            expected.extend_from_slice(b"tail\n");
+            let actual = fs::read(path).unwrap();
+            let mut job_bytes = Vec::new();
+            for line in actual.split_inclusive(|byte| *byte == b'\n') {
+                if line.starts_with(&[stream, b'>']) {
+                    job_bytes.extend_from_slice(line);
+                } else {
+                    assert!(
+                        stream == b'2'
+                            && (line.starts_with(b"Initializing job ")
+                                || line.starts_with(b"s>Started (pid ")
+                                || line == b"s>Exited with code 0\n"),
+                        "unexpected output: {line:?}"
+                    );
+                }
+            }
+            assert_eq!(job_bytes, expected, "length={length}, stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn closed_output_sinks_do_not_prevent_completion_or_descendant_cleanup() {
+    for stderr in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let pid_path = temp.path().join("child.pid");
+        fs::write(&config, serde_json::json!({"jobs": {"writer": {
+            "command": format!("sleep 30 & echo $! > {}; printf out; printf err >&2", pid_path.display()),
+            "restart": false, "shutdown_timeout": 0
+        }}}).to_string()).unwrap();
+        let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+        let mut runner = if stderr {
+            Runner::start_with_unread_stderr(&config, temp.path().join("log"), &[])
+        } else {
+            Runner::start_with_unread_stdout(&config, temp.path().join("log"))
+        };
+        if stderr {
+            drop(runner.child.stderr.take());
+        } else {
+            drop(runner.child.stdout.take());
+        }
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        let pids = read_pids(&[pid_path]);
+        assert_eq!(pids.len(), 1);
+        assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+    }
+}
+
+#[test]
 fn output_readers_preserve_binary_bytes_blank_lines_and_unterminated_tails() {
     let temp = tempfile::tempdir().unwrap();
     let payload = temp.path().join("payload");
