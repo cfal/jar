@@ -5682,13 +5682,14 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
     let escapee = temp.path().join("escapee.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     let fault_library = build_partial_helper_capture_fault_library(temp.path());
     let command = format!(
-        "trap 'setsid sh -c \"echo \\$\\$ > {}; exec sleep 30\" & while [ ! -s {} ]; do sleep 0.001; done; exit 0' TERM; touch {}; while :; do sleep 1; done",
+        "trap 'setsid sh -c \"echo \\$\\$ > {}; exec sleep 30\" & while [ ! -e {} ]; do sleep 0.001; done; exit 0' TERM; touch {}; while :; do sleep 1; done",
         escapee.display(),
-        escapee.display(),
+        release.display(),
         ready.display()
     );
     fs::write(
@@ -5708,8 +5709,19 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
     ];
 
     let mut runner = Runner::start_with_env(&config, log, &[], &environment);
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()
+        && runner.log().contains("Started (pid ")));
     runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&escapee)).is_empty()
+        }),
+        "TERM handler did not create the escaped descendant: {}",
+        runner.log()
+    );
+    let identity =
+        support::ProcessIdentity::read(read_pids(std::slice::from_ref(&escapee))[0]).unwrap();
+    fs::write(&release, "release").unwrap();
     let status = runner.wait(Duration::from_secs(8));
 
     assert!(
@@ -5723,10 +5735,8 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
         "{}",
         runner.log()
     );
-    assert!(
-        !read_pids(std::slice::from_ref(&escapee)).is_empty(),
-        "TERM handler did not create the escaped descendant"
-    );
+    assert_eq!(support::cleanup_pid_file(&escapee, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !identity.running()));
 }
 
 #[test]
