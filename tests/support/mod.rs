@@ -183,13 +183,13 @@ impl Drop for GuardedChild {
         };
         if !exited {
             root.signal(libc::SIGTERM, None);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !exited && Instant::now() < deadline {
-            if self.child.try_wait().ok().flatten().is_some() {
-                break;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
         }
         // Keep identities captured before shutdown, even after adoption or setsid.
         descendants(&mut self.known);
@@ -214,12 +214,16 @@ impl Drop for GuardedChild {
 type RecordedIdentities = HashMap<PathBuf, Vec<ProcessIdentity>>;
 static RECORDED: OnceLock<Mutex<RecordedIdentities>> = OnceLock::new();
 
-pub fn observe_pid_file(path: &Path) -> Vec<u32> {
-    let pids: Vec<u32> = fs::read_to_string(path)
+fn read_pid_file(path: &Path) -> Vec<u32> {
+    fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.trim().parse().ok())
-        .collect();
+        .collect()
+}
+
+pub fn observe_pid_file(path: &Path) -> Vec<u32> {
+    let pids = read_pid_file(path);
     if pids.is_empty() {
         return pids;
     }
@@ -255,11 +259,7 @@ pub fn cleanup_pid_file(path: &Path, sudo_user: Option<&str>) -> usize {
         .remove(path)
         .unwrap_or_default();
     let mut unobserved = 0;
-    for pid in fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-    {
+    for pid in read_pid_file(path) {
         if let Some(identity) = ProcessIdentity::read(pid)
             && identity.running()
             && !known.contains(&identity)

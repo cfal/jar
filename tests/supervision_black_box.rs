@@ -1602,6 +1602,18 @@ fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
     }
 }
 
+fn wait_for_recorded_identity(runner: &Runner, pid_path: &Path) -> support::ProcessIdentity {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !support::observe_pid_file(pid_path).is_empty()
+        }),
+        "{}",
+        runner.log()
+    );
+    let pid = support::observe_pid_file(pid_path)[0];
+    support::ProcessIdentity::read(pid).unwrap()
+}
+
 fn build_paused_wrapper_inner_library(root: &Path) -> PathBuf {
     let source = root.join("pause-inner.c");
     let library = root.join("pause-inner.so");
@@ -1736,15 +1748,7 @@ fn one_generation_wrapper_shutdown_before_inner_signal_handlers_is_successful() 
                     ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
                 ],
             );
-            assert!(
-                wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
-                    &ready
-                ))
-                .is_empty()),
-                "{}",
-                runner.log()
-            );
-            let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+            let inner = wait_for_recorded_identity(&runner, &ready);
             assert_eq!(parent_process_id(inner.pid), Some(runner.child.id()));
             if requested_shutdown {
                 runner.signal(signal);
@@ -1788,15 +1792,7 @@ fn one_generation_wrapper_preserves_unrequested_signal_during_shutdown() {
                 ("JR_TEST_TERM_ACK", ack.to_str().unwrap()),
             ],
         );
-        assert!(
-            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
-                &ready
-            ))
-            .is_empty()),
-            "{}",
-            runner.log()
-        );
-        let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+        let inner = wait_for_recorded_identity(&runner, &ready);
         runner.signal(libc::SIGTERM);
         assert!(
             wait_until(Duration::from_secs(5), || fs::metadata(&ack)
@@ -1840,15 +1836,7 @@ fn one_generation_wrapper_does_not_record_shutdown_sent_to_a_zombie_inner() {
             ("JR_TEST_PREREAP_RELEASE", release.to_str().unwrap()),
         ],
     );
-    assert!(
-        wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
-            &ready
-        ))
-        .is_empty()),
-        "{}",
-        runner.log()
-    );
-    let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+    let inner = wait_for_recorded_identity(&runner, &ready);
     inner.signal(libc::SIGTERM, None);
     assert!(
         wait_until(Duration::from_secs(5), || zombie.exists()),
@@ -1907,15 +1895,7 @@ fn one_generation_wrapper_late_shutdown_preserves_reaped_signal_failure() {
             ("JR_TEST_POST_REAP_RELEASE", release.to_str().unwrap()),
         ],
     );
-    assert!(
-        wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
-            &ready
-        ))
-        .is_empty()),
-        "{}",
-        runner.log()
-    );
-    let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+    let inner = wait_for_recorded_identity(&runner, &ready);
     inner.signal(libc::SIGTERM, None);
     assert!(
         wait_until(Duration::from_secs(5), || reaped.exists()),
