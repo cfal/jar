@@ -5063,6 +5063,118 @@ mod tests {
     }
 
     #[test]
+    fn job_shim_readiness_rejects_eof_and_invalid_status() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            for status in [Some(JOB_SHIM_READY), Some(0), Some(255), None] {
+                let (reader, writer) = job_shim_readiness_pipe().unwrap();
+                let mut writer = std::fs::File::from(writer);
+                if let Some(status) = status {
+                    writer.write_all(&[status]).unwrap();
+                }
+                drop(writer);
+                let result = read_job_shim_readiness(&reader).await;
+                match status {
+                    Some(JOB_SHIM_READY) => result.unwrap(),
+                    None => assert_eq!(
+                        result.unwrap_err().kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                    ),
+                    Some(status) => assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains(&format!("invalid readiness status: {status}"))
+                    ),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn job_shim_readiness_stops_on_shutdown_or_closed_channel() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            for state in [ShutdownState::Graceful, ShutdownState::Force] {
+                let (reader, _writer) = job_shim_readiness_pipe().unwrap();
+                let (_sender, mut shutdown) = watch::channel(state);
+                let mut reader = Some(reader);
+                assert!(matches!(
+                    wait_for_job_shim_readiness(&mut reader, &mut shutdown, Duration::from_secs(1))
+                        .await
+                        .unwrap(),
+                    JobShimReadiness::Shutdown
+                ));
+                assert!(reader.is_none());
+            }
+
+            let (reader, _writer) = job_shim_readiness_pipe().unwrap();
+            let (sender, mut shutdown) = watch::channel(ShutdownState::Running);
+            drop(sender);
+            assert!(matches!(
+                wait_for_job_shim_readiness(
+                    &mut Some(reader),
+                    &mut shutdown,
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+                JobShimReadiness::Shutdown
+            ));
+        });
+    }
+
+    #[test]
+    fn sync_and_async_shim_completion_validate_the_same_protocol() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        for status in [
+            Some(JOB_SHIM_COMPLETED),
+            Some(JOB_SHIM_FAILED),
+            Some(255),
+            None,
+        ] {
+            for asynchronous in [false, true] {
+                let (reader, writer) = job_shim_completion_pipe().unwrap();
+                let mut writer = std::fs::File::from(writer);
+                if let Some(status) = status {
+                    writer.write_all(&[status]).unwrap();
+                }
+                drop(writer);
+                let mut reader = Some(reader);
+                let result = if asynchronous {
+                    runtime.block_on(read_job_shim_completion_async(&mut reader))
+                } else {
+                    read_job_shim_completion(&mut reader)
+                };
+                match status {
+                    Some(JOB_SHIM_COMPLETED) => result.unwrap(),
+                    Some(JOB_SHIM_FAILED) => assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("descendant supervision failure")
+                    ),
+                    Some(status) => assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains(&format!("invalid completion status: {status}"))
+                    ),
+                    None => assert_eq!(
+                        result.unwrap_err().kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                    ),
+                }
+                assert!(reader.is_none());
+            }
+        }
+        read_job_shim_completion(&mut None).unwrap();
+        runtime
+            .block_on(read_job_shim_completion_async(&mut None))
+            .unwrap();
+    }
+
+    #[test]
     fn process_group_defaults_to_enabled() {
         let config: Config =
             serde_yaml::from_str("jobs:\n  example:\n    command: echo ok\n").unwrap();
@@ -5096,6 +5208,50 @@ mod tests {
         for config in [yaml, json] {
             assert!(!config.jobs["once"].restart);
             assert_eq!(config.jobs["once"].restart_delay, 123);
+        }
+    }
+
+    #[test]
+    fn yaml_and_json_reject_invalid_job_field_types_and_duplicate_aliases() {
+        for (field, value) in [
+            ("command", serde_json::json!({"shell": "true"})),
+            ("restart", serde_json::json!("false")),
+            ("disabled", serde_json::json!(1)),
+            ("delay", serde_json::json!(-1)),
+            ("restartDelay", serde_json::json!(1.5)),
+            ("shutdownTimeout", serde_json::json!("5")),
+            ("prefix", serde_json::json!(["{job}"])),
+            ("env", serde_json::json!({"PORT": [3000]})),
+            ("datetime", serde_json::json!({"enabled": "true"})),
+        ] {
+            let mut job = serde_json::json!({"command": "true"});
+            job[field] = value;
+            assert!(
+                serde_json::from_value::<JobConfig>(job.clone()).is_err(),
+                "{field}"
+            );
+            assert!(
+                serde_yaml::from_str::<JobConfig>(&serde_yaml::to_string(&job).unwrap()).is_err(),
+                "{field}"
+            );
+        }
+        for (field, alias, value) in [
+            ("restart_delay", "restartDelay", serde_json::json!(100)),
+            ("shutdown_timeout", "shutdownTimeout", serde_json::json!(1)),
+            ("process_group", "processGroup", serde_json::json!(false)),
+            ("sudo_user", "sudoUser", serde_json::json!("root")),
+        ] {
+            let mut job = serde_json::json!({"command": "true"});
+            job[field] = value.clone();
+            job[alias] = value;
+            assert!(
+                serde_json::from_value::<JobConfig>(job.clone()).is_err(),
+                "{field}"
+            );
+            assert!(
+                serde_yaml::from_str::<JobConfig>(&serde_yaml::to_string(&job).unwrap()).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -5429,6 +5585,73 @@ mod tests {
                 .iter()
                 .all(|frame| frame.len() <= MAX_OUTPUT_FRAME_BYTES)
         );
+    }
+
+    #[test]
+    fn output_frames_preserve_payload_bytes_and_repeat_the_bounded_prefix() {
+        let mut job: JobConfig = serde_yaml::from_str("command: true").unwrap();
+        for template in [
+            String::new(),
+            "[{job}/{stream}] ".to_string(),
+            "\u{20ac}".repeat(MAX_OUTPUT_PREFIX_BYTES),
+        ] {
+            job.prefix = Some(template);
+            let prefix = PrefixWriter::from_job("worker", &job).for_stream("2");
+            let expected_prefix = bounded_format(format_args!("{prefix}"), MAX_OUTPUT_PREFIX_BYTES);
+            assert!(std::str::from_utf8(&expected_prefix).is_ok());
+            for length in [
+                0,
+                1,
+                MAX_OUTPUT_FRAME_BYTES - 1,
+                MAX_OUTPUT_FRAME_BYTES,
+                MAX_OUTPUT_FRAME_BYTES * 2,
+            ] {
+                let payload: Vec<u8> = (0..length).map(|i| (i % 256) as u8).collect();
+                let (sender, receiver) = sync_channel(8);
+                send_output(&sender, &prefix, &payload);
+                drop(sender);
+                let mut reconstructed = Vec::new();
+                let mut frames = 0;
+                for message in receiver {
+                    let OutputMessage::Frame(frame) = message else {
+                        panic!("unexpected flush barrier");
+                    };
+                    assert!(frame.len() <= MAX_OUTPUT_FRAME_BYTES);
+                    assert!(frame.starts_with(&expected_prefix));
+                    assert_eq!(frame.last(), Some(&b'\n'));
+                    reconstructed.extend_from_slice(&frame[expected_prefix.len()..frame.len() - 1]);
+                    frames += 1;
+                }
+                assert_eq!(reconstructed, payload);
+                assert_eq!(
+                    frames,
+                    length
+                        .div_ceil(MAX_OUTPUT_FRAME_BYTES - expected_prefix.len() - 1)
+                        .max(1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saturated_or_disconnected_output_queues_do_not_block_producers() {
+        let (sender, receiver) = sync_channel(1);
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            send_output_frame(&sender, b"prefix: ", b"first");
+            send_output_frame(&sender, b"prefix: ", b"dropped");
+            done_tx.send(sender).unwrap();
+        });
+        let sender = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        let OutputMessage::Frame(frame) = receiver.try_recv().unwrap() else {
+            panic!("unexpected flush barrier");
+        };
+        assert_eq!(frame, b"prefix: first\n");
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        send_output_frame(&sender, b"prefix: ", b"disconnected");
+        flush_output_sink(&sender);
     }
 
     #[test]
