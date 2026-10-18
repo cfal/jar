@@ -23,7 +23,7 @@ impl Drop for TestProcessCleanup {
 }
 
 fn binary_path() -> String {
-    env!("CARGO_BIN_EXE_job-runner-rs").to_string()
+    env!("CARGO_BIN_EXE_jr").to_string()
 }
 
 fn create_temp_config(content: &str) -> tempfile::NamedTempFile {
@@ -781,6 +781,10 @@ jobs:
 
 #[test]
 fn help_flag() {
+    assert_eq!(
+        std::path::Path::new(&binary_path()).file_name().unwrap(),
+        "jr"
+    );
     let output = Command::new(binary_path())
         .arg("--help")
         .output()
@@ -788,7 +792,7 @@ fn help_flag() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Usage:"),
+        stderr.contains(&format!("Usage: {} [--wrap]", binary_path())),
         "Should show usage with --help. Stderr: {}",
         stderr
     );

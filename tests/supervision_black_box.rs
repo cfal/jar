@@ -54,7 +54,7 @@ impl Runner {
         environment: &[(&str, &str)],
     ) -> Self {
         let log = File::create(&log_path).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
         command
             .args(extra_args)
             .arg(config)
@@ -66,14 +66,14 @@ impl Runner {
 
     fn start_with_unread_stdout(config: &Path, log_path: PathBuf) -> Self {
         let log = File::create(&log_path).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
         command.arg(config).stdout(Stdio::piped()).stderr(log);
         Self::spawn_in_session(command, log_path)
     }
 
     fn start_with_unread_stderr(config: &Path, log_path: PathBuf, extra_args: &[&str]) -> Self {
         let log = File::create(&log_path).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
         command
             .args(extra_args)
             .arg(config)
@@ -93,7 +93,7 @@ impl Runner {
         environment: &[(&str, &str)],
     ) -> Self {
         let log = File::create(&log_path).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
         command
             .arg(config)
             .env("PATH", path)
@@ -1532,14 +1532,14 @@ fn post_spawn_error_respects_direct_process_signal_scope() {
 #[test]
 fn atomic_binary_replacement_does_not_break_job_restarts() {
     let temp = tempfile::tempdir().unwrap();
-    let executable = temp.path().join("job-runner-rs");
-    let replacement = temp.path().join("job-runner-rs.new");
+    let executable = temp.path().join("jr");
+    let replacement = temp.path().join("jr.new");
     let runs = temp.path().join("runs");
     let ready = temp.path().join("ready");
     let release = temp.path().join("release");
     let config = temp.path().join("jobs.yaml");
     let log_path = temp.path().join("runner.log");
-    fs::copy(env!("CARGO_BIN_EXE_job-runner-rs"), &executable).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_jr"), &executable).unwrap();
     fs::write(
         &config,
         format!(
@@ -1559,7 +1559,7 @@ fn atomic_binary_replacement_does_not_break_job_restarts() {
     let mut runner = Runner::spawn_in_session(command, log_path);
     assert!(wait_until(Duration::from_secs(3), || ready.exists()));
 
-    fs::copy(env!("CARGO_BIN_EXE_job-runner-rs"), &replacement).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_jr"), &replacement).unwrap();
     fs::rename(&replacement, &executable).unwrap();
     File::create(&release).unwrap();
 
@@ -2979,7 +2979,7 @@ fn wrapper_restarts_a_killed_inner_runner_and_stops_during_backoff() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho $$ >> {}\npid=$PPID\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n    kill -KILL \"$pid\"\n    exit 0\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nexit 1\n",
+            "#!/bin/bash\necho $$ >> {}\npid=$PPID\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = jr ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n    kill -KILL \"$pid\"\n    exit 0\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nexit 1\n",
             runs.display()
         ),
     );
@@ -3068,7 +3068,7 @@ fn wrapper_reconciles_jobs_left_by_a_killed_inner_runner_before_restart() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
+            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = jr ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
             runs = runs.display(),
             killed_once = killed_once.display(),
         ),
@@ -3116,7 +3116,7 @@ fn wrapper_contains_new_escapee_after_inner_and_shim_exit() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\n( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\nwhile [ ! -s {descendant_pid} ]; do sleep 0.01; done\npid=$PPID\nshim=\ninner=\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n    if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nkill -KILL \"$shim\" \"$inner\"\n",
+            "#!/bin/bash\n( setsid sh -c 'echo $$ > {descendant_pid}; exec sleep 30' & )\nwhile [ ! -s {descendant_pid} ]; do sleep 0.01; done\npid=$PPID\nshim=\ninner=\nwhile [ \"$pid\" -gt 1 ]; do\n  cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n  if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = jr ]; then\n    if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n  fi\n  pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\ndone\nkill -KILL \"$shim\" \"$inner\"\n",
             descendant_pid = descendant_pid.display(),
         ),
     );
@@ -3175,7 +3175,7 @@ fn wrapper_reconciles_cross_uid_jobs_before_restart() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
+            "#!/bin/bash\necho $$ >> {runs}\nif [ ! -e {killed_once} ]; then\n  touch {killed_once}\n  pid=$PPID\n  shim=\n  inner=\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = jr ]; then\n      if [[ \"$cmdline\" = *--job-shim* ]]; then shim=$pid; else inner=$pid; break; fi\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  kill -KILL \"$inner\" \"$shim\"\nfi\nexec sleep 30\n",
             runs = runs.display(),
             killed_once = killed_once.display(),
         ),
@@ -3229,7 +3229,7 @@ fn wrapper_drops_user_signals_received_during_backoff() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/bash\necho run >> {runs}\nif [ \"$(wc -l < {runs})\" -eq 1 ]; then\n  pid=$PPID\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = job-runner-rs ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n      kill -KILL \"$pid\"\n      exit 0\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  exit 1\nfi\necho $$ > {job_pid}\ntrap 'touch {stale_signal}' USR1\ntouch {stable}\nwhile :; do sleep 1; done\n",
+            "#!/bin/bash\necho run >> {runs}\nif [ \"$(wc -l < {runs})\" -eq 1 ]; then\n  pid=$PPID\n  while [ \"$pid\" -gt 1 ]; do\n    cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\n    if [ \"$(cat /proc/$pid/comm 2>/dev/null)\" = jr ] && [[ \"$cmdline\" != *--job-shim* ]]; then\n      kill -KILL \"$pid\"\n      exit 0\n    fi\n    pid=$(awk '{{print $4}}' /proc/$pid/stat 2>/dev/null || echo 1)\n  done\n  exit 1\nfi\necho $$ > {job_pid}\ntrap 'touch {stale_signal}' USR1\ntouch {stable}\nwhile :; do sleep 1; done\n",
             runs = runs.display(),
             job_pid = job_pid.display(),
             stale_signal = stale_signal.display(),
@@ -4764,7 +4764,7 @@ fn sudo_job_shim_kills_escaped_descendant_before_exiting() {
         descendant.display()
     );
     let output = File::create(&log).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"))
+    let child = Command::new(env!("CARGO_BIN_EXE_jr"))
         .args([
             "--job-shim",
             "--shutdown-timeout",
@@ -4826,7 +4826,7 @@ fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
     );
     let output = File::create(&log).unwrap();
     let path = install_hanging_reconcile_sudo(temp.path(), &helper_pid, &helper_descendant_pid);
-    let child = Command::new(env!("CARGO_BIN_EXE_job-runner-rs"))
+    let child = Command::new(env!("CARGO_BIN_EXE_jr"))
         .args([
             "--job-shim",
             "--shutdown-timeout",
@@ -5109,7 +5109,7 @@ fn runner_refuses_to_run_as_container_pid_one() {
         return;
     }
 
-    let binary = format!("{}:/runner:ro", env!("CARGO_BIN_EXE_job-runner-rs"));
+    let binary = format!("{}:/runner:ro", env!("CARGO_BIN_EXE_jr"));
     let output = Command::new("docker")
         .args([
             "run",

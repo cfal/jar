@@ -2718,9 +2718,7 @@ fn wait_for_descendants(root: ProcessIdentity, duration: Duration) -> std::io::R
 
 fn main() -> ExitCode {
     if unsafe { libc::getpid() } == 1 {
-        std::eprintln!(
-            "Refusing to run as PID 1; use an external init such as `tini -- job-runner-rs ...`"
-        );
+        std::eprintln!("Refusing to run as PID 1; use an external init such as `tini -- jr ...`");
         return ExitCode::from(1);
     }
 

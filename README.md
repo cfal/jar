@@ -1,4 +1,4 @@
-# job-runner-rs
+# jr
 
 A lightweight asynchronous process supervisor for Linux. It runs multiple jobs,
 restarts them after exit, forwards signals, and shuts down their process trees.
@@ -21,19 +21,27 @@ restarts them after exit, forwards signals, and shuts down their process trees.
 cargo build --release
 ```
 
-The binary will be at `target/release/job-runner-rs`.
+The binary will be at `target/release/jr`.
+
+To install `jr` into Cargo's bin directory:
+
+```bash
+cargo install --path . --bin jr
+```
+
+The Cargo package remains named `job-runner-rs`.
 
 ## Usage
 
 ```bash
 # Run with a config file
-job-runner-rs config.yaml
+jr config.yaml
 
 # Wrapper mode (auto-restarts the entire job-runner on failure)
-job-runner-rs --wrap config.yaml
+jr --wrap config.yaml
 
 # Show help
-job-runner-rs --help
+jr --help
 ```
 
 ## Configuration
@@ -274,7 +282,7 @@ shutdown. Output is dropped after a queue fills or a bounded exit flush expires.
 The `--wrap` flag runs job-runner itself under supervision:
 
 ```bash
-job-runner-rs --wrap config.yaml
+jr --wrap config.yaml
 ```
 
 When the inner job-runner exits, the wrapper adopts and kills any remaining
@@ -289,11 +297,11 @@ wrapper forwards termination and `SIGUSR1`/`SIGUSR2` signals, and its restart
 backoff is interruptible. Signals are queued only across an in-progress spawn;
 user signals received while no inner generation exists are dropped. The wrapper
 is a child subreaper, but wrapper mode is not a PID 1 implementation and cannot
-recover if the wrapper itself is abruptly killed. `job-runner-rs` refuses to
+recover if the wrapper itself is abruptly killed. `jr` refuses to
 start when its own PID is 1. In a container, use an external init:
 
 ```bash
-tini -- job-runner-rs config.yaml
+tini -- jr config.yaml
 ```
 
 Each default job shim reaps its command and adopted descendants. The supervisor
@@ -369,7 +377,7 @@ Many daemons reopen log files on SIGUSR1. Forward the signal to all jobs:
 ```bash
 # Rotate logs and signal job-runner
 logrotate /etc/logrotate.conf
-kill -USR1 $(pidof job-runner-rs)
+kill -USR1 $(pidof jr)
 ```
 
 ## License
