@@ -223,10 +223,6 @@ where
     }
 }
 
-pub(crate) fn exists(process: ProcessIdentity) -> bool {
-    exists_checked(process).unwrap_or(false)
-}
-
 pub(crate) fn parent_pid_checked(process: ProcessIdentity) -> io::Result<Option<u32>> {
     match read_stat(process.pid) {
         Ok(ProcessInspection::Live(stat)) if stat.identity == process => Ok(Some(stat.parent_pid)),

@@ -544,10 +544,12 @@ enum WrapperSignalPhase {
 #[derive(Default)]
 struct WrapperSignalState {
     phase: WrapperSignalPhase,
+    forwarded_termination: Vec<libc::c_int>,
 }
 
 impl WrapperSignalState {
     fn begin_publication(&mut self) {
+        self.forwarded_termination.clear();
         self.phase = WrapperSignalPhase::Publishing(PendingWrapperSignals::default());
     }
 
@@ -575,10 +577,24 @@ impl WrapperSignalState {
         }
     }
 
-    fn clear(&mut self, inner: ProcessIdentity) {
+    fn record_forwarded(&mut self, inner: ProcessIdentity, signal: libc::c_int) {
+        if matches!(self.phase, WrapperSignalPhase::Running(current) if current == inner)
+            && matches!(
+                signal,
+                libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT
+            )
+            && !self.forwarded_termination.contains(&signal)
+        {
+            self.forwarded_termination.push(signal);
+        }
+    }
+
+    fn clear(&mut self, inner: ProcessIdentity) -> Vec<libc::c_int> {
         if matches!(self.phase, WrapperSignalPhase::Running(current) if current == inner) {
             self.phase = WrapperSignalPhase::Idle;
+            return std::mem::take(&mut self.forwarded_termination);
         }
+        Vec::new()
     }
 }
 
@@ -4412,10 +4428,13 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
 
         let mut inner_termination_error = None;
         let mut inner_exit_status = None;
+        let mut inner_termination_signals = Vec::new();
         let inner_was_supervised = match process_tree::identity(child.id()) {
             Ok(identity) => {
                 publish_wrapper_inner(&signal_state, identity);
-                match wait_for_main_child(&child) {
+                let wait_result = wait_for_main_child(&child);
+                inner_termination_signals = lock_or_recover(&signal_state).clear(identity);
+                match wait_result {
                     Ok(exit_status) => {
                         inner_exit_status = Some(exit_status);
                         match exit_status.code() {
@@ -4427,7 +4446,6 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
                         eprintln!("[Wrapper] Failed to read exit status: {}", e);
                     }
                 }
-                lock_or_recover(&signal_state).clear(identity);
                 true
             }
             Err(error) => {
@@ -4460,11 +4478,9 @@ fn run_wrapper_mode(self_path: &str, inner_args: &[String]) -> ExitCode {
         if !restart_inner {
             let code = inner_exit_status.map_or(1, |status| {
                 // The inner may receive shutdown before installing its handlers.
-                if shutdown_state.load(Ordering::Acquire) != 0
-                    && matches!(
-                        status.signal(),
-                        Some(libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT)
-                    )
+                if status
+                    .signal()
+                    .is_some_and(|signal| inner_termination_signals.contains(&signal))
                 {
                     return 0;
                 }
@@ -5020,24 +5036,29 @@ fn reap_adopted_children() -> std::io::Result<()> {
 
 fn forward_or_queue_wrapper_signal(state: &Mutex<WrapperSignalState>, signal: libc::c_int) {
     let mut state = lock_or_recover(state);
-    if let Some((identity, signal)) = state.receive(signal) {
-        signal_wrapper_identity(identity, signal);
+    if let Some((identity, signal)) = state.receive(signal)
+        && signal_wrapper_identity(identity, signal)
+    {
+        state.record_forwarded(identity, signal);
     }
 }
 
 fn publish_wrapper_inner(state: &Mutex<WrapperSignalState>, identity: ProcessIdentity) {
     let mut state = lock_or_recover(state);
     for signal in state.publish(identity) {
-        signal_wrapper_identity(identity, signal);
+        if signal_wrapper_identity(identity, signal) {
+            state.record_forwarded(identity, signal);
+        }
     }
 }
 
-fn signal_wrapper_identity(identity: ProcessIdentity, signal: libc::c_int) {
-    if process_tree::exists(identity)
+fn signal_wrapper_identity(identity: ProcessIdentity, signal: libc::c_int) -> bool {
+    if process_tree::is_running_checked(identity).unwrap_or(false)
         && let Ok(pid) = i32::try_from(identity.pid)
     {
-        let _ = send_signal_target(pid, signal);
+        return send_signal_target(pid, signal).is_ok();
     }
+    false
 }
 
 fn wrapper_delay(shutdown: &AtomicU8, duration: Duration) {
@@ -5755,6 +5776,36 @@ mod tests {
             "é".repeat((MAX_OUTPUT_FRAME_BYTES - 1) / 2).as_bytes()
         );
         assert!(std::str::from_utf8(&output).is_ok());
+    }
+
+    #[test]
+    fn wrapper_termination_history_is_identity_scoped_and_finalized_on_clear() {
+        let inner = ProcessIdentity {
+            pid: 123,
+            process_group: 123,
+            start_time: 456,
+        };
+        let stale = ProcessIdentity {
+            start_time: 455,
+            ..inner
+        };
+        let mut state = WrapperSignalState::default();
+        state.begin_publication();
+        state.publish(inner);
+        state.record_forwarded(stale, libc::SIGQUIT);
+        state.record_forwarded(inner, libc::SIGUSR1);
+        state.record_forwarded(inner, libc::SIGKILL);
+        state.record_forwarded(inner, libc::SIGTERM);
+        state.record_forwarded(inner, libc::SIGTERM);
+        assert!(state.clear(stale).is_empty());
+        let finalized = state.clear(inner);
+        state.record_forwarded(inner, libc::SIGQUIT);
+        assert_eq!(state.receive(libc::SIGQUIT), None);
+        assert!(state.clear(inner).is_empty());
+        assert_eq!(finalized, [libc::SIGTERM]);
+        state.begin_publication();
+        state.publish(inner);
+        assert!(state.clear(inner).is_empty());
     }
 
     #[test]

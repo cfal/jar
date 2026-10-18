@@ -1603,17 +1603,31 @@ fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
     }
 }
 
-#[test]
-fn one_generation_wrapper_shutdown_before_inner_signal_handlers_is_successful() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("pause-inner.c");
-    let library = temp.path().join("pause-inner.so");
+fn build_paused_wrapper_inner_library(root: &Path) -> PathBuf {
+    let source = root.join("pause-inner.c");
+    let library = root.join("pause-inner.so");
     fs::write(
         &source,
-        r#"#include <stdio.h>
+        r#"#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+static int term_ack = -1;
+static _Atomic int reaped_signal_child;
+
+static void acknowledge_term(int signal) {
+    (void) signal;
+    write(term_ack, "term", 4);
+}
 
 __attribute__((constructor)) static void initialize(void) {
     if (!getenv("JR_TEST_WRAPPER_INITIALIZED")) {
@@ -1622,11 +1636,41 @@ __attribute__((constructor)) static void initialize(void) {
     }
     struct rlimit limit = {0, 0};
     setrlimit(RLIMIT_CORE, &limit);
+    const char *ack = getenv("JR_TEST_TERM_ACK");
+    if (ack) {
+        term_ack = open(ack, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (term_ack < 0) _exit(99);
+        signal(SIGTERM, acknowledge_term);
+    }
     FILE *ready = fopen(getenv("JR_TEST_INNER_READY"), "w");
     if (!ready) _exit(99);
     fprintf(ready, "%d\n", getpid());
     fclose(ready);
     for (;;) pause();
+}
+
+pid_t waitpid(pid_t pid, int *status, int options) {
+    static pid_t (*original)(pid_t, int *, int);
+    if (!original) original = dlsym(RTLD_NEXT, "waitpid");
+    pid_t result = original(pid, status, options);
+    if (result > 0 && status && WIFSIGNALED(*status))
+        atomic_store(&reaped_signal_child, 1);
+    return result;
+}
+
+DIR *opendir(const char *path) {
+    static DIR *(*original)(const char *);
+    if (!original) original = dlsym(RTLD_NEXT, "opendir");
+    const char *ready = getenv("JR_TEST_POST_REAP_READY");
+    const char *release = getenv("JR_TEST_POST_REAP_RELEASE");
+    if (ready && release && !strcmp(path, "/proc")
+        && atomic_exchange(&reaped_signal_child, 0)) {
+        int fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) _exit(99);
+        close(fd);
+        for (int i = 0; i < 500 && access(release, F_OK); i++) usleep(10000);
+    }
+    return original(path);
 }
 "#,
     )
@@ -1637,11 +1681,18 @@ __attribute__((constructor)) static void initialize(void) {
             .arg(&source)
             .arg("-o")
             .arg(&library)
+            .arg("-ldl")
             .status()
             .unwrap()
             .success()
     );
+    library
+}
 
+#[test]
+fn one_generation_wrapper_shutdown_before_inner_signal_handlers_is_successful() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         for requested_shutdown in [true, false] {
             let config = temp.path().join("jobs.json");
@@ -1693,6 +1744,115 @@ __attribute__((constructor)) static void initialize(void) {
             assert_eq!(runner.log().matches("Starting inner process").count(), 1);
         }
     }
+}
+
+#[test]
+fn one_generation_wrapper_preserves_unrequested_signal_during_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    for signal in [libc::SIGQUIT, libc::SIGKILL] {
+        let config = temp.path().join("jobs.json");
+        let ready = temp.path().join(format!("inner-{signal}"));
+        let ack = temp.path().join(format!("term-ack-{signal}"));
+        fs::write(
+            &config,
+            r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+        )
+        .unwrap();
+        let mut runner = Runner::start_with_env(
+            &config,
+            temp.path().join("log"),
+            &["--wrap"],
+            &[
+                ("LD_PRELOAD", library.to_str().unwrap()),
+                ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+                ("JR_TEST_TERM_ACK", ack.to_str().unwrap()),
+            ],
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &ready
+            ))
+            .is_empty()),
+            "{}",
+            runner.log()
+        );
+        let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+        runner.signal(libc::SIGTERM);
+        assert!(
+            wait_until(Duration::from_secs(5), || fs::metadata(&ack)
+                .is_ok_and(|metadata| metadata.len() > 0)),
+            "{}",
+            runner.log()
+        );
+        inner.signal(signal, None);
+        assert_eq!(
+            runner.wait(Duration::from_secs(5)).code(),
+            Some(128 + signal),
+            "{}",
+            runner.log()
+        );
+        assert!(!inner.running());
+        assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+    }
+}
+
+#[test]
+fn one_generation_wrapper_late_shutdown_preserves_reaped_signal_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    let config = temp.path().join("jobs.json");
+    let ready = temp.path().join("inner");
+    let reaped = temp.path().join("reaped");
+    let release = temp.path().join("release");
+    fs::write(
+        &config,
+        r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+    )
+    .unwrap();
+    let mut runner = Runner::start_with_env(
+        &config,
+        temp.path().join("log"),
+        &["--wrap"],
+        &[
+            ("LD_PRELOAD", library.to_str().unwrap()),
+            ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+            ("JR_TEST_POST_REAP_READY", reaped.to_str().unwrap()),
+            ("JR_TEST_POST_REAP_RELEASE", release.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+            &ready
+        ))
+        .is_empty()),
+        "{}",
+        runner.log()
+    );
+    let inner = support::ProcessIdentity::read(read_pids(&[ready])[0]).unwrap();
+    inner.signal(libc::SIGTERM, None);
+    assert!(
+        wait_until(Duration::from_secs(5), || reaped.exists()),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(support::ProcessIdentity::read(inner.pid), None);
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received termination signal")),
+        "{}",
+        runner.log()
+    );
+    fs::write(&release, "release").unwrap();
+    assert_eq!(
+        runner.wait(Duration::from_secs(5)).code(),
+        Some(143),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(runner.log().matches("Starting inner process").count(), 1);
 }
 
 #[test]
