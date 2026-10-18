@@ -77,6 +77,14 @@ jr --help
 
 ## Configuration
 
+Pass exactly one configuration file. Unknown fields, invalid field types, and
+duplicate snake_case/camelCase aliases are errors, including in disabled jobs.
+Configuration parsing and active-job prefix, datetime-format, and duration
+validation finish before any job or wrapper generation starts. Disabled jobs and
+empty commands skip these semantic checks. Launch inputs (working directory, sudo
+user, environment keys, and embedded NUL bytes) are checked on each launch;
+failures affect only that job and follow its restart policy.
+
 ### Minimal Example
 
 ```yaml
@@ -375,6 +383,8 @@ jr --wrap config.yaml
 
 If every enabled, nonempty job has `restart: false`, the wrapper runs only one
 inner generation, cleans up, and returns its exit status without restarting it.
+This preserves earlier job failures even when shutdown is requested by a signal.
+An explicit shutdown with no recorded job failure still returns status 0.
 Otherwise, wrapper recovery remains enabled: a non-restarting job runs once per
 inner generation and may run again after a runner failure. Completion is not
 persisted across generations.
@@ -473,6 +483,21 @@ Many daemons reopen log files on SIGUSR1. Forward the signal to all jobs:
 logrotate /etc/logrotate.conf
 kill -USR1 $(pidof jr)
 ```
+
+## Testing
+
+Run process-sensitive tests serially:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo test --locked -- --test-threads=1 --show-output
+```
+
+The Linux black-box tests use a C compiler, noninteractive sudo for the current
+user and root, and Docker with the `ubuntu:24.04` image. Locally, unavailable sudo
+or Docker cases print `skipped:` and return early; Cargo still counts them as
+passed. Set `JR_REQUIRE_TEST_PREREQUISITES=1` to fail instead of skipping, as CI
+does. Inspect `--show-output` before treating a local run as full coverage.
+Any present value enables this test-only strict mode; unset it to allow skips.
 
 ## License
 

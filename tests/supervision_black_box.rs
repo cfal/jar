@@ -4,11 +4,15 @@ use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+mod support;
+use support::{GuardedChild, SpawnGuarded};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TEST_RECONCILE_INTERVAL_ENV: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
@@ -22,7 +26,7 @@ fn serialize_resource_intensive_test() -> MutexGuard<'static, ()> {
 }
 
 struct Runner {
-    child: Child,
+    child: GuardedChild,
     log_path: PathBuf,
 }
 
@@ -38,7 +42,7 @@ impl Runner {
         }
 
         Self {
-            child: command.spawn().unwrap(),
+            child: command.spawn_guarded().unwrap(),
             log_path,
         }
     }
@@ -132,18 +136,6 @@ impl Runner {
     }
 }
 
-impl Drop for Runner {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
-                libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = self.child.wait();
-        }
-    }
-}
-
 struct ForkedProcess(libc::pid_t);
 
 impl Drop for ForkedProcess {
@@ -159,11 +151,8 @@ struct ProcessCleanup(Vec<PathBuf>);
 
 impl Drop for ProcessCleanup {
     fn drop(&mut self) {
-        for pid in read_pids(&self.0) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+        for path in &self.0 {
+            support::cleanup_pid_file(path, None);
         }
     }
 }
@@ -233,27 +222,7 @@ struct SudoProcessCleanup {
 
 impl Drop for SudoProcessCleanup {
     fn drop(&mut self) {
-        for pid in read_pids(std::slice::from_ref(&self.pid_path)) {
-            let process_group = process_group_id(pid)
-                .map(|group| format!("-{group}"))
-                .unwrap_or_else(|| pid.to_string());
-            let pid = pid.to_string();
-            let _ = Command::new("sudo")
-                .args([
-                    "-n",
-                    "-u",
-                    &self.username,
-                    "--",
-                    "kill",
-                    "-KILL",
-                    "--",
-                    &process_group,
-                    &pid,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        support::cleanup_pid_file(&self.pid_path, Some(&self.username));
     }
 }
 
@@ -267,24 +236,10 @@ impl Drop for IdentityScopedSudoProcessCleanup {
         let Some((pid, start_time)) = read_recorded_process_identity(&self.identity_path) else {
             return;
         };
-        let Some(process_group) = process_group_for_identity(pid, start_time) else {
-            return;
-        };
-        let _ = Command::new("sudo")
-            .args([
-                "-n",
-                "-u",
-                &self.username,
-                "--",
-                "kill",
-                "-KILL",
-                "--",
-                &format!("-{process_group}"),
-                &pid.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        support::cleanup_process_tree(
+            support::ProcessIdentity { pid, start_time },
+            Some(&self.username),
+        );
     }
 }
 
@@ -476,7 +431,11 @@ __attribute__((constructor)) static void initialize(void) {
         pid_t first = fork();
         if (first == 0) {
             pid_t holder = fork();
-            if (holder > 0) _exit(0);
+            if (holder > 0) {
+                const char *release = getenv("JOB_RUNNER_COMPLETION_HOLDER_RELEASE");
+                for (int i = 0; release && i < 500 && access(release, F_OK); i++) usleep(10000);
+                _exit(0);
+            }
             if (holder < 0) _exit(2);
             setsid();
             int holder_output = open(holder_marker, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -808,13 +767,7 @@ fn fork_with_retry() -> libc::pid_t {
 fn read_pids(paths: &[PathBuf]) -> Vec<u32> {
     paths
         .iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .flat_map(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| support::observe_pid_file(path))
         .collect()
 }
 
@@ -858,11 +811,6 @@ fn process_group_and_start_time(pid: u32) -> Option<(u32, u64)> {
     let process_group = fields.nth(2)?.parse().ok()?;
     let start_time = fields.nth(16)?.parse().ok()?;
     Some((process_group, start_time))
-}
-
-fn process_group_for_identity(pid: u32, start_time: u64) -> Option<u32> {
-    let (process_group, current_start_time) = process_group_and_start_time(pid)?;
-    (current_start_time == start_time).then_some(process_group)
 }
 
 fn parent_process_id(pid: u32) -> Option<u32> {
@@ -947,20 +895,33 @@ fn cpu_time_for_ticks(ticks: u64) -> Duration {
 }
 
 fn current_username() -> Option<String> {
-    let output = Command::new("id").arg("-un").output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let username = Command::new("id")
+        .arg("-un")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|username| !username.is_empty());
+    require_test_prerequisite(username.is_some(), "current username");
+    username
+}
+
+fn require_test_prerequisite(available: bool, description: &str) -> bool {
+    assert!(
+        available || std::env::var_os("JR_REQUIRE_TEST_PREREQUISITES").is_none(),
+        "required test prerequisite unavailable: {description}"
+    );
+    available
 }
 
 fn sudo_available_for(username: &str) -> bool {
-    Command::new("sudo")
+    let available = Command::new("sudo")
         .args(["-n", "-u", username, "--", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    require_test_prerequisite(available, &format!("noninteractive sudo for {username}"))
 }
 
 fn real_sudo_path() -> String {
@@ -993,13 +954,14 @@ fn install_failing_signal_sudo(root: &Path) -> String {
     )
 }
 
-fn install_unready_cleanup_leaking_sudo(root: &Path, escapee_pid: &Path) -> String {
+fn install_unready_cleanup_leaking_sudo(root: &Path, escapee_pid: &Path, release: &Path) -> String {
     let real_sudo = real_sudo_path();
     install_fake_sudo(
         root,
         &format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    {real_sudo} \"$@\"\n    setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n    while [ ! -s {escapee_pid} ]; do sleep 0.01; done\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = job-runner-signal ]; then\n    {real_sudo} \"$@\"\n    setsid sh -c 'echo $$ > {escapee_pid}; exec sleep 30' &\n    while [ ! -e {release} ]; do sleep 0.01; done\n    kill -KILL \"$PPID\"\n    kill -KILL \"$$\"\n  fi\ndone\nexec {real_sudo} \"$@\"\n",
             escapee_pid = escapee_pid.display(),
+            release = release.display(),
         ),
     )
 }
@@ -1243,6 +1205,21 @@ fn exercise_sudo_signal_route(username: &str) {
     assert!(wait_until(Duration::from_secs(5), || {
         fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0)
     }));
+    let pid = read_pids(std::slice::from_ref(&pid_file))[0];
+    let expected_uid = Command::new("id").args(["-u", username]).output().unwrap();
+    assert!(expected_uid.status.success());
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let effective_uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        effective_uid,
+        String::from_utf8_lossy(&expected_uid.stdout).trim()
+    );
     let process_tree = Command::new("pstree")
         .args(["-ap", &runner.child.id().to_string()])
         .output()
@@ -1281,21 +1258,29 @@ impl Drop for ContainerCleanup {
 }
 
 fn docker_available() -> bool {
-    Command::new("docker")
+    let available = Command::new("docker")
         .args(["image", "inspect", "ubuntu:24.04"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    require_test_prerequisite(available, "Docker with the ubuntu:24.04 image")
 }
 
 fn container_exists(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let output = Command::new("docker")
+        .args(["container", "ls", "--all", "--format", "{{.Names}}"])
+        .output()
+        .expect("could not query Docker containers");
+    assert!(
+        output.status.success(),
+        "Docker container query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .any(|line| line == name)
 }
 
 fn unique_container_name(label: &str) -> String {
@@ -1422,6 +1407,896 @@ fn non_restarting_job_cleans_descendants_and_drains_output() {
     let pids = read_pids(&[descendant]);
     assert!(!pids.is_empty());
     assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+}
+
+#[test]
+fn non_restarting_invalid_launch_inputs_fail_once_without_stopping_other_jobs() {
+    for (field, value, diagnostic) in [
+        ("sudo_user", serde_json::json!(""), "Invalid sudo_user"),
+        (
+            "sudo_user",
+            serde_json::json!("root --preserve-env"),
+            "Invalid sudo_user",
+        ),
+        (
+            "env",
+            serde_json::json!({"": "value"}),
+            "Invalid environment variable name",
+        ),
+        (
+            "env",
+            serde_json::json!({"A=B": "value"}),
+            "Invalid environment variable name",
+        ),
+        (
+            "env",
+            serde_json::json!({"A\0B": "value"}),
+            "Invalid environment variable name",
+        ),
+        ("env", serde_json::json!({"KEY": "a\0b"}), "nul byte found"),
+        ("command", serde_json::json!("echo bad\0"), "nul byte found"),
+    ] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let forbidden = temp.path().join("forbidden");
+            let done = temp.path().join("done");
+            let mut invalid = serde_json::json!({
+                "command": format!("touch {}", forbidden.display()),
+                "restart": false,
+                "restartDelay": 0
+            });
+            invalid[field] = value.clone();
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {
+                    "invalid": invalid,
+                    "other": {"command": format!("touch {}", done.display()), "delay": 200, "restart": false}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(
+                runner.log().matches(diagnostic).count(),
+                1,
+                "{}",
+                runner.log()
+            );
+            assert!(done.exists(), "{}", runner.log());
+            assert!(!forbidden.exists(), "{}", runner.log());
+            assert!(!runner.log().contains("before restarting"));
+            assert!(
+                !runner.log().contains("shutting down active processes"),
+                "{}",
+                runner.log()
+            );
+        }
+    }
+}
+
+#[test]
+fn shim_command_start_failure_is_job_local() {
+    for wrap in [false, true] {
+        for missing_sudo in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let done = temp.path().join("done");
+            let bin = temp.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+            let mut bad = serde_json::json!({"command": ":", "restart": false});
+            if missing_sudo {
+                bad["sudo_user"] = serde_json::json!("root");
+            } else {
+                bad["env"] = serde_json::json!({"PATH": "/nonexistent"});
+            }
+            fs::write(&config, serde_json::json!({"jobs": {
+                "bad": bad,
+                "other": {"command": format!("printf done > {}", done.display()), "delay": 300, "restart": false}
+            }}).to_string()).unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let env = if missing_sudo {
+                vec![("PATH", bin.to_str().unwrap())]
+            } else {
+                vec![]
+            };
+            let mut runner = Runner::start_with_env(&config, temp.path().join("log"), &args, &env);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            assert!(done.exists(), "{}", runner.log());
+            assert_eq!(
+                runner
+                    .log()
+                    .matches("Job shim could not start command")
+                    .count(),
+                1,
+                "{}",
+                runner.log()
+            );
+            assert!(
+                !runner.log().contains("Fatal process supervision error"),
+                "{}",
+                runner.log()
+            );
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn shim_command_start_failure_retries_only_the_failed_job() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let done = temp.path().join("done");
+        fs::write(&config, serde_json::json!({"jobs": {
+            "bad": {"command": ":", "env": {"PATH": "/nonexistent"}, "restart_delay": 100},
+            "other": {"command": format!("printf done >> {}", done.display()), "delay": 300, "restart": false}
+        }}).to_string()).unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || done.exists()
+                && runner
+                    .log()
+                    .matches("Job shim could not start command")
+                    .count()
+                    >= 2),
+            "{}",
+            runner.log()
+        );
+        assert!(runner.is_running());
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert_eq!(fs::read_to_string(done).unwrap(), "done");
+        assert!(
+            !runner.log().contains("Fatal process supervision error"),
+            "{}",
+            runner.log()
+        );
+    }
+}
+
+#[test]
+fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.yaml");
+        let started = temp.path().join("started");
+        fs::write(&config, format!(
+            "jobs:\n  delayed:\n    command: 'touch {}'\n    delay: 60000\n    restart: false\n",
+            started.display()
+        )).unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || runner
+                .log()
+                .contains("Starting in 60.000s")),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(!started.exists());
+        assert!(!runner.log().contains("Started (pid"));
+    }
+}
+
+fn wait_for_recorded_identity(runner: &Runner, pid_path: &Path) -> support::ProcessIdentity {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !support::observe_pid_file(pid_path).is_empty()
+        }),
+        "{}",
+        runner.log()
+    );
+    let pid = support::observe_pid_file(pid_path)[0];
+    support::ProcessIdentity::read(pid).unwrap()
+}
+
+fn build_paused_wrapper_inner_library(root: &Path) -> PathBuf {
+    let source = root.join("pause-inner.c");
+    let library = root.join("pause-inner.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int term_ack = -1;
+static int is_wrapper;
+static _Atomic int reaped_signal_child;
+static int prereap_barrier_used;
+
+static void acknowledge_term(int signal) {
+    (void) signal;
+    write(term_ack, "term", 4);
+}
+
+__attribute__((constructor)) static void initialize(void) {
+    if (!getenv("JR_TEST_WRAPPER_INITIALIZED")) {
+        setenv("JR_TEST_WRAPPER_INITIALIZED", "1", 1);
+        is_wrapper = 1;
+        return;
+    }
+    struct rlimit limit = {0, 0};
+    setrlimit(RLIMIT_CORE, &limit);
+    const char *ack = getenv("JR_TEST_TERM_ACK");
+    if (ack) {
+        term_ack = open(ack, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (term_ack < 0) _exit(99);
+        signal(SIGTERM, acknowledge_term);
+    }
+    FILE *ready = fopen(getenv("JR_TEST_INNER_READY"), "w");
+    if (!ready) _exit(99);
+    fprintf(ready, "%d\n", getpid());
+    fclose(ready);
+    for (;;) pause();
+}
+
+pid_t waitpid(pid_t pid, int *status, int options) {
+    static pid_t (*original)(pid_t, int *, int);
+    if (!original) original = dlsym(RTLD_NEXT, "waitpid");
+    const char *ready = getenv("JR_TEST_PREREAP_READY");
+    const char *release = getenv("JR_TEST_PREREAP_RELEASE");
+    if (is_wrapper && ready && release && pid == -1 && options == 0
+        && !prereap_barrier_used++) {
+        siginfo_t info;
+        int result;
+        do {
+            result = waitid(P_ALL, 0, &info, WEXITED | WNOWAIT);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) _exit(99);
+        int fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) _exit(99);
+        close(fd);
+        for (int i = 0; i < 500 && access(release, F_OK); i++) usleep(10000);
+        if (access(release, F_OK)) _exit(98);
+    }
+    pid_t result = original(pid, status, options);
+    if (result > 0 && status && WIFSIGNALED(*status))
+        atomic_store(&reaped_signal_child, 1);
+    return result;
+}
+
+DIR *opendir(const char *path) {
+    static DIR *(*original)(const char *);
+    if (!original) original = dlsym(RTLD_NEXT, "opendir");
+    const char *ready = getenv("JR_TEST_POST_REAP_READY");
+    const char *release = getenv("JR_TEST_POST_REAP_RELEASE");
+    if (ready && release && !strcmp(path, "/proc")
+        && atomic_exchange(&reaped_signal_child, 0)) {
+        int fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) _exit(99);
+        close(fd);
+        for (int i = 0; i < 500 && access(release, F_OK); i++) usleep(10000);
+    }
+    return original(path);
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success()
+    );
+    library
+}
+
+#[test]
+fn one_generation_wrapper_shutdown_before_inner_signal_handlers_is_successful() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        for requested_shutdown in [true, false] {
+            let config = temp.path().join("jobs.json");
+            let ready = temp
+                .path()
+                .join(format!("inner-{signal}-{requested_shutdown}"));
+            let started = temp.path().join("started");
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {"job": {
+                    "command": format!("touch {}", started.display()), "restart": false
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+            let mut runner = Runner::start_with_env(
+                &config,
+                temp.path().join("log"),
+                &["--wrap"],
+                &[
+                    ("LD_PRELOAD", library.to_str().unwrap()),
+                    ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+                ],
+            );
+            let inner = wait_for_recorded_identity(&runner, &ready);
+            assert_eq!(parent_process_id(inner.pid), Some(runner.child.id()));
+            if requested_shutdown {
+                runner.signal(signal);
+            } else {
+                inner.signal(signal, None);
+            }
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(if requested_shutdown { 0 } else { 128 + signal }),
+                "{}",
+                runner.log()
+            );
+            assert!(!inner.running());
+            assert!(!started.exists());
+            assert!(runner.log().contains("Process terminated by signal"));
+            assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn one_generation_wrapper_preserves_unrequested_signal_during_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    for signal in [libc::SIGQUIT, libc::SIGKILL] {
+        let config = temp.path().join("jobs.json");
+        let ready = temp.path().join(format!("inner-{signal}"));
+        let ack = temp.path().join(format!("term-ack-{signal}"));
+        fs::write(
+            &config,
+            r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+        )
+        .unwrap();
+        let mut runner = Runner::start_with_env(
+            &config,
+            temp.path().join("log"),
+            &["--wrap"],
+            &[
+                ("LD_PRELOAD", library.to_str().unwrap()),
+                ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+                ("JR_TEST_TERM_ACK", ack.to_str().unwrap()),
+            ],
+        );
+        let inner = wait_for_recorded_identity(&runner, &ready);
+        runner.signal(libc::SIGTERM);
+        assert!(
+            wait_until(Duration::from_secs(5), || fs::metadata(&ack)
+                .is_ok_and(|metadata| metadata.len() > 0)),
+            "{}",
+            runner.log()
+        );
+        inner.signal(signal, None);
+        assert_eq!(
+            runner.wait(Duration::from_secs(5)).code(),
+            Some(128 + signal),
+            "{}",
+            runner.log()
+        );
+        assert!(!inner.running());
+        assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+    }
+}
+
+#[test]
+fn one_generation_wrapper_does_not_record_shutdown_sent_to_a_zombie_inner() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    let config = temp.path().join("jobs.json");
+    let ready = temp.path().join("inner");
+    let zombie = temp.path().join("zombie");
+    let release = temp.path().join("release");
+    fs::write(
+        &config,
+        r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+    )
+    .unwrap();
+    let mut runner = Runner::start_with_env(
+        &config,
+        temp.path().join("log"),
+        &["--wrap"],
+        &[
+            ("LD_PRELOAD", library.to_str().unwrap()),
+            ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+            ("JR_TEST_PREREAP_READY", zombie.to_str().unwrap()),
+            ("JR_TEST_PREREAP_RELEASE", release.to_str().unwrap()),
+        ],
+    );
+    let inner = wait_for_recorded_identity(&runner, &ready);
+    inner.signal(libc::SIGTERM, None);
+    assert!(
+        wait_until(Duration::from_secs(5), || zombie.exists()),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(process_state(inner.pid), Some('Z'));
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received termination signal")),
+        "{}",
+        runner.log()
+    );
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received another termination signal")),
+        "{}",
+        runner.log()
+    );
+    fs::write(&release, "release").unwrap();
+    assert_eq!(
+        runner.wait(Duration::from_secs(5)).code(),
+        Some(143),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(support::ProcessIdentity::read(inner.pid), None);
+    assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+}
+
+#[test]
+fn one_generation_wrapper_late_shutdown_preserves_reaped_signal_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = build_paused_wrapper_inner_library(temp.path());
+    let config = temp.path().join("jobs.json");
+    let ready = temp.path().join("inner");
+    let reaped = temp.path().join("reaped");
+    let release = temp.path().join("release");
+    fs::write(
+        &config,
+        r#"{"jobs":{"job":{"command":"exit 99","restart":false}}}"#,
+    )
+    .unwrap();
+    let mut runner = Runner::start_with_env(
+        &config,
+        temp.path().join("log"),
+        &["--wrap"],
+        &[
+            ("LD_PRELOAD", library.to_str().unwrap()),
+            ("JR_TEST_INNER_READY", ready.to_str().unwrap()),
+            ("JR_TEST_POST_REAP_READY", reaped.to_str().unwrap()),
+            ("JR_TEST_POST_REAP_RELEASE", release.to_str().unwrap()),
+        ],
+    );
+    let inner = wait_for_recorded_identity(&runner, &ready);
+    inner.signal(libc::SIGTERM, None);
+    assert!(
+        wait_until(Duration::from_secs(5), || reaped.exists()),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(support::ProcessIdentity::read(inner.pid), None);
+    runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || runner
+            .log()
+            .contains("Received termination signal")),
+        "{}",
+        runner.log()
+    );
+    fs::write(&release, "release").unwrap();
+    assert_eq!(
+        runner.wait(Duration::from_secs(5)).code(),
+        Some(143),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+}
+
+#[test]
+fn one_generation_wrapper_preserves_job_failures_during_shutdown() {
+    for wrap in [false, true] {
+        for failure in [0, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let pid_path = temp.path().join("active.pid");
+            fs::write(&config, serde_json::json!({"jobs": {
+                "finished": {"command": format!("exit {failure}"), "restart": false, "prefix": "finished: "},
+                "active": {"command": format!("echo $$ > {}; exec sleep 30", pid_path.display()), "restart": false}
+            }}).to_string()).unwrap();
+            let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    !read_pids(std::slice::from_ref(&pid_path)).is_empty()
+                        && runner
+                            .log()
+                            .contains(&format!("finished: Exited with code {failure}"))
+                }),
+                "{}",
+                runner.log()
+            );
+            let pids = read_pids(std::slice::from_ref(&pid_path));
+            runner.signal(libc::SIGTERM);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(i32::from(failure != 0)),
+                "{}",
+                runner.log()
+            );
+            assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+            if wrap {
+                assert_eq!(runner.log().matches("Starting inner process").count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn one_generation_wrapper_cleans_jobs_after_inner_sigkill_without_restarting() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    let shim = temp.path().join("shim.pid");
+    let job = temp.path().join("job.pid");
+    fs::write(&config, format!(
+        "jobs:\n  once:\n    command: 'echo $PPID > {}; echo $$ > {}; exec sleep 30'\n    restart: false\n",
+        shim.display(), job.display()
+    )).unwrap();
+    let paths = [shim, job];
+    let _cleanup = ProcessCleanup(paths.to_vec());
+    let mut runner = Runner::start(&config, temp.path().join("runner.log"), &["--wrap"]);
+    assert!(
+        wait_until(Duration::from_secs(5), || read_pids(&paths).len() == 2),
+        "{}",
+        runner.log()
+    );
+    let pids = read_pids(&paths);
+    let inner = parent_process_id(pids[0]).unwrap();
+    assert_eq!(parent_process_id(inner), Some(runner.child.id()));
+    assert_eq!(
+        unsafe { libc::kill(inner as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    assert_eq!(
+        runner.wait(Duration::from_secs(8)).code(),
+        Some(137),
+        "{}",
+        runner.log()
+    );
+    assert!(
+        pids.iter().all(|pid| !process_is_running(*pid)),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(
+        runner
+            .log()
+            .matches("[Wrapper] Starting inner process..")
+            .count(),
+        1
+    );
+    assert!(!runner.log().contains("before restarting"));
+}
+
+#[test]
+fn invalid_configuration_is_rejected_before_any_job_starts() {
+    for yaml in [false, true] {
+        for wrap in [false, true] {
+            for invalid in [
+                serde_json::json!({"typo": true, "jobs": {}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restatr": false}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "datetime": {"enabeld": true}}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restart_delay": 1, "restartDelay": 2}}}),
+                serde_json::json!({"jobs": {"bad": {"command": {"shell": ":"}}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restart": "false"}}}),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let config = temp
+                    .path()
+                    .join(if yaml { "jobs.yaml" } else { "jobs.json" });
+                let marker = temp.path().join("forbidden");
+                let mut invalid = invalid;
+                invalid["jobs"]["aaa_valid"] = serde_json::json!({"command": format!("touch {}", marker.display()), "restart": false});
+                let text = if yaml {
+                    serde_yaml::to_string(&invalid).unwrap()
+                } else {
+                    invalid.to_string()
+                };
+                fs::write(&config, text).unwrap();
+                let args = if wrap { vec!["--wrap"] } else { vec![] };
+                let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+                assert_eq!(
+                    runner.wait(Duration::from_secs(5)).code(),
+                    Some(1),
+                    "{}",
+                    runner.log()
+                );
+                assert!(runner.log().contains("Could not parse"), "{}", runner.log());
+                assert!(!runner.log().contains("Initializing job"));
+                assert!(!runner.log().contains("Starting inner process"));
+                assert!(!marker.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_or_invalid_cli_inputs_never_start_a_valid_config() {
+    for wrap in [false, true] {
+        for invalid_args in [vec!["extra.yaml"], vec!["--unknown"], vec!["-t", "0"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let marker = temp.path().join("forbidden");
+            let config = temp.path().join("jobs.json");
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {"job": {
+                    "command": format!("touch {}", marker.display()), "restart": false
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+            fs::copy(&config, temp.path().join("extra.yaml")).unwrap();
+            let log_path = temp.path().join("log");
+            let log = File::create(&log_path).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+            command
+                .current_dir(temp.path())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            if wrap {
+                command.arg("--wrap");
+            }
+            command.arg(config).args(&invalid_args);
+            let mut runner = Runner::spawn_in_session(command, log_path);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            let expected = match invalid_args[0] {
+                "extra.yaml" => "Only one config file",
+                "--unknown" => "Unknown option",
+                _ => "positive integer",
+            };
+            assert!(runner.log().contains(expected), "{}", runner.log());
+            assert!(!marker.exists());
+            assert!(!runner.log().contains("Starting inner process"));
+        }
+    }
+}
+
+#[test]
+fn configurations_without_active_jobs_exit_successfully() {
+    for config_text in [
+        "jobs: {}\n",
+        "jobs:\n  disabled:\n    command: exit 1\n    disabled: true\n    prefix: '{unknown}'\n    datetime: {enabled: true, format: '%Q'}\n  empty:\n    command: ''\n    prefix: '}'\n    shutdownTimeout: 18446744073709551615\n",
+    ] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.yaml");
+            fs::write(&config, config_text).unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+            assert!(
+                runner.wait(Duration::from_secs(5)).success(),
+                "{}",
+                runner.log()
+            );
+            assert!(!runner.log().contains("Initializing job"));
+            assert!(!runner.log().contains("before restarting"));
+            if config_text.contains("disabled:") {
+                assert!(runner.log().contains("Skipping disabled job: disabled"));
+                assert!(
+                    runner
+                        .log()
+                        .contains("Skipping job with missing command: empty")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapper_reads_commented_json_and_extensionless_configs_with_thread_options() {
+    for extension in ["json", "conf", ""] {
+        for threads_after_config in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join(if extension.is_empty() {
+                "jobs".to_string()
+            } else {
+                format!("jobs.{extension}")
+            });
+            let runs = temp.path().join("runs");
+            fs::write(&config, format!("// whole-line comment\n{}\n", serde_json::json!({"jobs": {"once": {
+                "command": format!("echo run >> {}; printf '%s' 'https://example.test/#fragment'", runs.display()),
+                "restart": false,
+                "prefix": "{stream}: "
+            }}}))).unwrap();
+            let log_path = temp.path().join("runner.log");
+            let log = File::create(&log_path).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+            command
+                .arg("--wrap")
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            if threads_after_config {
+                command.arg(&config).args(["-t", "2"]);
+            } else {
+                command.args(["-t", "2"]).arg(&config);
+            }
+            let mut runner = Runner::spawn_in_session(command, log_path);
+            assert!(
+                runner.wait(Duration::from_secs(5)).success(),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(runs).unwrap(), "run\n");
+            assert!(
+                runner
+                    .log()
+                    .lines()
+                    .any(|line| line == "1: https://example.test/#fragment")
+            );
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn output_reader_preserves_complete_payloads_at_buffer_and_frame_boundaries() {
+    for length in [8191, 8192, 8193, 65535, 65536, 65537, 131072] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let payload_path = temp.path().join("payload");
+        let stdout_path = temp.path().join("stdout");
+        let stderr_path = temp.path().join("stderr");
+        let payload: Vec<_> = (0..length).map(|i| [b'a', 0, 255][i % 3]).collect();
+        let mut input = payload.clone();
+        input.extend_from_slice(b"\n\ntail");
+        fs::write(&payload_path, input).unwrap();
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {"binary": {
+                "command": format!("cat {0}; cat {0} >&2", payload_path.display()),
+                "prefix": "{stream}>", "restart": false
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+        command
+            .arg(config)
+            .stdout(File::create(&stdout_path).unwrap())
+            .stderr(File::create(&stderr_path).unwrap());
+        let mut runner = Runner::spawn_in_session(command, stderr_path.clone());
+        assert!(runner.wait(Duration::from_secs(5)).success());
+        for (stream, path) in [(b'1', stdout_path), (b'2', stderr_path)] {
+            let mut expected = Vec::new();
+            for reader_chunk in payload.chunks(65536) {
+                for frame in reader_chunk.chunks(65533) {
+                    expected.extend_from_slice(&[stream, b'>']);
+                    expected.extend_from_slice(frame);
+                    expected.push(b'\n');
+                }
+            }
+            expected.extend_from_slice(&[stream, b'>', b'\n', stream, b'>']);
+            expected.extend_from_slice(b"tail\n");
+            let actual = fs::read(path).unwrap();
+            let mut job_bytes = Vec::new();
+            for line in actual.split_inclusive(|byte| *byte == b'\n') {
+                if line.starts_with(&[stream, b'>']) {
+                    job_bytes.extend_from_slice(line);
+                } else {
+                    assert!(
+                        stream == b'2'
+                            && (line.starts_with(b"Initializing job ")
+                                || line.starts_with(b"s>Started (pid ")
+                                || line == b"s>Exited with code 0\n"),
+                        "unexpected output: {line:?}"
+                    );
+                }
+            }
+            assert_eq!(job_bytes, expected, "length={length}, stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn closed_output_sinks_do_not_prevent_completion_or_descendant_cleanup() {
+    for stderr in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let pid_path = temp.path().join("child.pid");
+        fs::write(&config, serde_json::json!({"jobs": {"writer": {
+            "command": format!("sleep 30 & echo $! > {}; printf out; printf err >&2", pid_path.display()),
+            "restart": false, "shutdown_timeout": 0
+        }}}).to_string()).unwrap();
+        let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+        let mut runner = if stderr {
+            Runner::start_with_unread_stderr(&config, temp.path().join("log"), &[])
+        } else {
+            Runner::start_with_unread_stdout(&config, temp.path().join("log"))
+        };
+        if stderr {
+            drop(runner.child.stderr.take());
+        } else {
+            drop(runner.child.stdout.take());
+        }
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        let pids = read_pids(&[pid_path]);
+        assert_eq!(pids.len(), 1);
+        assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+    }
+}
+
+#[test]
+fn output_readers_preserve_binary_bytes_blank_lines_and_unterminated_tails() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = temp.path().join("payload");
+    let stdout_path = temp.path().join("stdout");
+    let stderr_path = temp.path().join("stderr");
+    let config = temp.path().join("jobs.json");
+    fs::write(&payload, b"\n\0\xff\r\ntail").unwrap();
+    fs::write(
+        &config,
+        serde_json::json!({"jobs": {"binary": {
+            "command": format!("cat {0}; cat {0} >&2", payload.display()),
+            "prefix": "{stream}>", "restart": false
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+    command
+        .arg(config)
+        .stdout(File::create(&stdout_path).unwrap())
+        .stderr(File::create(&stderr_path).unwrap());
+    let mut runner = Runner::spawn_in_session(command, stderr_path.clone());
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert_eq!(fs::read(stdout_path).unwrap(), b"1>\n1>\0\xff\r\n1>tail\n");
+    let stderr = fs::read(stderr_path).unwrap();
+    let job_stderr: Vec<u8> = stderr
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| line.starts_with(b"2>"))
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(job_stderr, b"2>\n2>\0\xff\r\n2>tail\n");
 }
 
 #[test]
@@ -2138,6 +3013,123 @@ fn inherited_output_pipe_does_not_block_restart() {
 }
 
 #[test]
+fn replacement_checks_previous_identity_before_starting_and_reruns_one_shots_per_generation() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let previous = temp.path().join("previous");
+        let overlap = temp.path().join("overlap");
+        let children = temp.path().join("children");
+        let shim = temp.path().join("shim");
+        let once = temp.path().join("once");
+        let script = temp.path().join("generation.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+read_identity() {{
+    record=$(cat /proc/$1/stat 2>/dev/null) || return 1
+    record=${{record##*) }}
+    set -- $record
+    printf '%s %s\n' "$1" "${{20}}"
+}}
+if [ -s {previous} ]; then
+    read -r old_pid old_start < {previous}
+    if current=$(read_identity "$old_pid"); then
+        set -- $current
+        if [ "$2" = "$old_start" ] && [ "$1" != Z ] && [ "$1" != X ]; then
+            echo overlap >> {overlap}
+        fi
+    fi
+fi
+sleep 30 &
+pid=$!
+set -- $(read_identity "$pid")
+echo "$pid $2" > {previous}
+echo $PPID > {shim}
+echo "$pid" >> {children}
+{finish}
+"#,
+                previous = previous.display(),
+                overlap = overlap.display(),
+                shim = shim.display(),
+                children = children.display(),
+                finish = if wrap {
+                    "while :; do sleep 1; done"
+                } else {
+                    "exit 0"
+                }
+            ),
+        );
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {
+                "once": {"command": format!("echo run >> {}", once.display()), "restart": false},
+                "repeated": {"command": format!("exec {}", script.display()), "restart_delay": 100}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let _cleanup = ProcessCleanup(vec![children.clone(), shim.clone()]);
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &children
+            ))
+            .is_empty()
+                && fs::read_to_string(&once)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    == 1
+                && !read_pids(std::slice::from_ref(&shim)).is_empty()),
+            "{}",
+            runner.log()
+        );
+        if wrap {
+            let inner = parent_process_id(read_pids(&[shim])[0]).unwrap();
+            assert_eq!(parent_process_id(inner), Some(runner.child.id()));
+            assert_eq!(
+                unsafe { libc::kill(inner as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+        }
+        assert!(
+            wait_until(Duration::from_secs(if wrap { 25 } else { 5 }), || {
+                read_pids(std::slice::from_ref(&children)).len() >= 2
+                    && fs::read_to_string(&once)
+                        .unwrap_or_default()
+                        .lines()
+                        .count()
+                        == if wrap { 2 } else { 1 }
+            }),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(
+            !overlap.exists(),
+            "a replacement observed its previous generation alive"
+        );
+        assert_eq!(
+            fs::read_to_string(once).unwrap().lines().count(),
+            if wrap { 2 } else { 1 }
+        );
+        assert!(
+            read_pids(&[children])
+                .into_iter()
+                .all(|pid| !process_is_running(pid))
+        );
+    }
+}
+
+#[test]
 fn natural_leader_exit_kills_residual_process_group_before_restart() {
     let temp = tempfile::tempdir().unwrap();
     let children = temp.path().join("children");
@@ -2850,6 +3842,170 @@ fn blocked_stderr_does_not_block_final_supervision_error() {
 }
 
 #[test]
+fn direct_process_mode_signals_only_the_shell_and_bounds_output_draining() {
+    for natural_exit in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let child = temp.path().join("child.pid");
+        let ready = temp.path().join("ready");
+        let received = temp.path().join("received");
+        let release = temp.path().join("release");
+        let command = if natural_exit {
+            format!(
+                "sleep 30 & echo $! > {}; while [ ! -e {} ]; do sleep 0.01; done; echo tail; exit 0",
+                child.display(),
+                release.display()
+            )
+        } else {
+            format!(
+                "sleep 30 & echo $! > {}; trap 'echo usr1 >> {}' USR1; trap 'exit 0' TERM; touch {}; while :; do sleep 0.05; done",
+                child.display(),
+                received.display(),
+                ready.display()
+            )
+        };
+        fs::write(
+            &config,
+            serde_json::json!({"jobs": {"direct": {
+                "command": command, "process_group": false, "restart": false
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let _cleanup = ProcessCleanup(vec![child.clone()]);
+        let mut runner = Runner::start(&config, temp.path().join("log"), &[]);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &child
+            ))
+            .is_empty()
+                && (natural_exit || ready.exists())),
+            "{}",
+            runner.log()
+        );
+        let pid = read_pids(std::slice::from_ref(&child))[0];
+        let identity = support::ProcessIdentity::read(pid).unwrap();
+        if natural_exit {
+            fs::write(&release, "release").unwrap();
+        }
+        if !natural_exit {
+            runner.signal(libc::SIGUSR1);
+            assert!(
+                wait_until(Duration::from_secs(3), || received.exists()),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(&received).unwrap(), "usr1\n");
+            assert!(identity.running(), "USR1 was incorrectly sent to the group");
+            runner.signal(libc::SIGTERM);
+        }
+        assert!(
+            runner.wait(Duration::from_secs(3)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(
+            identity.running(),
+            "direct mode unexpectedly killed a descendant"
+        );
+        if natural_exit {
+            assert!(runner.log().contains("tail"));
+        }
+        assert_eq!(support::cleanup_pid_file(&child, None), 0);
+        assert!(wait_until(Duration::from_secs(2), || !identity.running()));
+    }
+}
+
+#[test]
+fn int_hup_and_quit_request_graceful_shutdown() {
+    for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let ready = temp.path().join("ready");
+            let graceful = temp.path().join("graceful");
+            let pid_path = temp.path().join("job.pid");
+            fs::write(&config, serde_json::json!({"jobs": {"job": {
+                "command": format!("echo $$ > {}; trap 'echo term >> {}; exit 0' TERM; touch {}; while :; do sleep 0.1; done", pid_path.display(), graceful.display(), ready.display()),
+                "restart": false
+            }}}).to_string()).unwrap();
+            let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+            assert!(
+                wait_until(Duration::from_secs(5), || ready.exists()
+                    && !read_pids(std::slice::from_ref(&pid_path)).is_empty()
+                    && runner.log().contains("Started (pid ")),
+                "{}",
+                runner.log()
+            );
+            let identity = support::ProcessIdentity::read(read_pids(&[pid_path])[0]).unwrap();
+            runner.signal(signal);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(0),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(graceful).unwrap(), "term\n");
+            assert!(!identity.running());
+            let name = match signal {
+                libc::SIGINT => "INT",
+                libc::SIGHUP => "HUP",
+                _ => "QUIT",
+            };
+            assert!(
+                runner.log().contains(&format!("Received {name} signal")),
+                "{}",
+                runner.log()
+            );
+        }
+    }
+}
+
+#[test]
+fn second_sigint_forces_shutdown_without_waiting_for_grace_period() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let pid_path = temp.path().join("job.pid");
+        fs::write(&config, serde_json::json!({"jobs": {"job": {
+            "command": format!("trap '' TERM; echo $$ > {}; while :; do sleep 1; done", pid_path.display()),
+            "shutdown_timeout": 30, "restart": false
+        }}}).to_string()).unwrap();
+        let _cleanup = ProcessCleanup(vec![pid_path.clone()]);
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || !read_pids(std::slice::from_ref(
+                &pid_path
+            ))
+            .is_empty()
+                && runner.log().contains("Started (pid ")),
+            "{}",
+            runner.log()
+        );
+        let identity = support::ProcessIdentity::read(read_pids(&[pid_path])[0]).unwrap();
+        runner.signal(libc::SIGINT);
+        assert!(
+            wait_until(Duration::from_secs(5), || runner
+                .log()
+                .contains("shutting down active processes")),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGINT);
+        assert_eq!(
+            runner.wait(Duration::from_secs(4)).code(),
+            Some(0),
+            "{}",
+            runner.log()
+        );
+        assert!(!identity.running());
+    }
+}
+
+#[test]
 fn second_termination_signal_forces_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("stubborn.pid");
@@ -3011,6 +4167,7 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let shim_pid = temp.path().join("shim.pid");
     let holder_pid = temp.path().join("holder.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     let probe = build_shim_startup_probe_library(temp.path());
@@ -3023,6 +4180,7 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
                     "LD_PRELOAD": probe,
                     "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
                     "JOB_RUNNER_COMPLETION_HOLDER_PID": holder_pid,
+                    "JOB_RUNNER_COMPLETION_HOLDER_RELEASE": release,
                     "JOB_RUNNER_STOP_SHIM_STARTUP": "1",
                 }
             }
@@ -3037,7 +4195,10 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
             && !read_pids(std::slice::from_ref(&holder_pid)).is_empty()
     }));
     let holder = read_pids(std::slice::from_ref(&holder_pid))[0];
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
     assert!(process_is_running(holder));
+    fs::write(&release, "release").unwrap();
+    assert!(wait_until(Duration::from_secs(5), || process_state(shim) == Some('T')));
     runner.signal(libc::SIGTERM);
 
     let started = Instant::now();
@@ -3051,6 +4212,10 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
         process_is_running(holder),
         "test did not retain the inherited completion writer"
     );
+    assert_eq!(support::cleanup_pid_file(&holder_pid, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !process_is_running(
+        holder
+    )));
 }
 
 #[test]
@@ -3064,6 +4229,7 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
     let shim_pid = temp.path().join("shim.pid");
     let workload_pid = temp.path().join("workload.pid");
     let helper_escapee_pid = temp.path().join("helper-escapee.pid");
+    let release = temp.path().join("release-helper");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     for path in [&workload_pid, &helper_escapee_pid] {
@@ -3076,7 +4242,7 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
     permissions.set_mode(0o755);
     fs::set_permissions(temp.path(), permissions).unwrap();
     let probe = build_shim_startup_probe_library(temp.path());
-    let path = install_unready_cleanup_leaking_sudo(temp.path(), &helper_escapee_pid);
+    let path = install_unready_cleanup_leaking_sudo(temp.path(), &helper_escapee_pid, &release);
     let config_data = serde_json::json!({
         "jobs": {
             "job": {
@@ -3114,6 +4280,17 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
         runner.log()
     );
     runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&helper_escapee_pid)).is_empty()
+        }),
+        "signal-helper descendant did not start: {}",
+        runner.log()
+    );
+    let escapee =
+        support::ProcessIdentity::read(read_pids(std::slice::from_ref(&helper_escapee_pid))[0])
+            .unwrap();
+    fs::write(&release, "release").unwrap();
     let status = runner.wait(Duration::from_secs(8));
 
     assert!(
@@ -3122,11 +4299,11 @@ fn unready_sudo_cleanup_propagates_signal_helper_containment_failure() {
         runner.log()
     );
     assert!(
-        read_pids(std::slice::from_ref(&helper_escapee_pid))
-            .into_iter()
-            .any(process_is_running),
+        escapee.running(),
         "test did not exercise a surviving signal-helper descendant"
     );
+    assert_eq!(support::cleanup_pid_file(&helper_escapee_pid, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !escapee.running()));
 }
 
 #[test]
@@ -3528,7 +4705,11 @@ fn same_user_sudo_delivers_each_signal_once() {
 
 #[test]
 fn cross_uid_sudo_signals_and_stops_job() {
-    let username = "root";
+    let username = if unsafe { libc::geteuid() } == 0 {
+        "nobody"
+    } else {
+        "root"
+    };
     if !sudo_available_for(username) {
         eprintln!("skipped: noninteractive sudo unavailable for {username}");
         return;
@@ -4501,13 +5682,14 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
     let escapee = temp.path().join("escapee.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     let fault_library = build_partial_helper_capture_fault_library(temp.path());
     let command = format!(
-        "trap 'setsid sh -c \"echo \\$\\$ > {}; exec sleep 30\" & while [ ! -s {} ]; do sleep 0.001; done; exit 0' TERM; touch {}; while :; do sleep 1; done",
+        "trap 'setsid sh -c \"echo \\$\\$ > {}; exec sleep 30\" & while [ ! -e {} ]; do sleep 0.001; done; exit 0' TERM; touch {}; while :; do sleep 1; done",
         escapee.display(),
-        escapee.display(),
+        release.display(),
         ready.display()
     );
     fs::write(
@@ -4527,8 +5709,19 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
     ];
 
     let mut runner = Runner::start_with_env(&config, log, &[], &environment);
-    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()
+        && runner.log().contains("Started (pid ")));
     runner.signal(libc::SIGTERM);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !read_pids(std::slice::from_ref(&escapee)).is_empty()
+        }),
+        "TERM handler did not create the escaped descendant: {}",
+        runner.log()
+    );
+    let identity =
+        support::ProcessIdentity::read(read_pids(std::slice::from_ref(&escapee))[0]).unwrap();
+    fs::write(&release, "release").unwrap();
     let status = runner.wait(Duration::from_secs(8));
 
     assert!(
@@ -4542,10 +5735,8 @@ fn graceful_shutdown_fails_when_the_shim_reports_cleanup_failure() {
         "{}",
         runner.log()
     );
-    assert!(
-        !read_pids(std::slice::from_ref(&escapee)).is_empty(),
-        "TERM handler did not create the escaped descendant"
-    );
+    assert_eq!(support::cleanup_pid_file(&escapee, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !identity.running()));
 }
 
 #[test]
@@ -4889,18 +6080,6 @@ fn sudo_named_workload_still_receives_forwarded_signals() {
 }
 
 #[test]
-fn identity_scoped_cleanup_rejects_a_reused_pid() {
-    let pid = std::process::id();
-    let (process_group, start_time) = process_group_and_start_time(pid).unwrap();
-
-    assert_eq!(
-        process_group_for_identity(pid, start_time),
-        Some(process_group)
-    );
-    assert_eq!(process_group_for_identity(pid, start_time + 1), None);
-}
-
-#[test]
 fn sudo_sigkill_retries_after_a_transient_helper_failure() {
     let username = "root";
     if !sudo_available_for(username) {
@@ -4987,7 +6166,7 @@ fn sudo_job_shim_kills_escaped_descendant_before_exiting() {
         ])
         .stdout(output.try_clone().unwrap())
         .stderr(output)
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let _cleanup = SudoProcessCleanup {
         username: username.to_string(),
@@ -5050,7 +6229,7 @@ fn sudo_job_shim_bounds_a_stalled_cleanup_helper() {
         .env("PATH", path)
         .stdout(output.try_clone().unwrap())
         .stderr(output)
-        .spawn()
+        .spawn_guarded()
         .unwrap();
     let _cleanup = SudoProcessCleanup {
         username: username.to_string(),

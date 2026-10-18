@@ -223,10 +223,6 @@ where
     }
 }
 
-pub(crate) fn exists(process: ProcessIdentity) -> bool {
-    exists_checked(process).unwrap_or(false)
-}
-
 pub(crate) fn parent_pid_checked(process: ProcessIdentity) -> io::Result<Option<u32>> {
     match read_stat(process.pid) {
         Ok(ProcessInspection::Live(stat)) if stat.identity == process => Ok(Some(stat.parent_pid)),
@@ -879,6 +875,44 @@ mod tests {
             !is_running_checked_with(process, |_| Ok(ProcessInspection::Live(zombie))).unwrap()
         );
         assert!(!exists_checked_with(process, |_| Ok(ProcessInspection::Departed)).unwrap());
+    }
+
+    #[test]
+    fn metadata_lookups_reject_a_stale_process_identity() {
+        let current = identity(std::process::id()).unwrap();
+        assert!(exists_checked(current).unwrap());
+        assert!(parent_pid_checked(current).unwrap().is_some());
+        assert_eq!(
+            executable_path_checked(current).unwrap(),
+            Some(std::env::current_exe().unwrap())
+        );
+        assert!(!command_line_checked(current).unwrap().unwrap().is_empty());
+
+        let stale = ProcessIdentity {
+            start_time: current.start_time + 1,
+            ..current
+        };
+        assert!(!exists_checked(stale).unwrap());
+        assert!(!is_running_checked(stale).unwrap());
+        assert_eq!(parent_pid_checked(stale).unwrap(), None);
+        assert_eq!(executable_path_checked(stale).unwrap(), None);
+        assert_eq!(command_line_checked(stale).unwrap(), None);
+    }
+
+    #[test]
+    fn existence_checks_distinguish_disappearance_from_inspection_errors() {
+        let process = stat(123, 1, 123, 1).identity;
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            assert!(
+                !exists_checked_with(process, |_| Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap()
+            );
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::InvalidData] {
+            let error = exists_checked_with(process, |_| Err(io::Error::from(kind))).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains("/proc/123/stat"));
+        }
     }
 
     #[test]

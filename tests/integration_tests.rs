@@ -4,6 +4,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[allow(dead_code)]
+mod support;
+use support::SpawnGuarded;
+
 #[derive(Clone, Copy, Debug)]
 struct TestProcess {
     pid: u32,
@@ -98,6 +102,41 @@ fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
+fn wait_for_started_job(ready: &std::path::Path, log: &std::path::Path) {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            ready.exists()
+                && std::fs::read_to_string(log).is_ok_and(|output| output.contains("Started (pid "))
+        }),
+        "job trap or supervisor registration not ready: {}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn invalid_cli_arguments_report_specific_errors_without_starting_jobs() {
+    for (args, diagnostic) in [
+        (vec!["-t"], "-t requires a number argument"),
+        (vec!["-t", "0"], "-t requires a positive integer"),
+        (vec!["-t", "-1"], "-t requires a positive integer"),
+        (vec!["-t", "not-a-number"], "-t requires a positive integer"),
+        (
+            vec!["-t", "18446744073709551616"],
+            "-t requires a positive integer",
+        ),
+        (vec!["--unknown"], "Unknown option: --unknown"),
+        (vec!["--wrap"], "No config file provided"),
+        (vec!["-t", "2"], "No config file provided"),
+    ] {
+        let output = Command::new(binary_path()).args(&args).output().unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(diagnostic), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Initializing job"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
 #[test]
 fn deterministic_job_ordering() {
     let config = r#"
@@ -119,7 +158,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -152,24 +191,33 @@ jobs:
 
 #[test]
 fn sigusr1_forwarding() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
+    let config = format!(
+        r#"
 jobs:
   signal_handler:
-    command: "sh -c 'trap \"echo USR1_RECEIVED\" USR1; while true; do sleep 0.5; done'"
-"#;
+    command: |
+      trap 'echo USR1_RECEIVED' USR1
+      touch {}
+      while true; do sleep 0.5; done
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(1));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -188,24 +236,33 @@ jobs:
 
 #[test]
 fn sigusr2_forwarding() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
+    let config = format!(
+        r#"
 jobs:
   signal_handler:
-    command: "sh -c 'trap \"echo USR2_RECEIVED\" USR2; while true; do sleep 0.5; done'"
-"#;
+    command: |
+      trap 'echo USR2_RECEIVED' USR2
+      touch {}
+      while true; do sleep 0.5; done
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(1));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR2);
 
@@ -236,7 +293,7 @@ fn process_group_kills_children() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(
@@ -262,25 +319,34 @@ fn process_group_kills_children() {
 
 #[test]
 fn process_group_signal_via_negative_pid() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
+    let config = format!(
+        r#"
 jobs:
   group_leader:
-    command: "bash -c 'bash -c \"trap \\\"echo CHILD_GOT_USR1\\\" USR1; while true; do sleep 0.2; done\" & wait'"
+    command: |
+      trap ':' USR1
+      bash -c 'trap "echo CHILD_GOT_USR1" USR1; touch {}; while true; do sleep 0.2; done' &
+      while :; do wait; sleep 0.05; done
     process_group: true
-"#;
+"#,
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGUSR1);
 
@@ -311,7 +377,7 @@ fn process_group_all_children_killed() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(
@@ -351,7 +417,7 @@ fn process_group_enabled_by_default() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     assert!(wait_until(Duration::from_secs(3), || {
@@ -397,7 +463,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -423,41 +489,51 @@ jobs:
 
 #[test]
 fn graceful_shutdown_clean_exit() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
+    let graceful = temp.path().join("graceful");
+    let config = format!(
+        r#"
 jobs:
-  quick_exit:
-    command: "sleep 0.5"
-"#;
+  active:
+    command: |
+      trap 'touch {}; exit 0' TERM
+      touch {}
+      while :; do sleep 1; done
+    restart: false
+"#,
+        graceful.display(),
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
-    let stderr = child.stderr.take().unwrap();
-
-    thread::sleep(Duration::from_secs(2));
+    wait_for_started_job(&ready, &log);
 
     send_signal(child.id(), libc::SIGTERM);
 
-    let output = collect_output_for(stderr, Duration::from_secs(3));
-
-    let _ = child.wait();
-
-    let graceful_or_no_remaining = output
-        .iter()
-        .any(|line| line.contains("gracefully") || line.contains("Exited with code 0"))
-        || !output.iter().any(|line| line.contains("SIGKILL"));
-
     assert!(
-        graceful_or_no_remaining,
-        "Expected graceful shutdown. Output: {:?}",
-        output
+        wait_until(Duration::from_secs(3), || child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "graceful shutdown did not finish: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
+    let output = std::fs::read_to_string(&log).unwrap();
+
+    assert!(child.wait().unwrap().success(), "{output:?}");
+    assert!(graceful.exists(), "TERM trap did not run: {output:?}");
+    assert!(output.contains("Received TERM signal"), "{output:?}");
+    assert!(!output.contains("Killed by signal 9"), "{output:?}");
 }
 
 #[test]
@@ -475,7 +551,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -501,31 +577,46 @@ jobs:
 
 #[test]
 fn multiple_usr_signals() {
-    let config = r#"
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let log = temp.path().join("runner.log");
+    let received = temp.path().join("received");
+    let config = format!(
+        r#"
 jobs:
   counter:
     command: |
       count=0
-      trap 'count=$((count+1)); echo COUNT=$count' USR1
+      trap 'count=$((count+1)); echo COUNT=$count; echo $count > {}' USR1
+      touch {}
       while true; do sleep 0.2; done
-"#;
+"#,
+        received.display(),
+        ready.display()
+    );
 
-    let config_file = create_temp_config(config);
+    let config_file = create_temp_config(&config);
 
     let mut child = Command::new(binary_path())
         .arg(config_file.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
 
-    thread::sleep(Duration::from_millis(500));
+    wait_for_started_job(&ready, &log);
 
-    for _ in 0..3 {
+    for expected in 1..=3 {
         send_signal(child.id(), libc::SIGUSR1);
-        thread::sleep(Duration::from_millis(300));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                std::fs::read_to_string(&received)
+                    .is_ok_and(|contents| contents.trim() == expected.to_string())
+            }),
+            "signal {expected} was not acknowledged"
+        );
     }
 
     let output = collect_output_for(stdout, Duration::from_secs(2));
@@ -538,9 +629,10 @@ jobs:
         .filter(|line| line.contains("COUNT="))
         .collect();
 
-    assert!(
-        count_lines.len() >= 2,
-        "Expected at least 2 signal receipts, got: {:?}",
+    assert_eq!(
+        count_lines.len(),
+        3,
+        "Expected exactly 3 signal receipts, got: {:?}",
         count_lines
     );
 }
@@ -562,7 +654,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -597,7 +689,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
@@ -638,7 +730,7 @@ jobs:
         .args(["--wrap", config_file.path().to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner in wrapper mode");
 
     let stdout = child.stdout.take().unwrap();
@@ -680,7 +772,7 @@ fn json_config_with_comments() {
         .arg(file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -693,7 +785,7 @@ fn json_config_with_comments() {
         .iter()
         .any(|line| line.contains("json_with_comments"));
     assert!(
-        job_ran || status.success(),
+        job_ran && status.success(),
         "JSON with comments should be parsed correctly. Output: {:?}",
         output
     );
@@ -760,7 +852,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -831,13 +923,18 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
     send_signal(child.id(), libc::SIGTERM);
 
     let status = child.wait().expect("Failed to wait for child");
+    let output = collect_output_for(child.stdout.take().unwrap(), Duration::from_secs(1));
+    assert!(
+        output.iter().any(|line| line.ends_with("hello")),
+        "{output:?}"
+    );
 
     assert!(
         status.success(),
@@ -862,7 +959,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -903,7 +1000,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -952,7 +1049,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1002,7 +1099,7 @@ fn cwd_placeholder_substitution() {
         .arg(&config_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1037,7 +1134,7 @@ fn runner_cwd_placeholder_substitution() {
         .current_dir(runner_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1079,7 +1176,7 @@ fn dollar_placeholder_substitution() {
         .current_dir(runner_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1146,7 +1243,7 @@ fn dollar_cwd_prefix_substitution() {
         .env("HOME", home_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(2));
@@ -1170,7 +1267,7 @@ fn home_placeholder_substitution() {
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1211,7 +1308,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stdout = child.stdout.take().unwrap();
@@ -1247,7 +1344,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1285,7 +1382,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     thread::sleep(Duration::from_secs(1));
@@ -1321,7 +1418,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1354,7 +1451,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
@@ -1390,7 +1487,7 @@ jobs:
         .arg(config_file.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("Failed to start job-runner");
 
     let stderr = child.stderr.take().unwrap();
