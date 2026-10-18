@@ -77,6 +77,12 @@ jr --help
 
 ## Configuration
 
+Pass exactly one configuration file. Unknown fields, invalid field types, and
+duplicate snake_case/camelCase aliases are errors, including in disabled jobs.
+Configuration parsing and active-job validation finish before any job or wrapper
+generation starts. Disabled jobs and empty commands skip semantic checks such as
+prefix, datetime-format, and duration validation.
+
 ### Minimal Example
 
 ```yaml

@@ -246,6 +246,7 @@ impl std::fmt::Write for BoundedOutput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JobConfig {
     command: String,
     #[serde(default)]
@@ -283,6 +284,7 @@ fn default_process_group() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct DateTimeConfig {
     #[serde(default)]
     enabled: bool,
@@ -486,6 +488,7 @@ fn strip_json_comments(data: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     jobs: BTreeMap<String, JobConfig>,
 }
@@ -2880,6 +2883,10 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
             _ => {
+                if config_path.is_some() {
+                    std::eprintln!("Only one config file may be provided.");
+                    return ExitCode::from(1);
+                }
                 config_path = Some(&args[i]);
                 i += 1;
             }
@@ -2890,17 +2897,6 @@ fn main() -> ExitCode {
         std::eprintln!("No config file provided.");
         return ExitCode::from(1);
     };
-
-    if wrap_mode {
-        let wrapper_args: Vec<String> = args[1..]
-            .iter()
-            .filter(|a| *a != "--wrap")
-            .cloned()
-            .collect();
-        let exit_code = run_wrapper_mode(&args[0], &wrapper_args);
-        flush_output_sinks();
-        return exit_code;
-    }
 
     let home_path = env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let runner_cwd_path = env::current_dir()
@@ -2998,6 +2994,17 @@ fn main() -> ExitCode {
             .replace("#cwd#", &config_parent_path)
             .replace("#home#", &home_path)
             .replace("#runner_cwd#", &runner_cwd_path);
+    }
+
+    if wrap_mode {
+        let wrapper_args: Vec<String> = args[1..]
+            .iter()
+            .filter(|a| *a != "--wrap")
+            .cloned()
+            .collect();
+        let exit_code = run_wrapper_mode(&args[0], &wrapper_args);
+        flush_output_sinks();
+        return exit_code;
     }
 
     let mut base_env: HashMap<String, String> = env::vars().collect();

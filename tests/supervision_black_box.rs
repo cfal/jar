@@ -1681,6 +1681,94 @@ fn one_generation_wrapper_cleans_jobs_after_inner_sigkill_without_restarting() {
 }
 
 #[test]
+fn invalid_configuration_is_rejected_before_any_job_starts() {
+    for yaml in [false, true] {
+        for wrap in [false, true] {
+            for invalid in [
+                serde_json::json!({"typo": true, "jobs": {}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restatr": false}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "datetime": {"enabeld": true}}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restart_delay": 1, "restartDelay": 2}}}),
+                serde_json::json!({"jobs": {"bad": {"command": {"shell": ":"}}}}),
+                serde_json::json!({"jobs": {"bad": {"command": ":", "restart": "false"}}}),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let config = temp
+                    .path()
+                    .join(if yaml { "jobs.yaml" } else { "jobs.json" });
+                let marker = temp.path().join("forbidden");
+                let mut invalid = invalid;
+                invalid["jobs"]["aaa_valid"] = serde_json::json!({"command": format!("touch {}", marker.display()), "restart": false});
+                let text = if yaml {
+                    serde_yaml::to_string(&invalid).unwrap()
+                } else {
+                    invalid.to_string()
+                };
+                fs::write(&config, text).unwrap();
+                let args = if wrap { vec!["--wrap"] } else { vec![] };
+                let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+                assert_eq!(
+                    runner.wait(Duration::from_secs(5)).code(),
+                    Some(1),
+                    "{}",
+                    runner.log()
+                );
+                assert!(runner.log().contains("Could not parse"), "{}", runner.log());
+                assert!(!runner.log().contains("Initializing job"));
+                assert!(!runner.log().contains("Starting inner process"));
+                assert!(!marker.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_or_invalid_cli_inputs_never_start_a_valid_config() {
+    for wrap in [false, true] {
+        for invalid_args in [vec!["extra.yaml"], vec!["--unknown"], vec!["-t", "0"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let marker = temp.path().join("forbidden");
+            let config = temp.path().join("jobs.json");
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {"job": {
+                    "command": format!("touch {}", marker.display()), "restart": false
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+            fs::copy(&config, temp.path().join("extra.yaml")).unwrap();
+            let log_path = temp.path().join("log");
+            let log = File::create(&log_path).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+            command
+                .current_dir(temp.path())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            if wrap {
+                command.arg("--wrap");
+            }
+            command.arg(config).args(&invalid_args);
+            let mut runner = Runner::spawn_in_session(command, log_path);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            let expected = match invalid_args[0] {
+                "extra.yaml" => "Only one config file",
+                "--unknown" => "Unknown option",
+                _ => "positive integer",
+            };
+            assert!(runner.log().contains(expected), "{}", runner.log());
+            assert!(!marker.exists());
+            assert!(!runner.log().contains("Starting inner process"));
+        }
+    }
+}
+
+#[test]
 fn configurations_without_active_jobs_exit_successfully() {
     for config_text in [
         "jobs: {}\n",
