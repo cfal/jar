@@ -947,20 +947,33 @@ fn cpu_time_for_ticks(ticks: u64) -> Duration {
 }
 
 fn current_username() -> Option<String> {
-    let output = Command::new("id").arg("-un").output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let username = Command::new("id")
+        .arg("-un")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|username| !username.is_empty());
+    require_test_prerequisite(username.is_some(), "current username");
+    username
+}
+
+fn require_test_prerequisite(available: bool, description: &str) -> bool {
+    assert!(
+        available || std::env::var_os("JR_REQUIRE_TEST_PREREQUISITES").is_none(),
+        "required test prerequisite unavailable: {description}"
+    );
+    available
 }
 
 fn sudo_available_for(username: &str) -> bool {
-    Command::new("sudo")
+    let available = Command::new("sudo")
         .args(["-n", "-u", username, "--", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    require_test_prerequisite(available, &format!("noninteractive sudo for {username}"))
 }
 
 fn real_sudo_path() -> String {
@@ -1281,12 +1294,13 @@ impl Drop for ContainerCleanup {
 }
 
 fn docker_available() -> bool {
-    Command::new("docker")
+    let available = Command::new("docker")
         .args(["image", "inspect", "ubuntu:24.04"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    require_test_prerequisite(available, "Docker with the ubuntu:24.04 image")
 }
 
 fn container_exists(name: &str) -> bool {

@@ -27,6 +27,8 @@ jobs:
           sudo -n -u nobody true
           docker pull ubuntu:24.04
       - run: cargo test --locked -- --test-threads=1 --show-output
+        env:
+          JR_REQUIRE_TEST_PREREQUISITES: "1"
 
   msrv:
     name: Rust 1.88

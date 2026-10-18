@@ -474,6 +474,20 @@ logrotate /etc/logrotate.conf
 kill -USR1 $(pidof jr)
 ```
 
+## Testing
+
+Run process-sensitive tests serially:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo test --locked -- --test-threads=1 --show-output
+```
+
+The Linux black-box tests use a C compiler, noninteractive sudo for the current
+user and root, and Docker with the `ubuntu:24.04` image. Locally, unavailable sudo
+or Docker cases print `skipped:` and return early; Cargo still counts them as
+passed. Set `JR_REQUIRE_TEST_PREREQUISITES=1` to fail instead of skipping, as CI
+does. Inspect `--show-output` before treating a local run as full coverage.
+
 ## License
 
 [GNU General Public License v3.0](LICENSE)
