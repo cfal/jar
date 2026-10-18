@@ -28,7 +28,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pid");
         fs::write(&path, identity.pid.to_string()).unwrap();
-        cleanup_pid_file(&path, None);
+        assert_eq!(cleanup_pid_file(&path, None), 1);
         assert!(child.try_wait().unwrap().is_none());
         observe_pid_file(&path);
         RECORDED
@@ -37,9 +37,35 @@ mod tests {
             .lock()
             .unwrap()
             .insert(path.clone(), vec![stale]);
-        cleanup_pid_file(&path, None);
+        assert_eq!(cleanup_pid_file(&path, None), 1);
         assert!(child.try_wait().unwrap().is_none());
         identity.signal(libc::SIGTERM, None);
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn pid_reuse_does_not_prevent_recording_a_verified_new_identity() {
+        let mut child = Command::new("sleep").arg("30").spawn_guarded().unwrap();
+        let identity = ProcessIdentity::read(child.id()).unwrap();
+        let stale = ProcessIdentity {
+            start_time: identity.start_time + 1,
+            ..identity
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pid");
+        fs::write(&path, identity.pid.to_string()).unwrap();
+        RECORDED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert(path.clone(), vec![stale]);
+        observe_pid_file(&path);
+        observe_pid_file(&path);
+        assert_eq!(
+            RECORDED.get().unwrap().lock().unwrap()[&path],
+            [stale, identity]
+        );
+        assert_eq!(cleanup_pid_file(&path, None), 0);
         assert!(!child.wait().unwrap().success());
     }
 

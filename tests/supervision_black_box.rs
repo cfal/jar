@@ -809,11 +809,6 @@ fn process_group_and_start_time(pid: u32) -> Option<(u32, u64)> {
     Some((process_group, start_time))
 }
 
-fn process_group_for_identity(pid: u32, start_time: u64) -> Option<u32> {
-    let (process_group, current_start_time) = process_group_and_start_time(pid)?;
-    (current_start_time == start_time).then_some(process_group)
-}
-
 fn parent_process_id(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat[stat.rfind(')')? + 1..]
@@ -5970,18 +5965,6 @@ fn sudo_named_workload_still_receives_forwarded_signals() {
 
     runner.signal(libc::SIGTERM);
     assert!(runner.wait(Duration::from_secs(5)).success());
-}
-
-#[test]
-fn identity_scoped_cleanup_rejects_a_reused_pid() {
-    let pid = std::process::id();
-    let (process_group, start_time) = process_group_and_start_time(pid).unwrap();
-
-    assert_eq!(
-        process_group_for_identity(pid, start_time),
-        Some(process_group)
-    );
-    assert_eq!(process_group_for_identity(pid, start_time + 1), None);
 }
 
 #[test]

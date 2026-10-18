@@ -235,11 +235,11 @@ pub fn observe_pid_file(path: &Path) -> Vec<u32> {
         .unwrap_or_else(|e| e.into_inner());
     let identities = recorded.entry(path.to_path_buf()).or_default();
     for pid in &pids {
-        if !identities.iter().any(|identity| identity.pid == *pid)
-            && let Some(identity) = owned
-                .iter()
-                .copied()
-                .find(|identity| identity.pid == *pid && identity.running())
+        if let Some(identity) = owned
+            .iter()
+            .copied()
+            .find(|identity| identity.pid == *pid && identity.running())
+            && !identities.contains(&identity)
         {
             identities.push(identity);
         }
@@ -247,21 +247,24 @@ pub fn observe_pid_file(path: &Path) -> Vec<u32> {
     pids
 }
 
-pub fn cleanup_pid_file(path: &Path, sudo_user: Option<&str>) {
+pub fn cleanup_pid_file(path: &Path, sudo_user: Option<&str>) -> usize {
     let known = RECORDED
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path)
         .unwrap_or_default();
+    let mut unobserved = 0;
     for pid in fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
     {
-        if !known.iter().any(|identity| identity.pid == pid)
-            && ProcessIdentity::read(pid).is_some_and(|identity| identity.running())
+        if let Some(identity) = ProcessIdentity::read(pid)
+            && identity.running()
+            && !known.contains(&identity)
         {
+            unobserved += 1;
             eprintln!(
                 "refusing test cleanup of unobserved PID {pid} from {}",
                 path.display()
@@ -271,6 +274,7 @@ pub fn cleanup_pid_file(path: &Path, sudo_user: Option<&str>) {
     for identity in known {
         cleanup_process_tree(identity, sudo_user);
     }
+    unobserved
 }
 
 pub fn cleanup_process_tree(identity: ProcessIdentity, sudo_user: Option<&str>) {
