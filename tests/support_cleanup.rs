@@ -44,6 +44,73 @@ mod tests {
     }
 
     #[test]
+    fn observing_a_historical_pid_cannot_authorize_an_unrelated_process() {
+        let mut unrelated = Command::new("sleep").arg("30").spawn_guarded().unwrap();
+        let identity = ProcessIdentity::read(unrelated.id()).unwrap();
+        // Retain emergency cleanup, but model a process not owned by a live fixture.
+        GUARDED_ROOTS
+            .lock()
+            .unwrap()
+            .retain(|root| *root != identity);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old-generation.pid");
+        fs::write(&path, identity.pid.to_string()).unwrap();
+        assert_eq!(observe_pid_file(&path), vec![identity.pid]);
+        assert!(RECORDED.get().unwrap().lock().unwrap()[&path].is_empty());
+        cleanup_pid_file(&path, None);
+        assert!(unrelated.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn pid_file_cleanup_accepts_a_verified_fixture_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("child.pid");
+        let mut root = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", path.display()))
+            .spawn_guarded()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = observe_pid_file(&path).first() {
+                break *pid;
+            }
+            assert!(Instant::now() < deadline, "child never started");
+            thread::sleep(Duration::from_millis(20));
+        };
+        let identity = ProcessIdentity::read(pid).unwrap();
+        cleanup_pid_file(&path, None);
+        root.wait().unwrap();
+        assert!(!identity.running());
+    }
+
+    #[test]
+    fn privileged_cleanup_script_rechecks_identity_before_signalling() {
+        let mut child = Command::new("sleep").arg("30").spawn_guarded().unwrap();
+        let identity = ProcessIdentity::read(child.id()).unwrap();
+        for start_time in [identity.start_time + 1, identity.start_time] {
+            assert!(
+                Command::new("sh")
+                    .args([
+                        "-c",
+                        IDENTITY_CHECKED_KILL,
+                        "--",
+                        &identity.pid.to_string(),
+                        &start_time.to_string(),
+                        &libc::SIGTERM.to_string(),
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            if start_time != identity.start_time {
+                assert!(child.try_wait().unwrap().is_none());
+            }
+        }
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
     fn unwinding_reaps_the_runner_and_stops_separate_job_sessions() {
         for wrap in [false, true] {
             let temp = tempfile::tempdir().unwrap();

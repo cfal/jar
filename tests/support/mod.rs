@@ -8,6 +8,17 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const IDENTITY_CHECKED_KILL: &str = r#"
+pid=$1 expected=$2 signal=$3
+IFS= read -r stat < "/proc/$pid/stat" || exit 0
+set -f
+set -- ${stat##*) }
+[ "$#" -ge 20 ] || exit 1
+shift 19
+[ "$1" = "$expected" ] || exit 0
+kill "-$signal" "$pid"
+"#;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -51,10 +62,13 @@ impl ProcessIdentity {
                     "-u",
                     user,
                     "--",
-                    "kill",
-                    &format!("-{signal}"),
+                    "sh",
+                    "-c",
+                    IDENTITY_CHECKED_KILL,
                     "--",
                     &self.pid.to_string(),
+                    &self.start_time.to_string(),
+                    &signal.to_string(),
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -97,6 +111,8 @@ pub struct GuardedChild {
     known: Vec<ProcessIdentity>,
 }
 
+static GUARDED_ROOTS: Mutex<Vec<ProcessIdentity>> = Mutex::new(Vec::new());
+
 pub trait SpawnGuarded {
     fn spawn_guarded(&mut self) -> io::Result<GuardedChild>;
 }
@@ -105,6 +121,12 @@ impl SpawnGuarded for Command {
     fn spawn_guarded(&mut self) -> io::Result<GuardedChild> {
         let child = self.spawn()?;
         let root = ProcessIdentity::read(child.id());
+        if let Some(root) = root {
+            GUARDED_ROOTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(root);
+        }
         Ok(GuardedChild {
             child,
             root,
@@ -182,6 +204,10 @@ impl Drop for GuardedChild {
         for process in self.known.iter().filter(|identity| identity.running()) {
             eprintln!("test cleanup could not stop {process:?}");
         }
+        GUARDED_ROOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|identity| *identity != root);
     }
 }
 
@@ -194,6 +220,15 @@ pub fn observe_pid_file(path: &Path) -> Vec<u32> {
         .lines()
         .filter_map(|line| line.trim().parse().ok())
         .collect();
+    if pids.is_empty() {
+        return pids;
+    }
+    // A PID file may describe a finished generation. Authorize only live fixture ownership.
+    let mut owned = GUARDED_ROOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    descendants(&mut owned);
     let mut recorded = RECORDED
         .get_or_init(Mutex::default)
         .lock()
@@ -201,7 +236,10 @@ pub fn observe_pid_file(path: &Path) -> Vec<u32> {
     let identities = recorded.entry(path.to_path_buf()).or_default();
     for pid in &pids {
         if !identities.iter().any(|identity| identity.pid == *pid)
-            && let Some(identity) = ProcessIdentity::read(*pid)
+            && let Some(identity) = owned
+                .iter()
+                .copied()
+                .find(|identity| identity.pid == *pid && identity.running())
         {
             identities.push(identity);
         }
@@ -231,10 +269,14 @@ pub fn cleanup_pid_file(path: &Path, sudo_user: Option<&str>) {
         }
     }
     for identity in known {
-        let mut tree = vec![identity];
-        descendants(&mut tree);
-        for process in tree.into_iter().rev() {
-            process.signal(libc::SIGKILL, sudo_user);
-        }
+        cleanup_process_tree(identity, sudo_user);
+    }
+}
+
+pub fn cleanup_process_tree(identity: ProcessIdentity, sudo_user: Option<&str>) {
+    let mut tree = vec![identity];
+    descendants(&mut tree);
+    for process in tree.into_iter().rev() {
+        process.signal(libc::SIGKILL, sudo_user);
     }
 }

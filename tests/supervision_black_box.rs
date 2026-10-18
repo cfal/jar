@@ -236,24 +236,10 @@ impl Drop for IdentityScopedSudoProcessCleanup {
         let Some((pid, start_time)) = read_recorded_process_identity(&self.identity_path) else {
             return;
         };
-        let Some(process_group) = process_group_for_identity(pid, start_time) else {
-            return;
-        };
-        let _ = Command::new("sudo")
-            .args([
-                "-n",
-                "-u",
-                &self.username,
-                "--",
-                "kill",
-                "-KILL",
-                "--",
-                &format!("-{process_group}"),
-                &pid.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        support::cleanup_process_tree(
+            support::ProcessIdentity { pid, start_time },
+            Some(&self.username),
+        );
     }
 }
 
