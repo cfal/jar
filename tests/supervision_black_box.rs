@@ -431,7 +431,11 @@ __attribute__((constructor)) static void initialize(void) {
         pid_t first = fork();
         if (first == 0) {
             pid_t holder = fork();
-            if (holder > 0) _exit(0);
+            if (holder > 0) {
+                const char *release = getenv("JOB_RUNNER_COMPLETION_HOLDER_RELEASE");
+                for (int i = 0; release && i < 500 && access(release, F_OK); i++) usleep(10000);
+                _exit(0);
+            }
             if (holder < 0) _exit(2);
             setsid();
             int holder_output = open(holder_marker, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -3777,10 +3781,12 @@ fn direct_process_mode_signals_only_the_shell_and_bounds_output_draining() {
         let child = temp.path().join("child.pid");
         let ready = temp.path().join("ready");
         let received = temp.path().join("received");
+        let release = temp.path().join("release");
         let command = if natural_exit {
             format!(
-                "sleep 30 & echo $! > {}; echo tail; exit 0",
-                child.display()
+                "sleep 30 & echo $! > {}; while [ ! -e {} ]; do sleep 0.01; done; echo tail; exit 0",
+                child.display(),
+                release.display()
             )
         } else {
             format!(
@@ -3811,6 +3817,9 @@ fn direct_process_mode_signals_only_the_shell_and_bounds_output_draining() {
         );
         let pid = read_pids(std::slice::from_ref(&child))[0];
         let identity = support::ProcessIdentity::read(pid).unwrap();
+        if natural_exit {
+            fs::write(&release, "release").unwrap();
+        }
         if !natural_exit {
             runner.signal(libc::SIGUSR1);
             assert!(
@@ -3834,6 +3843,8 @@ fn direct_process_mode_signals_only_the_shell_and_bounds_output_draining() {
         if natural_exit {
             assert!(runner.log().contains("tail"));
         }
+        assert_eq!(support::cleanup_pid_file(&child, None), 0);
+        assert!(wait_until(Duration::from_secs(2), || !identity.running()));
     }
 }
 
@@ -4086,6 +4097,7 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let shim_pid = temp.path().join("shim.pid");
     let holder_pid = temp.path().join("holder.pid");
+    let release = temp.path().join("release");
     let config = temp.path().join("jobs.json");
     let log = temp.path().join("runner.log");
     let probe = build_shim_startup_probe_library(temp.path());
@@ -4098,6 +4110,7 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
                     "LD_PRELOAD": probe,
                     "JOB_RUNNER_SHIM_STARTUP_PID": shim_pid,
                     "JOB_RUNNER_COMPLETION_HOLDER_PID": holder_pid,
+                    "JOB_RUNNER_COMPLETION_HOLDER_RELEASE": release,
                     "JOB_RUNNER_STOP_SHIM_STARTUP": "1",
                 }
             }
@@ -4112,7 +4125,10 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
             && !read_pids(std::slice::from_ref(&holder_pid)).is_empty()
     }));
     let holder = read_pids(std::slice::from_ref(&holder_pid))[0];
+    let shim = read_pids(std::slice::from_ref(&shim_pid))[0];
     assert!(process_is_running(holder));
+    fs::write(&release, "release").unwrap();
+    assert!(wait_until(Duration::from_secs(5), || process_state(shim) == Some('T')));
     runner.signal(libc::SIGTERM);
 
     let started = Instant::now();
@@ -4126,6 +4142,10 @@ fn inherited_completion_writer_cannot_block_unready_shim_cleanup() {
         process_is_running(holder),
         "test did not retain the inherited completion writer"
     );
+    assert_eq!(support::cleanup_pid_file(&holder_pid, None), 0);
+    assert!(wait_until(Duration::from_secs(2), || !process_is_running(
+        holder
+    )));
 }
 
 #[test]
