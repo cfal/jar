@@ -1,0 +1,56 @@
+name: Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: 1
+
+jobs:
+  tests:
+    name: Unit and integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential sudo strace
+          sudo -n -u nobody true
+          docker pull ubuntu:24.04
+      - run: cargo test --locked -- --test-threads=1 --show-output
+
+  msrv:
+    name: Rust 1.88
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  notices:
+    name: Dependency notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - name: Verify dependency notices
+        run: |
+          python3 scripts/generate-release-notices.py
+          git diff --exit-code -- licenses/dependencies.txt
+          python3 scripts/check-release-notices.py .
+          python3 -B scripts/test-release-notices.py

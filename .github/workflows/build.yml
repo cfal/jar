@@ -1,0 +1,153 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: [master, 'release-*']
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - target: x86_64-unknown-linux-musl
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+      - name: Build binary
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.use_cross }}
+        run: |
+          if [ "$USE_CROSS" = true ]; then
+            cross build --release --locked --target "$TARGET" --bin jr -j 1
+          else
+            cargo build --release --locked --target "$TARGET" --bin jr
+          fi
+          test -x "target/$TARGET/release/jr"
+          file "target/$TARGET/release/jr"
+      - name: Smoke test native executable
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          printf 'jobs:\n  smoke:\n    command: echo release-ok\n    restart: false\n    prefix: ""\n' > smoke.yaml
+          "target/$TARGET/release/jr" smoke.yaml > smoke.out
+          grep -qx release-ok smoke.out
+      - name: Package binary and notices
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p artifacts/package
+          cp "target/$TARGET/release/jr" LICENSE README.md THIRD_PARTY_NOTICES.md artifacts/package/
+          cp -R licenses artifacts/package/
+          tar -czf "artifacts/jar-$TARGET.tar.gz" -C artifacts/package jr LICENSE README.md THIRD_PARTY_NOTICES.md licenses
+          python3 scripts/check-release-notices.py "artifacts/jar-$TARGET.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jar-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+
+  source:
+    name: Source bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Bundle source and locked dependencies
+        run: |
+          mkdir -p source/.cargo artifacts
+          git archive HEAD | tar -x -C source
+          cd source
+          cargo vendor --locked vendor > .cargo/config.toml
+          cargo check --offline --locked --bin jr --target-dir ../target
+          cd ..
+          tar -czf artifacts/jar-source.tar.gz -C source .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jar-source
+          path: artifacts/jar-source.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: [lint, test, build, source]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release version and dependency requirements
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())
+          assert os.environ["RELEASE_TAG"] == "v" + manifest["package"]["version"]
+          for section in ("dependencies", "dev-dependencies"):
+              for name, dependency in manifest[section].items():
+                  version = dependency if isinstance(dependency, str) else dependency["version"]
+                  assert version != "*", f"Unversioned release dependency: {name}"
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jar-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: sha256sum *.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
+          draft: true
+          generate_release_notes: true
