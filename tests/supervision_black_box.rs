@@ -1442,7 +1442,7 @@ fn non_restarting_invalid_launch_inputs_fail_once_without_stopping_other_jobs() 
                 &config,
                 serde_json::json!({"jobs": {
                     "invalid": invalid,
-                    "other": {"command": format!("touch {}", done.display()), "restart": false}
+                    "other": {"command": format!("touch {}", done.display()), "delay": 200, "restart": false}
                 }})
                 .to_string(),
             )
@@ -1464,7 +1464,103 @@ fn non_restarting_invalid_launch_inputs_fail_once_without_stopping_other_jobs() 
             assert!(done.exists(), "{}", runner.log());
             assert!(!forbidden.exists(), "{}", runner.log());
             assert!(!runner.log().contains("before restarting"));
+            assert!(
+                !runner.log().contains("shutting down active processes"),
+                "{}",
+                runner.log()
+            );
         }
+    }
+}
+
+#[test]
+fn shim_command_start_failure_is_job_local() {
+    for wrap in [false, true] {
+        for missing_sudo in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let done = temp.path().join("done");
+            let bin = temp.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+            let mut bad = serde_json::json!({"command": ":", "restart": false});
+            if missing_sudo {
+                bad["sudo_user"] = serde_json::json!("root");
+            } else {
+                bad["env"] = serde_json::json!({"PATH": "/nonexistent"});
+            }
+            fs::write(&config, serde_json::json!({"jobs": {
+                "bad": bad,
+                "other": {"command": format!("printf done > {}", done.display()), "delay": 300, "restart": false}
+            }}).to_string()).unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let env = if missing_sudo {
+                vec![("PATH", bin.to_str().unwrap())]
+            } else {
+                vec![]
+            };
+            let mut runner = Runner::start_with_env(&config, temp.path().join("log"), &args, &env);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            assert!(done.exists(), "{}", runner.log());
+            assert_eq!(
+                runner
+                    .log()
+                    .matches("Job shim could not start command")
+                    .count(),
+                1,
+                "{}",
+                runner.log()
+            );
+            assert!(
+                !runner.log().contains("Fatal process supervision error"),
+                "{}",
+                runner.log()
+            );
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn shim_command_start_failure_retries_only_the_failed_job() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.json");
+        let done = temp.path().join("done");
+        fs::write(&config, serde_json::json!({"jobs": {
+            "bad": {"command": ":", "env": {"PATH": "/nonexistent"}, "restart_delay": 100},
+            "other": {"command": format!("printf done >> {}", done.display()), "delay": 300, "restart": false}
+        }}).to_string()).unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || done.exists()
+                && runner
+                    .log()
+                    .matches("Job shim could not start command")
+                    .count()
+                    >= 2),
+            "{}",
+            runner.log()
+        );
+        assert!(runner.is_running());
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert_eq!(fs::read_to_string(done).unwrap(), "done");
+        assert!(
+            !runner.log().contains("Fatal process supervision error"),
+            "{}",
+            runner.log()
+        );
     }
 }
 

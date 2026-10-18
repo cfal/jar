@@ -48,6 +48,7 @@ const JOB_SHIM_COMPLETION_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 // Black-box tests execute the production binary, so this cannot be gated on cfg(test).
 const TEST_PROCESS_RECONCILE_INTERVAL_MS: &str = "JOB_RUNNER_TEST_PROCESS_RECONCILE_INTERVAL_MS";
 const JOB_SHIM_READY: u8 = 1;
+const JOB_SHIM_START_FAILED: u8 = 2;
 const JOB_SHIM_COMPLETED: u8 = 1;
 const JOB_SHIM_FAILED: u8 = 2;
 
@@ -611,8 +612,10 @@ fn job_shim_readiness_pipe() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
     Ok((unsafe { AsyncFd::register(reader)? }, writer))
 }
 
+#[derive(Debug)]
 enum JobShimReadiness {
     Ready,
+    StartFailed,
     Shutdown,
 }
 
@@ -631,7 +634,7 @@ async fn wait_for_job_shim_readiness(
     tokio::select! {
         biased;
         result = read_job_shim_readiness(&reader) => {
-            result.map(|()| JobShimReadiness::Ready)
+            result
         }
         changed = shutdown.changed() => {
             let _ = changed;
@@ -644,7 +647,7 @@ async fn wait_for_job_shim_readiness(
     }
 }
 
-async fn read_job_shim_readiness(reader: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
+async fn read_job_shim_readiness(reader: &AsyncFd<OwnedFd>) -> std::io::Result<JobShimReadiness> {
     loop {
         let mut readable = reader.readable().await?;
         match readable.try_io(|descriptor| read_job_shim_readiness_byte(descriptor.as_raw_fd())) {
@@ -654,19 +657,19 @@ async fn read_job_shim_readiness(reader: &AsyncFd<OwnedFd>) -> std::io::Result<(
     }
 }
 
-fn read_job_shim_readiness_byte(descriptor: RawFd) -> std::io::Result<()> {
+fn read_job_shim_readiness_byte(descriptor: RawFd) -> std::io::Result<JobShimReadiness> {
     loop {
         let mut readiness = [0];
         let read =
             unsafe { libc::read(descriptor, readiness.as_mut_ptr().cast(), readiness.len()) };
         if read == readiness.len() as isize {
-            return if readiness[0] == JOB_SHIM_READY {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!(
+            return match readiness[0] {
+                JOB_SHIM_READY => Ok(JobShimReadiness::Ready),
+                JOB_SHIM_START_FAILED => Ok(JobShimReadiness::StartFailed),
+                status => Err(std::io::Error::other(format!(
                     "job shim reported an invalid readiness status: {}",
-                    readiness[0]
-                )))
+                    status
+                ))),
             };
         }
         if read == 0 {
@@ -1401,6 +1404,23 @@ async fn start_proc_internal(
     .await
     {
         Ok(JobShimReadiness::Ready) => {}
+        Ok(JobShimReadiness::StartFailed) => {
+            let cleanup = stop_unready_job_shim(
+                status_prefix,
+                opts,
+                &mut child,
+                pid,
+                &mut shim_completion_reader,
+            )
+            .await;
+            drain_output_handlers([stdout_handle, stderr_handle]).await;
+            return Err(match cleanup {
+                Ok(_) => {
+                    ProcessRunError::Retry(std::io::Error::other("job command failed to start"))
+                }
+                Err(error) => ProcessRunError::Fatal(error),
+            });
+        }
         Ok(JobShimReadiness::Shutdown) => {
             let cleanup = stop_unready_job_shim(
                 status_prefix,
@@ -2662,6 +2682,11 @@ fn run_job_shim(args: &[String]) -> ExitCode {
         Ok(child) => child,
         Err(error) => {
             std::eprintln!("Job shim could not start command: {error}");
+            // No workload exists. Confirm containment before publishing the launch failure.
+            completion.report_success();
+            if let Some(writer) = &mut readiness {
+                let _ = writer.write_all(&[JOB_SHIM_START_FAILED]);
+            }
             return ExitCode::from(1);
         }
     };
@@ -5066,7 +5091,13 @@ mod tests {
     fn job_shim_readiness_rejects_eof_and_invalid_status() {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
-            for status in [Some(JOB_SHIM_READY), Some(0), Some(255), None] {
+            for status in [
+                Some(JOB_SHIM_READY),
+                Some(JOB_SHIM_START_FAILED),
+                Some(0),
+                Some(255),
+                None,
+            ] {
                 let (reader, writer) = job_shim_readiness_pipe().unwrap();
                 let mut writer = std::fs::File::from(writer);
                 if let Some(status) = status {
@@ -5075,7 +5106,12 @@ mod tests {
                 drop(writer);
                 let result = read_job_shim_readiness(&reader).await;
                 match status {
-                    Some(JOB_SHIM_READY) => result.unwrap(),
+                    Some(JOB_SHIM_READY) => {
+                        assert!(matches!(result.unwrap(), JobShimReadiness::Ready))
+                    }
+                    Some(JOB_SHIM_START_FAILED) => {
+                        assert!(matches!(result.unwrap(), JobShimReadiness::StartFailed))
+                    }
                     None => assert_eq!(
                         result.unwrap_err().kind(),
                         std::io::ErrorKind::UnexpectedEof
