@@ -99,6 +99,30 @@ fn wait_until(duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
 }
 
 #[test]
+fn invalid_cli_arguments_report_specific_errors_without_starting_jobs() {
+    for (args, diagnostic) in [
+        (vec!["-t"], "-t requires a number argument"),
+        (vec!["-t", "0"], "-t requires a positive integer"),
+        (vec!["-t", "-1"], "-t requires a positive integer"),
+        (vec!["-t", "not-a-number"], "-t requires a positive integer"),
+        (
+            vec!["-t", "18446744073709551616"],
+            "-t requires a positive integer",
+        ),
+        (vec!["--unknown"], "Unknown option: --unknown"),
+        (vec!["--wrap"], "No config file provided"),
+        (vec!["-t", "2"], "No config file provided"),
+    ] {
+        let output = Command::new(binary_path()).args(&args).output().unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(diagnostic), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Initializing job"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn deterministic_job_ordering() {
     let config = r#"
 jobs:

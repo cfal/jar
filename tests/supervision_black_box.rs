@@ -1425,6 +1425,258 @@ fn non_restarting_job_cleans_descendants_and_drains_output() {
 }
 
 #[test]
+fn non_restarting_invalid_launch_inputs_fail_once_without_stopping_other_jobs() {
+    for (field, value, diagnostic) in [
+        ("sudo_user", serde_json::json!(""), "Invalid sudo_user"),
+        (
+            "sudo_user",
+            serde_json::json!("root --preserve-env"),
+            "Invalid sudo_user",
+        ),
+        (
+            "env",
+            serde_json::json!({"": "value"}),
+            "Invalid environment variable name",
+        ),
+        (
+            "env",
+            serde_json::json!({"A=B": "value"}),
+            "Invalid environment variable name",
+        ),
+        (
+            "env",
+            serde_json::json!({"A\0B": "value"}),
+            "Invalid environment variable name",
+        ),
+        ("env", serde_json::json!({"KEY": "a\0b"}), "nul byte found"),
+        ("command", serde_json::json!("echo bad\0"), "nul byte found"),
+    ] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.json");
+            let forbidden = temp.path().join("forbidden");
+            let done = temp.path().join("done");
+            let mut invalid = serde_json::json!({
+                "command": format!("touch {}", forbidden.display()),
+                "restart": false,
+                "restartDelay": 0
+            });
+            invalid[field] = value.clone();
+            fs::write(
+                &config,
+                serde_json::json!({"jobs": {
+                    "invalid": invalid,
+                    "other": {"command": format!("touch {}", done.display()), "restart": false}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+            assert_eq!(
+                runner.wait(Duration::from_secs(5)).code(),
+                Some(1),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(
+                runner.log().matches(diagnostic).count(),
+                1,
+                "{}",
+                runner.log()
+            );
+            assert!(done.exists(), "{}", runner.log());
+            assert!(!forbidden.exists(), "{}", runner.log());
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn non_restarting_initial_delay_is_cancelled_by_shutdown() {
+    for wrap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("jobs.yaml");
+        let started = temp.path().join("started");
+        fs::write(&config, format!(
+            "jobs:\n  delayed:\n    command: 'touch {}'\n    delay: 60000\n    restart: false\n",
+            started.display()
+        )).unwrap();
+        let args = if wrap { vec!["--wrap"] } else { vec![] };
+        let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+        assert!(
+            wait_until(Duration::from_secs(5), || runner
+                .log()
+                .contains("Starting in 60.000s")),
+            "{}",
+            runner.log()
+        );
+        runner.signal(libc::SIGTERM);
+        assert!(
+            runner.wait(Duration::from_secs(5)).success(),
+            "{}",
+            runner.log()
+        );
+        assert!(!started.exists());
+        assert!(!runner.log().contains("Started (pid"));
+    }
+}
+
+#[test]
+fn one_generation_wrapper_cleans_jobs_after_inner_sigkill_without_restarting() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("jobs.yaml");
+    let shim = temp.path().join("shim.pid");
+    let job = temp.path().join("job.pid");
+    fs::write(&config, format!(
+        "jobs:\n  once:\n    command: 'echo $PPID > {}; echo $$ > {}; exec sleep 30'\n    restart: false\n",
+        shim.display(), job.display()
+    )).unwrap();
+    let paths = [shim, job];
+    let _cleanup = ProcessCleanup(paths.to_vec());
+    let mut runner = Runner::start(&config, temp.path().join("runner.log"), &["--wrap"]);
+    assert!(
+        wait_until(Duration::from_secs(5), || read_pids(&paths).len() == 2),
+        "{}",
+        runner.log()
+    );
+    let pids = read_pids(&paths);
+    let inner = parent_process_id(pids[0]).unwrap();
+    assert_eq!(parent_process_id(inner), Some(runner.child.id()));
+    assert_eq!(
+        unsafe { libc::kill(inner as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    assert_eq!(
+        runner.wait(Duration::from_secs(8)).code(),
+        Some(137),
+        "{}",
+        runner.log()
+    );
+    assert!(
+        pids.iter().all(|pid| !process_is_running(*pid)),
+        "{}",
+        runner.log()
+    );
+    assert_eq!(
+        runner
+            .log()
+            .matches("[Wrapper] Starting inner process..")
+            .count(),
+        1
+    );
+    assert!(!runner.log().contains("before restarting"));
+}
+
+#[test]
+fn configurations_without_active_jobs_exit_successfully() {
+    for config_text in [
+        "jobs: {}\n",
+        "jobs:\n  disabled:\n    command: exit 1\n    disabled: true\n    prefix: '{unknown}'\n    datetime: {enabled: true, format: '%Q'}\n  empty:\n    command: ''\n    prefix: '}'\n    shutdownTimeout: 18446744073709551615\n",
+    ] {
+        for wrap in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("jobs.yaml");
+            fs::write(&config, config_text).unwrap();
+            let args = if wrap { vec!["--wrap"] } else { vec![] };
+            let mut runner = Runner::start(&config, temp.path().join("runner.log"), &args);
+            assert!(
+                runner.wait(Duration::from_secs(5)).success(),
+                "{}",
+                runner.log()
+            );
+            assert!(!runner.log().contains("Initializing job"));
+            assert!(!runner.log().contains("before restarting"));
+            if config_text.contains("disabled:") {
+                assert!(runner.log().contains("Skipping disabled job: disabled"));
+                assert!(
+                    runner
+                        .log()
+                        .contains("Skipping job with missing command: empty")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapper_reads_commented_json_and_extensionless_configs_with_thread_options() {
+    for extension in ["json", "conf"] {
+        for threads_after_config in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join(format!("jobs.{extension}"));
+            let runs = temp.path().join("runs");
+            fs::write(&config, format!("// whole-line comment\n{}\n", serde_json::json!({"jobs": {"once": {
+                "command": format!("echo run >> {}; printf '%s' 'https://example.test/#fragment'", runs.display()),
+                "restart": false,
+                "prefix": "{stream}: "
+            }}}))).unwrap();
+            let log_path = temp.path().join("runner.log");
+            let log = File::create(&log_path).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+            command
+                .arg("--wrap")
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            if threads_after_config {
+                command.arg(&config).args(["-t", "2"]);
+            } else {
+                command.args(["-t", "2"]).arg(&config);
+            }
+            let mut runner = Runner::spawn_in_session(command, log_path);
+            assert!(
+                runner.wait(Duration::from_secs(5)).success(),
+                "{}",
+                runner.log()
+            );
+            assert_eq!(fs::read_to_string(runs).unwrap(), "run\n");
+            assert!(
+                runner
+                    .log()
+                    .lines()
+                    .any(|line| line == "1: https://example.test/#fragment")
+            );
+            assert!(!runner.log().contains("before restarting"));
+        }
+    }
+}
+
+#[test]
+fn output_readers_preserve_binary_bytes_blank_lines_and_unterminated_tails() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = temp.path().join("payload");
+    let stdout_path = temp.path().join("stdout");
+    let stderr_path = temp.path().join("stderr");
+    let config = temp.path().join("jobs.json");
+    fs::write(&payload, b"\n\0\xff\r\ntail").unwrap();
+    fs::write(
+        &config,
+        serde_json::json!({"jobs": {"binary": {
+            "command": format!("cat {0}; cat {0} >&2", payload.display()),
+            "prefix": "{stream}>", "restart": false
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jr"));
+    command
+        .arg(config)
+        .stdout(File::create(&stdout_path).unwrap())
+        .stderr(File::create(&stderr_path).unwrap());
+    let mut runner = Runner::spawn_in_session(command, stderr_path.clone());
+    assert!(runner.wait(Duration::from_secs(5)).success());
+    assert_eq!(fs::read(stdout_path).unwrap(), b"1>\n1>\0\xff\r\n1>tail\n");
+    let stderr = fs::read(stderr_path).unwrap();
+    let job_stderr: Vec<u8> = stderr
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| line.starts_with(b"2>"))
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(job_stderr, b"2>\n2>\0\xff\r\n2>tail\n");
+}
+
+#[test]
 fn prefix_templates_apply_to_stdout_stderr_and_job_status() {
     for (template, expected) in [
         (
